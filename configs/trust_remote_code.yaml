@@ -1,0 +1,5 @@
+# Allowlist for Hugging Face `trust_remote_code=True`.
+# Empty by default: the loader refuses remote code for any repo not listed here.
+# Each entry needs: repo, revision (commit SHA of the reviewed code), reviewed_by,
+# reviewed_at (YYYY-MM-DD) and a written justification.
+allow: []

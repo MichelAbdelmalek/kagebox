@@ -1,0 +1,6 @@
+# Validation thresholds. Anything below goes to the review queue.
+ocr_confidence_min: 0.90
+whisper_wer_max: 0.15
+identity_similarity_default: 0.90
+style_similarity_default: 0.85
+lip_sync_offset_ms_max: 80

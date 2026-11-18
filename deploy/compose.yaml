@@ -1,0 +1,283 @@
+# Kagebox stack. Default (cloud profile): everything except worker-gpu; heavy generation on Together AI.
+#   make up-cloud   -> docker compose up
+#   make up-gpu     -> docker compose --profile gpu up   (needs the NVIDIA Container Toolkit)
+# Only caddy publishes a port, bound to 127.0.0.1. Nothing else is reachable from outside.
+name: kagebox
+
+x-hardening: &hardening
+  read_only: true
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: ["ALL"]
+  restart: unless-stopped
+  pids_limit: 512
+  tmpfs: ["/tmp:size=256m,mode=1777"]
+
+x-python-env: &python-env
+  KAGEBOX_PROFILE: ${KAGEBOX_PROFILE:-cloud}
+  KAGEBOX_DATABASE_URL: postgresql+psycopg://kagebox@postgres:5432/kagebox
+  KAGEBOX_DATABASE_PASSWORD_FILE: /run/secrets/db_password
+  KAGEBOX_S3_ENDPOINT: http://objects:8333
+  KAGEBOX_S3_ACCESS_KEY_FILE: /run/secrets/s3_access_key
+  KAGEBOX_S3_SECRET_KEY_FILE: /run/secrets/s3_secret_key
+  KAGEBOX_MEDIA_SIGNING_KEY_FILE: /run/secrets/media_signing_key
+  KAGEBOX_SESSION_SECRET_FILE: /run/secrets/session_secret
+  PREFECT_API_URL: http://prefect-server:4200/api
+
+services:
+  caddy:
+    <<: *hardening
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
+    user: "10001:10001"
+    # The caddy binary carries a file capability; exec fails unless it is in the bounding set.
+    cap_add: ["NET_BIND_SERVICE"]
+    ports: ["127.0.0.1:${KAGEBOX_PORT:-8443}:8443"]
+    environment:
+      KAGEBOX_HOST: ${KAGEBOX_HOST:-localhost}
+      XDG_DATA_HOME: /data
+      XDG_CONFIG_HOME: /config
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [edge, front]
+    depends_on:
+      volume-init: {condition: service_completed_successfully}
+      api: {condition: service_healthy}
+      web: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8081/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    mem_limit: 256m
+
+  web:
+    <<: *hardening
+    build: {context: ../apps/web, dockerfile: ../../deploy/docker/web.Dockerfile}
+    image: kagebox/web:dev
+    environment:
+      KAGEBOX_API_INTERNAL_URL: http://api:8000
+      NODE_ENV: production
+    networks: [front]
+    healthcheck:
+      test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    mem_limit: 512m
+
+  api:
+    <<: *hardening
+    build: {context: .., dockerfile: deploy/docker/python.Dockerfile, target: api, args: {EXTRA: api}}
+    image: kagebox/api:dev
+    environment:
+      <<: *python-env
+      KAGEBOX_ALLOWED_ORIGIN: https://${KAGEBOX_HOST:-localhost}:${KAGEBOX_PORT:-8443}
+    secrets: [db_password, s3_access_key, s3_secret_key, media_signing_key, session_secret]
+    networks: [front, back]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      objects-init: {condition: service_completed_successfully}
+    mem_limit: 1g
+
+  migrate:
+    <<: *hardening
+    image: kagebox/api:dev
+    restart: "no"
+    command: ["python", "-m", "kagebox_api.cli", "migrate"]
+    environment: *python-env
+    secrets: [db_password, s3_access_key, s3_secret_key, media_signing_key, session_secret]
+    networks: [back]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  prefect-server:
+    <<: *hardening
+    build: {context: .., dockerfile: deploy/docker/python.Dockerfile, target: worker, args: {EXTRA: worker}}
+    image: kagebox/worker:dev
+    entrypoint: ["/bin/sh", "/opt/prefect-env.sh"]
+    command: ["prefect", "server", "start", "--host", "0.0.0.0", "--port", "4200", "--no-services"]
+    environment:
+      PREFECT_HOME: /tmp/prefect
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+      PREFECT_UI_ENABLED: "false"  # no UI: the server is internal-only and has no auth
+    volumes:
+      - ./docker/prefect-env.sh:/opt/prefect-env.sh:ro
+    secrets: [db_password]
+    networks: [back]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4200/api/health',timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    mem_limit: 1g
+
+  worker-cpu:
+    <<: *hardening
+    image: kagebox/worker:dev
+    environment:
+      <<: *python-env
+      KAGEBOX_TOGETHER_API_KEY_FILE: /run/secrets/together_api_key
+      PREFECT_RUNNER_SERVER_ENABLE: "true"
+      PREFECT_RUNNER_SERVER_HOST: 127.0.0.1
+      PREFECT_RUNNER_SERVER_PORT: "8080"
+    secrets: [db_password, s3_access_key, s3_secret_key, media_signing_key, session_secret,
+              together_api_key]
+    volumes:
+      - models:/models:ro
+    networks: [back, egress]
+    depends_on:
+      prefect-server: {condition: service_healthy}
+      objects-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2).status==200 else 1)"]
+      interval: 20s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    mem_limit: 4g
+
+  worker-gpu:
+    profiles: [gpu]
+    <<: *hardening
+    image: kagebox/worker:dev  # Phase 2 swaps in a CUDA + ComfyUI image (pinned commit)
+    environment:
+      <<: *python-env
+      KAGEBOX_PROFILE: gpu
+    secrets: [db_password, s3_access_key, s3_secret_key]
+    volumes:
+      - models:/models:ro
+    networks: [back]  # no internet, no published ports; ComfyUI stays internal
+    depends_on:
+      prefect-server: {condition: service_healthy}
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+
+  postgres:
+    <<: *hardening
+    image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+    user: "70:70"
+    environment:
+      POSTGRES_USER: kagebox
+      POSTGRES_DB: kagebox
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    tmpfs: ["/tmp:size=64m", "/var/run/postgresql:size=8m,uid=70,gid=70"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init-prefect-db.sh:/docker-entrypoint-initdb.d/10-prefect.sh:ro
+    networks: [back]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kagebox -d kagebox"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    mem_limit: 1g
+
+  qdrant:
+    <<: *hardening
+    image: qdrant/qdrant:v1.15.5-unprivileged@sha256:48c12634a17d8d54f4e3fb95c2b081668039e6e4517ebba57be1882109199ae7
+    entrypoint: ["/usr/bin/bash", "-c", "QDRANT__SERVICE__API_KEY=$$(cat /run/secrets/qdrant_api_key) exec ./entrypoint.sh"]
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    secrets: [qdrant_api_key]
+    volumes:
+      - qdrant:/qdrant/storage
+      - qdrant-snapshots:/qdrant/snapshots
+    networks: [back]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+    mem_limit: 1g
+
+  objects:
+    <<: *hardening
+    image: chrislusf/seaweedfs:3.97@sha256:bb05d66d2963b1cc48073190781c3dd29e2c4c88a2ae2986bf58e38c86d89c6e
+    user: "10001:10001"
+    command: ["server", "-dir=/data", "-ip=objects", "-ip.bind=0.0.0.0", "-s3", "-s3.port=8333",
+              "-s3.config=/run/secrets/s3_config", "-master.volumeSizeLimitMB=1024",
+              "-volume.max=0"]
+    secrets: [s3_config]
+    volumes:
+      - objects:/data
+    networks: [back]
+    depends_on:
+      volume-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8333/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    mem_limit: 1g
+
+  objects-init:
+    <<: *hardening
+    image: kagebox/worker:dev
+    restart: "no"
+    command: ["python", "-m", "orchestration.init_buckets"]
+    environment: *python-env
+    secrets: [s3_access_key, s3_secret_key]
+    networks: [back]
+    depends_on:
+      objects: {condition: service_healthy}
+
+  # One-shot: give non-root services ownership of their named volumes.
+  volume-init:
+    image: busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478
+    restart: "no"
+    network_mode: none
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN"]
+    command: ["chown", "10001:10001", "/v/objects", "/v/caddy-data", "/v/caddy-config"]  # roots only; services own their contents
+    volumes:
+      - objects:/v/objects
+      - caddy-data:/v/caddy-data
+      - caddy-config:/v/caddy-config
+
+  # One-shot model download (Phase 1): pinned .safetensors revisions with sha256 checks.
+  models-fetch:
+    profiles: [fetch]
+    <<: *hardening
+    image: kagebox/worker:dev
+    restart: "no"
+    command: ["python", "-m", "orchestration.models_fetch"]
+    environment:
+      HF_HUB_OFFLINE: "0"
+    volumes:
+      - models:/models
+    networks: [egress]
+
+networks:
+  edge: {}
+  front: {internal: true}
+  back: {internal: true}
+  egress: {}
+
+volumes:
+  pgdata: {}
+  qdrant: {}
+  qdrant-snapshots: {}
+  objects: {}
+  models: {}
+  caddy-data: {}
+  caddy-config: {}
+
+secrets:
+  db_password: {file: ./secrets/db_password.txt}
+  s3_access_key: {file: ./secrets/s3_access_key.txt}
+  s3_secret_key: {file: ./secrets/s3_secret_key.txt}
+  session_secret: {file: ./secrets/session_secret.txt}
+  media_signing_key: {file: ./secrets/media_signing_key.txt}
+  qdrant_api_key: {file: ./secrets/qdrant_api_key.txt}
+  together_api_key: {file: ./secrets/together_api_key.txt}
+  s3_config: {file: ./secrets/s3_config.json}

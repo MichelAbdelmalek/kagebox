@@ -7,3 +7,14 @@ data/
 node_modules/
 __pycache__/
 .venv/
+.DS_Store
+deploy/secrets/*
+!deploy/secrets/.gitkeep
+apps/web/.next/
+apps/web/next-env.d.ts
+*.tsbuildinfo
+.scan/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+apps/web/.pnpm-store/

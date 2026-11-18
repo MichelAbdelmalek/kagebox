@@ -1,0 +1,39 @@
+{
+	admin off
+	local_certs
+	auto_https disable_redirects
+	http_port 8080
+	https_port 8443
+}
+
+# Internal-only liveness endpoint for the container healthcheck (not published).
+:8081 {
+	respond /health 200
+}
+
+https://{$KAGEBOX_HOST:localhost}:8443 {
+	encode zstd gzip
+	request_body {
+		max_size 210MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		Cross-Origin-Opener-Policy "same-origin"
+		-Server
+		-X-Powered-By
+	}
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+	handle {
+		reverse_proxy web:3000
+	}
+	log {
+		output stdout
+		format json
+	}
+}

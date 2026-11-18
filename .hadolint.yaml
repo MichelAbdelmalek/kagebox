@@ -1,0 +1,6 @@
+failure-threshold: warning
+trustedRegistries: [docker.io, ghcr.io, gcr.io]
+ignored:
+  # Base images are passed through ARGs that are pinned by tag *and* digest at the top of each
+  # Dockerfile; hadolint cannot resolve ARG values, so it flags every `FROM ${...}`.
+  - DL3006

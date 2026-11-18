@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="64" height="64" role="img" aria-label="Kagebox">
+  <rect x="26" y="26" width="84" height="84" rx="14" fill="#E5432A"/>
+  <rect x="13" y="13" width="84" height="84" rx="14" fill="#F4F1EA"/>
+  <path d="M44 34 L44 76 L80 55 Z" fill="#121217"/>
+</svg>

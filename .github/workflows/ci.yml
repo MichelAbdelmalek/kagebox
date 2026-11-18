@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Every job runs the same containerized Makefile targets used locally, so the toolchain is
+# pinned by image digest in one place (Makefile). Fails on any high or critical finding.
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: {persist-credentials: false}
+      - run: make test-py
+      - run: make lint
+
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: {persist-credentials: false}
+      - run: make test-web
+
+  security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: {persist-credentials: false, fetch-depth: 0}
+      - run: make scan
+
+  images:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: {persist-credentials: false}
+      - run: make env secrets
+      - run: docker compose -f deploy/compose.yaml --env-file .env build api prefect-server web
+      - run: make scan-images

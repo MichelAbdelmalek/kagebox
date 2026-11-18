@@ -1,0 +1,21 @@
+# Pinned models per pipeline stage.
+# Every entry must have: id, provider, revision (commit SHA for Hugging Face), license, source.
+# Local weights also need `files` with sha256 checksums; only .safetensors is accepted.
+# Entries marked `status: proposed` are not approved yet and are refused by the registry.
+#
+# Phase 0 ships with no approved models. Phase 1 fills these in after license verification
+# (see LICENSES.md and the open questions in the plan).
+
+version: 1
+
+stages:
+  understand:
+    provider: together
+    model: null            # e.g. a Qwen VL model from Together's catalogue (to be verified)
+    status: proposed
+  director:
+    provider: together
+    model: null            # e.g. Qwen3 or gpt-oss-120b on Together (to be verified)
+    status: proposed
+
+models: {}
