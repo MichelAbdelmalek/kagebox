@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+models/
+data/
+*.safetensors
+node_modules/
+__pycache__/
+.venv/

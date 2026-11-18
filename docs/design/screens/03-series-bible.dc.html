@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Kagebox · Series bible</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&amp;family=Inter:wght@400;500;600&amp;family=JetBrains+Mono:wght@500&amp;display=swap">
+<style>
+body{margin:0}
+a{color:#F2EFE8;text-decoration:none}a:hover{color:#FF8C75}
+</style>
+</helmet>
+<div style="min-height: 1080px; background: #0F0F13; color: #F2EFE8; font-family: Inter, system-ui, sans-serif; display: flex; flex-wrap: wrap">
+
+<nav aria-label="Main" style="flex: 1 1 232px; background: #121217; border-right: 1px solid #2B2B35; padding: 24px 16px; box-sizing: border-box; display: flex; flex-direction: column; gap: 6px">
+<div style="display: flex; align-items: center; gap: 10px; padding: 4px 10px 22px">
+<svg viewBox="0 0 120 120" width="30" height="30" aria-hidden="true"><rect x="26" y="26" width="84" height="84" rx="14" fill="#E5432A"></rect><rect x="13" y="13" width="84" height="84" rx="14" fill="#F4F1EA"></rect><path d="M44 34 L44 76 L80 55 Z" fill="#121217"></path></svg>
+<span style="font-family: 'Space Grotesk', Inter, sans-serif; font-weight: 700; font-size: 21px; letter-spacing: -0.04em">kagebox</span>
+</div>
+<a href="Projects.dc.html" style="display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 10px; font-size: 15px; color: #C9C5CF">Projects</a>
+<a href="Reader.dc.html" style="display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 10px; font-size: 15px; color: #C9C5CF">Panel reader</a>
+<a href="Bible.dc.html" style="display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 10px; background: #1F1F27; font-weight: 600; font-size: 15px">Series bible</a>
+<a href="Casting.dc.html" style="display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 10px; font-size: 15px; color: #C9C5CF">Voice casting</a>
+<a href="Style.dc.html" style="display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 10px; font-size: 15px; color: #C9C5CF">Art direction</a>
+<a href="Studio.dc.html" style="display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 10px; font-size: 15px; color: #C9C5CF">Director studio</a>
+<div style="height: 1px; background: #2B2B35; margin: 12px 4px"></div>
+<a href="Studio.dc.html" style="display: flex; align-items: center; justify-content: space-between; min-height: 44px; padding: 0 12px; border-radius: 10px; font-size: 15px; color: #C9C5CF">Review queue <span style="background: #F2B544; color: #121217; font-size: 12px; font-weight: 600; border-radius: 99px; padding: 2px 8px">3</span></a>
+<a href="#" style="display: flex; align-items: center; min-height: 44px; padding: 0 12px; border-radius: 10px; font-size: 15px; color: #C9C5CF">Models &amp; licenses</a>
+</nav>
+
+<main style="flex: 999 1 560px; min-width: 0; padding: 32px 40px 40px; box-sizing: border-box; display: flex; flex-direction: column; gap: 22px">
+
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-end; gap: 16px">
+<div style="display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 13px; color: #A6A2AE">The Clockwork Knight</div>
+<h1 style="margin: 0; font-family: 'Space Grotesk', Inter, sans-serif; font-size: 30px; font-weight: 700; letter-spacing: -0.03em">Series bible</h1>
+<div style="font-size: 14px; color: #A6A2AE">The single source of truth every shot retrieves before it is generated.</div>
+</div>
+<div role="tablist" aria-label="Bible sections" style="display: flex; flex-wrap: wrap; border: 1px solid #2B2B35; border-radius: 10px; overflow: hidden">
+<button type="button" role="tab" aria-selected="true" style="min-height: 44px; padding: 0 16px; border: none; background: #2B2B35; color: #F2EFE8; font: 600 14px Inter, sans-serif">Characters</button>
+<button type="button" role="tab" aria-selected="false" style="min-height: 44px; padding: 0 16px; border: none; background: transparent; color: #C9C5CF; font: 500 14px Inter, sans-serif">Locations</button>
+<button type="button" role="tab" aria-selected="false" style="min-height: 44px; padding: 0 16px; border: none; background: transparent; color: #C9C5CF; font: 500 14px Inter, sans-serif">Props</button>
+<button type="button" role="tab" aria-selected="false" style="min-height: 44px; padding: 0 16px; border: none; background: transparent; color: #C9C5CF; font: 500 14px Inter, sans-serif">Score themes</button>
+</div>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start">
+
+<section aria-label="Characters" style="flex: 1 1 240px; max-width: 300px; display: flex; flex-direction: column; gap: 10px">
+<sc-for list="{{chars}}" as="c" hint-placeholder-count="3">
+<button type="button" onClick="{{c.pick}}" aria-pressed="{{c.pressed}}" style="{{c.rowStyle}}">
+<span style="width: 44px; height: 44px; border-radius: 10px; background: {{c.tone}}; flex: 0 0 auto"></span>
+<span style="display: flex; flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0">
+<span style="font: 600 15px Inter, sans-serif">{{c.name}}</span>
+<span style="font: 500 12px 'JetBrains Mono', monospace; color: #A6A2AE">{{c.ref}} · {{c.refs}} refs</span>
+</span>
+</button>
+</sc-for>
+<button type="button" style="min-height: 44px; border: 1px dashed #3A3A44; border-radius: 12px; background: transparent; color: #C9C5CF; font: 500 14px Inter, sans-serif">Merge or split a character cluster</button>
+</section>
+
+<section aria-label="Character detail" style="flex: 999 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 20px">
+
+<div style="background: #17171D; border: 1px solid #2B2B35; border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 16px">
+<div style="display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; align-items: baseline">
+<h2 style="margin: 0; font-size: 22px; font-weight: 600">{{sel.name}}</h2>
+<span style="font-size: 13px; color: #A6A2AE">{{sel.role}}</span>
+</div>
+<div style="font-size: 13px; color: #A6A2AE">Reference crops from the source pages (approved ones train the character LoRA)</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 12px">
+<sc-for list="{{sel.crops}}" as="k" hint-placeholder-count="6">
+<figure style="margin: 0; display: flex; flex-direction: column; gap: 6px">
+<div style="aspect-ratio: 3 / 4; border-radius: 10px; background: #F4F1EA; border: {{k.border}}; display: flex; align-items: flex-end; justify-content: center; overflow: hidden">
+<div style="width: 54%; height: 70%; background: {{sel.tone}}; border-radius: 40% 40% 6px 6px"></div>
+</div>
+<figcaption style="font: 500 12px 'JetBrains Mono', monospace; color: #A6A2AE">{{k.id}} · {{k.state}}</figcaption>
+</figure>
+</sc-for>
+</div>
+</div>
+
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px">
+
+<div style="background: #17171D; border: 1px solid #2B2B35; border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 14px">
+<h3 style="margin: 0; font-size: 16px; font-weight: 600">Design consistency</h3>
+<div style="display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 10px 12px; font-size: 14px">
+<div style="color: #A6A2AE">Character LoRA</div><div>{{sel.lora}}</div>
+<div style="color: #A6A2AE">Outfits</div><div>{{sel.outfits}}</div>
+<div style="color: #A6A2AE">Key traits</div><div>{{sel.traits}}</div>
+</div>
+<label for="idThreshold" style="font-size: 13px; color: #A6A2AE">Identity match needed to accept a shot</label>
+<div style="display: flex; align-items: center; gap: 12px">
+<input id="idThreshold" type="range" min="0.80" max="0.99" step="0.01" value="{{threshold}}" onInput="{{setThreshold}}" style="flex: 1 1 auto; accent-color: #FF6A4D; min-height: 44px">
+<span style="font: 500 15px 'JetBrains Mono', monospace; color: #6CB4FF; min-width: 44px">{{thresholdLabel}}</span>
+</div>
+<div style="font-size: 13px; color: #A6A2AE">Shots below this go to the review queue instead of the edit.</div>
+</div>
+
+<div style="background: #17171D; border: 1px solid #2B2B35; border-radius: 16px; padding: 22px; display: flex; flex-direction: column; gap: 14px">
+<h3 style="margin: 0; font-size: 16px; font-weight: 600">Voice profile</h3>
+<div style="display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 10px 12px; font-size: 14px">
+<div style="color: #A6A2AE">Source</div><div>{{sel.voice}}</div>
+<div style="color: #A6A2AE">Consent</div><div style="{{sel.consentStyle}}">{{sel.consent}}</div>
+<div style="color: #A6A2AE">Engine</div><div>CosyVoice2 · watermark on</div>
+<div style="color: #A6A2AE">Languages</div><div>Japanese · Korean · English · Arabic</div>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<sc-for list="{{sel.emotions}}" as="e" hint-placeholder-count="4">
+<span style="font-size: 13px; border: 1px solid #2B2B35; border-radius: 99px; padding: 5px 12px">{{e}}</span>
+</sc-for>
+</div>
+<button type="button" style="align-self: flex-start; min-height: 44px; padding: 0 16px; border: 1px solid #3A3A44; border-radius: 10px; background: transparent; color: #F2EFE8; font: 600 14px Inter, sans-serif; display: flex; align-items: center; gap: 8px"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M8 5 L8 19 L19 12 Z"></path></svg>Play a sample line</button>
+<a href="Casting.dc.html" style="font-size: 14px; color: #FF8C75; text-decoration: underline">Change this voice in Voice casting</a>
+</div>
+
+</div>
+</section>
+</div>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1080}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { picked: 'char_knight', threshold: 0.90 };
+  }
+  renderVals() {
+    const data = [
+      { ref: 'char_knight', name: 'Clockwork Knight', role: 'Lead · 31 panels in ch. 1', tone: '#8A6A3A', refs: 24,
+        lora: 'Trained on 24 approved crops', outfits: 'Ch. 1: brass armour, torn red sash', traits: 'Visor glows when speaking; three-gear crest on chest',
+        voice: 'Designed voice (not cloned from a person)', consent: 'Not needed · synthetic voice', consentOk: true,
+        emotions: ['Calm', 'Resolute', 'Tender', 'Strained'],
+        crops: [['panel_0143', 'approved'], ['panel_0144', 'approved'], ['panel_0151', 'approved'], ['panel_0158', 'approved'], ['panel_0162', 'rejected'], ['panel_0170', 'pending']] },
+      { ref: 'char_ada', name: 'Ada', role: 'Lead · 27 panels in ch. 1', tone: '#3E5C8A', refs: 19,
+        lora: 'Training · 19 approved crops', outfits: 'Ch. 1: green coat, lantern', traits: 'Short dark hair, scar on left hand',
+        voice: 'Licensed actor: [ACTOR NAME]', consent: 'Signed consent on file', consentOk: true,
+        emotions: ['Worried', 'Hopeful', 'Surprised', 'Determined'],
+        crops: [['panel_0142', 'approved'], ['panel_0144', 'approved'], ['panel_0149', 'approved'], ['panel_0155', 'pending'], ['panel_0160', 'approved'], ['panel_0171', 'approved']] },
+      { ref: 'char_holt', name: 'Mayor Holt', role: 'Supporting · 6 panels in ch. 1', tone: '#5B4A63', refs: 6,
+        lora: 'Not enough crops yet (needs 12)', outfits: 'Ch. 1: grey suit, pocket watch', traits: 'Tall hat, thick moustache',
+        voice: 'Licensed actor: [ACTOR NAME]', consent: 'Consent missing · voice locked', consentOk: false,
+        emotions: ['Stern', 'Nervous'],
+        crops: [['panel_0147', 'approved'], ['panel_0148', 'pending'], ['panel_0166', 'approved']] }
+    ];
+    const picked = this.state.picked;
+    const chars = data.map((d) => {
+      const on = d.ref === picked;
+      return {
+        name: d.name, ref: d.ref, refs: d.refs, tone: d.tone, pressed: on ? 'true' : 'false',
+        pick: () => this.setState({ picked: d.ref }),
+        rowStyle: 'display: flex; align-items: center; gap: 12px; width: 100%; min-height: 64px; padding: 10px 12px; text-align: left; cursor: pointer; border-radius: 12px; color: #F2EFE8; background: ' + (on ? '#1F1F27' : '#17171D') + '; border: ' + (on ? '2px solid #FF6A4D' : '1px solid #2B2B35')
+      };
+    });
+    const s = data.find((d) => d.ref === picked) || data[0];
+    const borders = { approved: '2px solid #6CB4FF', rejected: '2px solid #FF6A4D', pending: '2px dashed #F2B544' };
+    const sel = {
+      name: s.name, role: s.role, tone: s.tone, lora: s.lora, outfits: s.outfits, traits: s.traits,
+      voice: s.voice, consent: s.consent, emotions: s.emotions,
+      consentStyle: 'color: ' + (s.consentOk ? '#6CB4FF' : '#F2B544'),
+      crops: s.crops.map((c) => ({ id: c[0], state: c[1], border: borders[c[1]] }))
+    };
+    const t = this.state.threshold;
+    return {
+      chars, sel, threshold: t, thresholdLabel: Number(t).toFixed(2),
+      setThreshold: (e) => this.setState({ threshold: parseFloat(e.target.value) })
+    };
+  }
+}
+</script>
+</body>
+</html>
