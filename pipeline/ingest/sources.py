@@ -1,8 +1,11 @@
 """Page sources: PDF (rendered in a sandboxed child process), CBZ and image folders.
 
 ``iter_pages`` yields (1-based source page number, RGB image with long side <= MAX_LONG_SIDE)
-lazily, for an inclusive page range. Every failure is an ``UploadRejected`` whose message is safe
-to show to the user; details (exit codes, child stderr) go to the log only.
+lazily, for an inclusive page range. With ``fit="width"`` (manhwa vertical strips, sliced later)
+only the width is capped at MAX_LONG_SIDE and the height is kept; MAX_IMAGE_PIXELS still bounds
+every decode. PDFs are always long-side capped by their sandboxed child, so ``fit="width"`` refuses
+them rather than silently squashing a strip. Every failure is an ``UploadRejected`` whose message
+is safe to show to the user; details (exit codes, child stderr) go to the log only.
 
 Untrusted PDFs are never opened in this process: page counting, encryption probing and every
 page render run in ``pipeline.ingest.pdf_child`` under rlimits, one child per call, so the CPU
@@ -44,6 +47,7 @@ from pipeline.common.uploads import (
 log = logging.getLogger(__name__)
 
 SourceKind = Literal["pdf", "cbz", "images"]
+Fit = Literal["long_side", "width"]
 
 # Limits are module constants so tests (and config) can tighten them. Anything the child must
 # honour is passed to it as an argument: patching this module does not reach the child process.
@@ -89,14 +93,20 @@ def detect_kind(path: Path) -> SourceKind:
 
 
 def iter_pages(
-    path: Path, kind: SourceKind, page_start: int, page_end: int
+    path: Path, kind: SourceKind, page_start: int, page_end: int, *, fit: Fit = "long_side"
 ) -> Iterator[tuple[int, Image.Image]]:
+    if fit not in ("long_side", "width"):
+        raise ValueError("fit must be 'long_side' or 'width'")
     if kind == "pdf":
+        if fit == "width":
+            raise UploadRejected(
+                "vertical-scroll strips must be uploaded as a CBZ or an image folder, not a PDF"
+            )
         return _iter_pdf(path, page_start, page_end)
     if kind == "cbz":
-        return _iter_cbz(path, page_start, page_end)
+        return _iter_cbz(path, page_start, page_end, fit)
     if kind == "images":
-        return _iter_images(path, page_start, page_end)
+        return _iter_images(path, page_start, page_end, fit)
     raise UploadRejected("unsupported source kind")
 
 
@@ -115,10 +125,10 @@ def _check_range(total: int, page_start: int, page_end: int) -> None:
         )
 
 
-def _fit(image: Image.Image) -> Image.Image:
-    """RGB, long side capped at MAX_LONG_SIDE. Applied to every source, child output included."""
+def _fit(image: Image.Image, fit: Fit = "long_side") -> Image.Image:
+    """RGB, long side (or only the width, for strips) capped at MAX_LONG_SIDE."""
     rgb = image.convert("RGB")
-    long_side = max(rgb.size)
+    long_side = max(rgb.size) if fit == "long_side" else rgb.width
     if long_side <= MAX_LONG_SIDE:
         return rgb
     s = MAX_LONG_SIDE / long_side
@@ -187,7 +197,9 @@ def _natural_key(name: str) -> tuple[tuple[int, int, str], ...]:
 # CBZ and image folders
 
 
-def _iter_cbz(path: Path, page_start: int, page_end: int) -> Iterator[tuple[int, Image.Image]]:
+def _iter_cbz(
+    path: Path, page_start: int, page_end: int, fit: Fit
+) -> Iterator[tuple[int, Image.Image]]:
     entries = safe_read_zip(_read_capped(path, MAX_CBZ_BYTES), ArchiveLimits())
     images = [(name, data) for name, data in entries if _is_page_image(data)]
     _log_skipped(len(entries) - len(images))
@@ -195,7 +207,7 @@ def _iter_cbz(path: Path, page_start: int, page_end: int) -> Iterator[tuple[int,
     _check_range(len(images), page_start, page_end)
     for index in range(page_start, page_end + 1):
         _, data = images[index - 1]
-        yield index, _fit(decode_image(data, IMAGE_MIMES, MAX_IMAGE_BYTES))
+        yield index, _fit(decode_image(data, IMAGE_MIMES, MAX_IMAGE_BYTES), fit)
 
 
 def _is_page_image(data: bytes) -> bool:
@@ -217,7 +229,9 @@ def _log_skipped(count: int) -> None:
         log.info("skipped %d non-image entries", count)
 
 
-def _iter_images(folder: Path, page_start: int, page_end: int) -> Iterator[tuple[int, Image.Image]]:
+def _iter_images(
+    folder: Path, page_start: int, page_end: int, fit: Fit
+) -> Iterator[tuple[int, Image.Image]]:
     if folder.is_symlink() or not folder.is_dir():
         raise UploadRejected("image source must be a folder")
     files = []
@@ -236,7 +250,7 @@ def _iter_images(folder: Path, page_start: int, page_end: int) -> Iterator[tuple
     _check_range(len(files), page_start, page_end)
     for index in range(page_start, page_end + 1):
         data = _read_capped(folder / files[index - 1], MAX_IMAGE_BYTES)
-        yield index, _fit(decode_image(data, IMAGE_MIMES, MAX_IMAGE_BYTES))
+        yield index, _fit(decode_image(data, IMAGE_MIMES, MAX_IMAGE_BYTES), fit)
 
 
 # ---------------------------------------------------------------------------------------------

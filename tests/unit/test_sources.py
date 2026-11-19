@@ -467,3 +467,37 @@ def test_timeout_kills_process_group(tmp_path: Path, monkeypatch: pytest.MonkeyP
         sources._run_child(["probe", "x"], tmp_path)
     time.sleep(2.5)
     assert not marker.exists()
+
+
+def test_fit_width_keeps_tall_strip_height(tmp_path: Path) -> None:
+    folder = tmp_path / "strip"
+    folder.mkdir()
+    (folder / "001.png").write_bytes(png_bytes((800, 30000)))
+    (folder / "002.png").write_bytes(png_bytes((4000, 9000)))
+    pages = dict(iter_pages(folder, "images", 1, 2, fit="width"))
+    assert pages[1].size == (800, 30000)  # untouched: width already within the cap
+    assert pages[2].size == (3000, 6750)  # only the width is capped, aspect kept
+    [(_, default)] = list(iter_pages(folder, "images", 1, 1))
+    assert default.size == (80, 3000)  # default stays long-side capped
+
+
+def test_fit_width_cbz(tmp_path: Path) -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("001.png", png_bytes((1000, 8000)))
+    cbz = tmp_path / "s.cbz"
+    cbz.write_bytes(buf.getvalue())
+    [(_, im)] = list(iter_pages(cbz, "cbz", 1, 1, fit="width"))
+    assert im.size == (1000, 8000)
+
+
+def test_fit_width_pdf_refused(tmp_path: Path) -> None:
+    pdf = make_pdf(tmp_path / "book.pdf", 1)
+    with pytest.raises(UploadRejected, match="CBZ or an image folder"):
+        list(iter_pages(pdf, "pdf", 1, 1, fit="width"))
+
+
+def test_fit_unknown_refused(tmp_path: Path) -> None:
+    pdf = make_pdf(tmp_path / "book.pdf", 1)
+    with pytest.raises(ValueError):
+        iter_pages(pdf, "pdf", 1, 1, fit="height")  # type: ignore[arg-type]
