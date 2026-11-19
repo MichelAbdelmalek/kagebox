@@ -1,6 +1,6 @@
 """Strict Pydantic v2 schemas for every inter-stage artifact."""
 
-from pipeline.common.schemas.base import Artifact, Cited, Provenance, Strict
+from pipeline.common.schemas.base import Artifact, Cited, ModelRef, Provenance, Strict
 from pipeline.common.schemas.production import (
     Casting,
     Check,
@@ -31,6 +31,7 @@ __all__ = [
     "CharacterRef",
     "Check",
     "Cited",
+    "ModelRef",
     "Page",
     "Panel",
     "Project",

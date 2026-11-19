@@ -4,7 +4,9 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from pipeline.common.database import make_engine
@@ -18,6 +20,7 @@ from pipeline.common.dbmodels import (
     ProjectRow,
     ReviewItemRow,
     User,
+    aware,
 )
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import Bubble, Page, Panel
@@ -72,6 +75,7 @@ def _seed(s: Session) -> dict[str, str]:
             "id": ids["page"],
             "chapter_id": ids["chap"],
             "index": 1,
+            "source_page": 1,
             "width": 10,
             "height": 20,
             "image_ref": REF,
@@ -115,6 +119,7 @@ def _seed(s: Session) -> dict[str, str]:
             "ocr_confidence": 0.5,
             "ocr_engine": "x",
             "speaker": {},
+            "reading_order": 1,
             "provenance": PROV,
         }
     )
@@ -123,6 +128,7 @@ def _seed(s: Session) -> dict[str, str]:
             id=ids["bubble"],
             panel_id=ids["panel"],
             chapter_id=ids["chap"],
+            reading_order=1,
             needs_review=bubble.needs_review,
             artifact=bubble.model_dump(mode="json", exclude={"needs_review"}),
         )
@@ -161,3 +167,32 @@ def test_artifact_json_validates(tmp_path: Any) -> None:
     Page.model_validate_json(json.dumps(s.get(PageRow, ids["page"]).artifact))  # type: ignore[union-attr]
     Panel.model_validate_json(json.dumps(s.get(PanelRow, ids["panel"]).artifact))  # type: ignore[union-attr]
     Bubble.model_validate_json(json.dumps(s.get(BubbleRow, ids["bubble"]).artifact))  # type: ignore[union-attr]
+
+
+def test_bubble_reading_order_unique_per_panel(tmp_path: Any) -> None:
+    s = _session(tmp_path)
+    ids = _seed(s)
+    row = s.get(BubbleRow, ids["bubble"])
+    assert row is not None
+    s.add(
+        BubbleRow(
+            id=new_id("bubble"),
+            panel_id=ids["panel"],
+            chapter_id=ids["chap"],
+            reading_order=1,  # same panel, same position
+            artifact=row.artifact,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        s.commit()
+
+
+def test_chapter_ingest_started_at_nullable(tmp_path: Any) -> None:
+    s = _session(tmp_path)
+    ids = _seed(s)
+    chapter = s.get(ChapterRow, ids["chap"])
+    assert chapter is not None
+    assert chapter.ingest_started_at is None
+    chapter.ingest_started_at = NOW
+    s.commit()
+    assert aware(chapter.ingest_started_at) == NOW

@@ -128,6 +128,7 @@ class MangaOcr:
     """manga-ocr for Japanese crops (vertical or horizontal)."""
 
     engine = MANGA_OCR_MODEL
+    models: tuple[str, ...] = (MANGA_OCR_MODEL,)  # every pinned model used, for provenance
 
     def __init__(self) -> None:
         self._parts: tuple[Any, Any, Any] | None = None
@@ -218,6 +219,7 @@ class PpOcr:
             raise ValueError(f"PP-OCRv5 language not supported: {lang!r}")
         self.lang: PpLang = lang
         self.engine = PP_REC_MODELS[lang]
+        self.models: tuple[str, ...] = (PP_DET_MODEL, PP_REC_MODELS[lang])
         self._parts: tuple[Any, Any, Any, Any] | None = None
 
     def _load(self) -> tuple[Any, Any, Any, Any]:

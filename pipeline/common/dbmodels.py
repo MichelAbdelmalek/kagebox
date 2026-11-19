@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -98,6 +98,9 @@ class ChapterRow(Base):
     page_end: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16))  # pending | ingesting | ready | failed
     error: Mapped[str | None] = mapped_column(Text, default=None)
+    # Set when a run takes the chapter to 'ingesting'; a run older than the stale limit may be
+    # taken over, and a run only writes results while it still owns the chapter.
+    ingest_started_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
@@ -107,7 +110,7 @@ class PageRow(Base):
     chapter_id: Mapped[str] = mapped_column(
         ForeignKey("chapters.id", ondelete="CASCADE"), index=True
     )
-    index: Mapped[int] = mapped_column(Integer)  # 1-based source page number
+    index: Mapped[int] = mapped_column(Integer)  # 1-based reading position within the chapter
     artifact: Mapped[dict[str, Any]]  # Page JSON
 
 
@@ -124,11 +127,15 @@ class PanelRow(Base):
 
 class BubbleRow(Base):
     __tablename__ = "bubbles"
+    __table_args__ = (
+        UniqueConstraint("panel_id", "reading_order", name="uq_bubbles_panel_id_reading_order"),
+    )
     id: Mapped[str] = mapped_column(String(80), primary_key=True)
     panel_id: Mapped[str] = mapped_column(ForeignKey("panels.id", ondelete="CASCADE"), index=True)
     chapter_id: Mapped[str] = mapped_column(
         ForeignKey("chapters.id", ondelete="CASCADE"), index=True
     )
+    reading_order: Mapped[int] = mapped_column(Integer)  # 1-based, within the panel
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
     artifact: Mapped[dict[str, Any]]  # Bubble JSON
 

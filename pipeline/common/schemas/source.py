@@ -49,12 +49,31 @@ class BBox(Strict):
 
 
 class Page(Artifact):
+    """One page as read. ``index`` is the 1-based reading position within the chapter.
+
+    ``source_page`` is the 1-based page (or strip image) number in the source file. A manhwa
+    strip is cut into several Pages; each records its rows ``[source_y0, source_y1)`` of the
+    source image (both set for a slice, both null for a whole page).
+    """
+
     id: PageId
     chapter_id: ChapterId
-    index: Annotated[int, Field(ge=0)]
+    index: Annotated[int, Field(ge=1)]
+    source_page: Annotated[int, Field(ge=1)]
+    source_y0: Annotated[int, Field(ge=0)] | None = None
+    source_y1: Annotated[int, Field(gt=0)] | None = None
     width: Annotated[int, Field(gt=0, le=60_000)]
     height: Annotated[int, Field(gt=0, le=200_000)]  # manhwa strips are tall
     image_ref: ObjectRef
+
+    @model_validator(mode="after")
+    def _slice_range(self) -> Page:
+        if (self.source_y0 is None) != (self.source_y1 is None):
+            raise ValueError("source_y0 and source_y1 are set together or not at all")
+        y0, y1 = self.source_y0, self.source_y1
+        if y0 is not None and y1 is not None and y1 <= y0:
+            raise ValueError("source_y1 must be greater than source_y0")
+        return self
 
 
 class Panel(Artifact):
@@ -76,6 +95,7 @@ class Bubble(Artifact):
     ocr_confidence: Score
     ocr_engine: ShortText
     speaker: Cited[CharacterId]
+    reading_order: Annotated[int, Field(ge=1)]  # 1-based, within its panel
 
     @computed_field  # type: ignore[prop-decorator]
     @property

@@ -26,20 +26,36 @@ class Strict(BaseModel):
     model_config = ConfigDict(strict=True, extra="forbid", frozen=True)
 
 
+Revision = Annotated[str, StringConstraints(max_length=80)]
+HttpsUrl = Annotated[str, StringConstraints(pattern=r"^https://", max_length=500)]
+
+
+class ModelRef(Strict):
+    """One pinned model that contributed to an artifact (from configs/models.yaml)."""
+
+    name: ShortText
+    revision: Revision
+    license: ShortText
+    source_url: HttpsUrl | None = None
+
+
 class Provenance(Strict):
-    """Where an artifact came from. Stored as a JSON manifest next to the artifact."""
+    """Where an artifact came from. Stored as a JSON manifest next to the artifact.
+
+    ``tool`` is the main tool; ``components`` lists every model that took part (for example the
+    bubble detector and each OCR model behind a Bubble).
+    """
 
     stage: Stage
     tool: ShortText  # model name, or the program (e.g. "ffmpeg") for non-model steps
     tool_version: ShortText
-    model_revision: Annotated[str, StringConstraints(max_length=80)] | None = None
+    model_revision: Revision | None = None
     license: ShortText
-    source_url: Annotated[str, StringConstraints(pattern=r"^https://", max_length=500)] | None = (
-        None
-    )
+    source_url: HttpsUrl | None = None
     provider: Literal["together", "local", "none"]
     params_hash: Sha256
     input_hashes: list[Sha256] = Field(default_factory=list)
+    components: list[ModelRef] = Field(default_factory=list, max_length=16)
     created_at: datetime
 
 

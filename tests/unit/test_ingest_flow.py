@@ -6,10 +6,11 @@ import hashlib
 import io
 import json
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -42,6 +43,7 @@ from pipeline.common.storage import MemoryObjectStore
 from pipeline.common.uploads import UploadRejected
 from pipeline.ingest.bubbles import Region
 from pipeline.ingest.panels import slice_strip
+from pipeline.ingest.process import params_hash
 
 EVIDENCE = "evidence/sha256/" + "a" * 64 + ".pdf"
 W, H = 600, 800
@@ -87,18 +89,29 @@ class FakeDetector:
         return [r for r in self.regions if r.score >= threshold]
 
 
+class Interrupted(BaseException):
+    """Stands in for Prefect's TerminationSignal (a BaseException, not an Exception)."""
+
+
 @dataclass
 class FakeOcr:
     engine: str = "manga-ocr"
+    models: tuple[str, ...] = ("manga-ocr",)
     results: list[tuple[str, float]] = field(default_factory=list)  # consumed in order
     default: tuple[str, float] = ("テスト", 0.97)
     fail_on_call: int | None = None
+    interrupt_on_call: int | None = None
+    on_call: Callable[[int], None] | None = None
     calls: int = 0
 
     def read(self, crop: Image.Image) -> tuple[str, float]:
         self.calls += 1
+        if self.on_call is not None:
+            self.on_call(self.calls)
         if self.fail_on_call is not None and self.calls == self.fail_on_call:
             raise RuntimeError("model exploded: /secret/path details")
+        if self.interrupt_on_call is not None and self.calls == self.interrupt_on_call:
+            raise Interrupted("terminated")
         return self.results.pop(0) if self.results else self.default
 
 
@@ -267,9 +280,12 @@ def test_ingest_creates_pages_panels_bubbles(
             s.scalars(select(PageRow).where(PageRow.chapter_id == cid).order_by(PageRow.index))
         )
         assert [p.index for p in pages] == [1, 2]
-        for prow in pages:
+        for n, prow in enumerate(pages, 1):
             page = Page.model_validate_json(json.dumps(prow.artifact))
             assert (page.width, page.height, page.chapter_id) == (W, H, cid)
+            assert (page.source_page, page.source_y0, page.source_y1) == (n, None, None)
+            params = {"tool": "kagebox-ingest", "direction": "rtl", "fit": "long_side"}
+            assert page.provenance.params_hash == params_hash(params)
             assert page.provenance.stage == "ingest"
             assert page.provenance.tool == "kagebox-ingest"
             assert page.provenance.input_hashes == [src_hash]
@@ -295,12 +311,13 @@ def test_ingest_creates_pages_panels_bubbles(
                 s.scalars(
                     select(BubbleRow)
                     .where(BubbleRow.panel_id == panels[0].id)
-                    .order_by(BubbleRow.id)
+                    .order_by(BubbleRow.reading_order)
                 )
             )
             bubbles = [Bubble.model_validate_json(json.dumps(b.artifact)) for b in top]
-            # manga reads right to left: the right-hand balloon first; id order = reading order
+            # manga reads right to left: the right-hand balloon first
             assert [b.bbox for b in bubbles] == [IN_TOP_RIGHT.bbox, IN_TOP.bbox]
+            assert [b.reading_order for b in bubbles] == [r.reading_order for r in top] == [1, 2]
             b = bubbles[1]
             assert (b.kind, b.text, b.lang, b.ocr_engine, b.speaker.value) == (
                 "speech",
@@ -312,6 +329,14 @@ def test_ingest_creates_pages_panels_bubbles(
             assert b.provenance.tool == "manga-ocr"
             assert b.provenance.model_revision == "aa6573bd10b0d446cbf622e29c3e084914df9741"
             assert b.provenance.license == "CC-BY-SA-4.0"
+            assert [c.name for c in b.provenance.components] == [
+                "manga-bubble-detector",
+                "manga-ocr",
+            ]
+            detector = b.provenance.components[0]
+            assert detector.revision == "bcf342f296beb56005e044da15990502629015de"
+            assert detector.license == "Apache-2.0"
+            assert detector.source_url is not None
             assert not top[1].needs_review
             bottom = s.scalars(select(BubbleRow).where(BubbleRow.panel_id == panels[1].id)).one()
             assert bottom.artifact["kind"] == "caption"
@@ -429,6 +454,9 @@ def test_manhwa_strip_sliced_into_pages(tmp_path: Path, monkeypatch: pytest.Monk
         ]
     assert [p.index for p in pages] == list(range(1, len(expected) + 1))
     assert [p.height for p in pages] == [y1 - y0 for y0, y1 in expected]
+    assert [(p.source_page, p.source_y0, p.source_y1) for p in pages] == [
+        (1, y0, y1) for y0, y1 in expected
+    ]
     assert all(p.width == 400 for p in pages)
     assert chapter(env, cid).status == "ready"
 
@@ -559,3 +587,200 @@ def test_deployment_parameters_validate() -> None:
     assert ingest_flow.validate_parameters({"chapter_id": "chap_1"}) == {"chapter_id": "chap_1"}
     with pytest.raises(Exception, match="chapter_id"):
         ingest_flow.validate_parameters({})
+
+
+# ---------------------------------------------------------------------------------------------
+# fix round 1: source position, provenance components, interruption, locking, invalid OCR
+
+
+def test_index_is_reading_position_and_source_page_is_real(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    env.detector.regions = []
+    cid = add_chapter(env, make_cbz([page_png()] * 4), page_start=3, page_end=4)
+    ingest_flow(cid)
+    with Session(env.engine) as s:
+        pages = [
+            Page.model_validate_json(json.dumps(p.artifact))
+            for p in s.scalars(
+                select(PageRow).where(PageRow.chapter_id == cid).order_by(PageRow.index)
+            )
+        ]
+    assert [(p.index, p.source_page, p.source_y0) for p in pages] == [(1, 3, None), (2, 4, None)]
+
+
+def test_pp_ocr_components_listed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch, fmt="comic_ltr")
+    env.detector.regions = [IN_TOP]
+    env.ocr.engine, env.ocr.models = "pp-ocrv5-rec-en", ("pp-ocrv5-det", "pp-ocrv5-rec-en")
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1, fmt="comic_ltr")
+    ingest_flow(cid)
+    with Session(env.engine) as s:
+        row = s.scalars(select(BubbleRow).where(BubbleRow.chapter_id == cid)).one()
+    prov = Bubble.model_validate_json(json.dumps(row.artifact)).provenance
+    assert (prov.tool, prov.model_revision) == (
+        "pp-ocrv5-rec-en",
+        "e4abce2bbd335f6c3eda0507b7f8e8abd5af3419",
+    )
+    assert [c.name for c in prov.components] == [
+        "manga-bubble-detector",
+        "pp-ocrv5-det",
+        "pp-ocrv5-rec-en",
+    ]
+
+
+def test_interrupted_run_marks_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+    env.ocr.interrupt_on_call = 2
+    with pytest.raises(Interrupted):
+        ingest_mod.run_ingest(cid, ingest_mod.build_deps())
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "ingest was interrupted")
+    assert count(env, PageRow, cid) == 0
+
+
+def test_flow_hooks_mark_interrupted_chapter_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    assert ingest_mod.on_interrupted in ingest_flow.on_crashed_hooks
+    assert ingest_mod.on_interrupted in ingest_flow.on_cancellation_hooks
+    with Session(env.engine) as s, s.begin():
+        row = s.get(ChapterRow, cid)
+        assert row is not None
+        row.status, row.ingest_started_at = "ingesting", datetime.now(UTC)
+    run = SimpleNamespace(parameters={"chapter_id": cid})
+    ingest_mod.on_interrupted(ingest_flow, run, None)  # type: ignore[arg-type]
+    assert (chapter(env, cid).status, chapter(env, cid).error) == (
+        "failed",
+        "ingest was interrupted",
+    )
+    # a chapter that is not ingesting (already failed with a better message) is left alone
+    with Session(env.engine) as s, s.begin():
+        row = s.get(ChapterRow, cid)
+        assert row is not None
+        row.error = "rights record has expired"
+    ingest_mod.on_interrupted(ingest_flow, run, None)  # type: ignore[arg-type]
+    assert chapter(env, cid).error == "rights record has expired"
+
+
+def test_failing_fail_does_not_mask_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    env.ocr.fail_on_call = 1
+
+    def broken_fail(*args: Any, **kwargs: Any) -> None:
+        raise OSError("database went away")
+
+    monkeypatch.setattr(ingest_mod, "_fail", broken_fail)
+    with pytest.raises(RuntimeError, match="model exploded"):
+        ingest_mod.run_ingest(cid, ingest_mod.build_deps())
+
+
+def test_concurrent_ingest_refused_stale_taken_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    ingest_flow(cid)
+    pages_before = count(env, PageRow, cid)
+
+    def set_running(started: datetime) -> None:
+        with Session(env.engine) as s, s.begin():
+            row = s.get(ChapterRow, cid)
+            assert row is not None
+            row.status, row.ingest_started_at = "ingesting", started
+
+    set_running(datetime.now(UTC))
+    with pytest.raises(ingest_mod.IngestAlreadyRunning, match="ingest already running"):
+        ingest_flow(cid)
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("ingesting", None)  # the running ingest is untouched
+    assert count(env, PageRow, cid) == pages_before
+    assert env.ocr.calls == 3  # only the first run read anything
+
+    set_running(datetime.now(UTC) - timedelta(seconds=ingest_mod.STALE_INGEST_S + 60))
+    assert ingest_flow(cid).pages == 1
+    assert chapter(env, cid).status == "ready"
+
+
+def test_taken_over_run_does_not_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+
+    def take_over(call: int) -> None:  # another run takes the chapter mid-way
+        if call == 1:
+            with Session(env.engine) as s, s.begin():
+                row = s.get(ChapterRow, cid)
+                assert row is not None
+                row.ingest_started_at = datetime.now(UTC) + timedelta(seconds=1)
+
+    env.ocr.on_call = take_over
+    with pytest.raises(ingest_mod.IngestAlreadyRunning):
+        ingest_mod.run_ingest(cid, ingest_mod.build_deps())
+    row = chapter(env, cid)
+    assert row.status == "ingesting"  # left to the run that owns it
+    assert count(env, PageRow, cid) == 0
+
+
+@pytest.mark.parametrize(
+    ("result", "field_name", "error_type"),
+    [
+        (("ok", float("nan")), "ocr_confidence", "less_than_equal"),  # NaN fails the bound
+        (("ok", 1.5), "ocr_confidence", "less_than_equal"),
+        (("秘" * 3000, 0.95), "text", "string_too_long"),
+    ],
+)
+def test_invalid_ocr_result_becomes_review_item(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    result: tuple[str, float],
+    field_name: str,
+    error_type: str,
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    env.ocr.results = [result]  # first bubble read (top panel, right balloon) is bad
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+
+    summary = ingest_flow(cid)
+
+    assert (summary.pages, summary.bubbles) == (1, 2)
+    invalid = [r for r in reviews(env, cid) if r.kind == "bubble_invalid"]
+    assert len(invalid) == 1
+    assert field_name in invalid[0].reason and error_type in invalid[0].reason
+    assert "秘" not in invalid[0].reason and "nan" not in invalid[0].reason.lower()
+    assert "秘秘" not in caplog.text
+    with Session(env.engine) as s:
+        top = s.scalars(
+            select(BubbleRow).where(BubbleRow.chapter_id == cid).order_by(BubbleRow.reading_order)
+        ).all()
+    assert all(b.artifact["text"] == "テスト" for b in top)
+    assert sorted(b.reading_order for b in top) == [1, 1]  # one per panel, renumbered from 1
+
+
+def test_rights_revoked_mid_run_stores_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+
+    def revoke(call: int) -> None:
+        if call == 1:
+            with Session(env.engine) as s, s.begin():
+                row = s.scalars(
+                    select(RightsRow).where(RightsRow.project_id == env.project_id)
+                ).one()
+                row.record = {**row.record, "status": "rejected"}
+
+    env.ocr.on_call = revoke
+    with pytest.raises(RightsDenied):
+        ingest_flow(cid)
+    row = chapter(env, cid)
+    assert row.status == "failed" and row.error is not None and "rejected" in row.error
+    assert count(env, PageRow, cid) == 0

@@ -14,6 +14,9 @@ from pipeline.common.schemas import (
     Bubble,
     Check,
     Cited,
+    ModelRef,
+    Page,
+    Provenance,
     RightsDenied,
     RightsRecord,
     SceneJSON,
@@ -136,6 +139,7 @@ def bubble(conf: float, speaker: dict[str, Any] | None = None) -> str:
             "ocr_confidence": conf,
             "ocr_engine": "paddleocr",
             "speaker": speaker if speaker is not None else {},
+            "reading_order": 1,
         }
     )
 
@@ -148,6 +152,73 @@ def test_bubble_low_confidence_flagged() -> None:
 def test_bubble_speaker_must_cite_own_panel() -> None:
     with pytest.raises(ValidationError):
         Bubble.model_validate_json(bubble(0.95, {"value": "char_ada", "panel_ids": ["panel_9"]}))
+
+
+def test_bubble_reading_order_required_and_positive() -> None:
+    raw = json.loads(bubble(0.95))
+    for bad in (0, -1, None):
+        with pytest.raises(ValidationError, match="reading_order"):
+            Bubble.model_validate_json(j({**raw, "reading_order": bad}))
+    del raw["reading_order"]
+    with pytest.raises(ValidationError, match="reading_order"):
+        Bubble.model_validate_json(j(raw))
+
+
+# --- Page ----------------------------------------------------------------------------------------
+
+
+def page(**over: Any) -> str:
+    base: dict[str, Any] = {
+        "id": "page_1",
+        "provenance": PROV,
+        "chapter_id": "chap_1",
+        "index": 1,
+        "source_page": 3,
+        "width": 100,
+        "height": 200,
+        "image_ref": REF,
+    }
+    base.update(over)
+    return j(base)
+
+
+def test_page_source_position() -> None:
+    p = Page.model_validate_json(page())
+    assert (p.index, p.source_page, p.source_y0, p.source_y1) == (1, 3, None, None)
+    sliced = Page.model_validate_json(page(source_y0=0, source_y1=200))
+    assert (sliced.source_y0, sliced.source_y1) == (0, 200)
+    for bad in (
+        {"source_page": 0},
+        {"index": 0},
+        {"source_y0": 0},  # both or neither
+        {"source_y1": 10},
+        {"source_y0": 10, "source_y1": 10},  # y1 > y0
+        {"source_y0": -1, "source_y1": 10},
+    ):
+        with pytest.raises(ValidationError):
+            Page.model_validate_json(page(**bad))
+    raw = json.loads(page())
+    del raw["source_page"]
+    with pytest.raises(ValidationError, match="source_page"):
+        Page.model_validate_json(j(raw))
+
+
+# --- Provenance components -----------------------------------------------------------------------
+
+
+def test_provenance_components() -> None:
+    assert Provenance.model_validate_json(j(PROV)).components == []
+    ref = {
+        "name": "manga-ocr",
+        "revision": "a" * 40,
+        "license": "CC-BY-SA-4.0",
+        "source_url": "https://huggingface.co/x",
+    }
+    prov = Provenance.model_validate_json(j({**PROV, "components": [ref]}))
+    assert prov.components == [ModelRef(**ref)]
+    for bad in ({"source_url": "http://x"}, {"extra": 1}, {"revision": "r" * 81}):
+        with pytest.raises(ValidationError):
+            Provenance.model_validate_json(j({**PROV, "components": [{**ref, **bad}]}))
 
 
 def test_ocr_threshold_matches_config() -> None:
