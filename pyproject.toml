@@ -39,6 +39,7 @@ worker = [
   "qdrant-client>=1.12,<2",
   "jiwer>=3,<5",
   "soundfile>=0.12,<1",
+  "pypdfium2>=4.30,<6",  # PDF rasterization (PDFium; no JS, no network), run in a sandbox
   "prefect>=3.1,<4",
   "sqlalchemy>=2.0.36,<3",
   "psycopg[binary]>=3.2,<4",
