@@ -77,6 +77,8 @@ For Phase 1 generation, put your Together AI key in `deploy/secrets/together_api
 
 Chapter sources up to 200 MB are uploaded over HTTP (`POST /api/chapters/{id}/upload`). Larger ones are imported server-side. Imports are scoped per project: put the file in `data/imports/<project_id>/` (gitignored; create the directory; regular files only, symlinks are ignored, a hard link is fine) and call `POST /api/chapters/{id}/import` with `{"name": "<file name>", "page_start": 1, "page_end": N}`. The API and the worker look only in the directory of the chapter's own project, so a source staged for one project can neither be imported nor probed through another (whose rights record does not cover it). `data/imports` is mounted read-only at `/imports` into `api` and `worker-cpu`; the API only matches the bare name against a listing of the project's directory.
 
+Both return `202 {"job_id": ...}`. Follow the run with `GET /api/jobs/{job_id}` (`submitted` → `running` → `completed` / `failed` / `cancelled`) and the chapter with `GET /api/chapters/{id}` (`pending` → `ingesting` → `ready` / `failed`, with a user-safe `error`). A run heartbeats the chapter after every page; an `ingesting` chapter with no heartbeat for 10 minutes is reported as failed (`ingest was interrupted`) and accepts a new source, and a run longer than 3 hours is ended (`ingest timed out`). Request bodies are capped at 1 MB (Caddy and the API) except the multipart upload routes (chapter source, rights evidence).
+
 ### Make targets
 
 | Target | What it does |
