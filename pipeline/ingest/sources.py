@@ -11,20 +11,22 @@ limit applies per page and a crash only loses that page.
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import logging
 import os
 import re
-import resource
 import shutil
+import signal
 import stat
 
 # subprocess runs only our own child module, as an argument list without a shell.
 import subprocess  # nosec B404
 import sys
 import tempfile
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Literal
 
@@ -35,9 +37,8 @@ from pipeline.common.uploads import (
     IMAGE_MIMES,
     ArchiveLimits,
     UploadRejected,
-    reencode_image,
+    decode_image,
     safe_read_zip,
-    sniff,
 )
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,7 @@ MAX_IMAGE_BYTES = 200 * 1024**2
 MAX_RENDERED_PNG_BYTES = 128 * 1024**2
 
 CHILD_TIMEOUT_S = 120.0  # wall clock: RLIMIT_CPU does not stop a sleeping or blocked child
+DOC_DEADLINE_S = 1800.0  # wall clock summed over the probe and every page child of one document
 CHILD_CPU_S = 60
 CHILD_AS_BYTES = 2 * 1024**3
 CHILD_FSIZE_BYTES = 256 * 1024**2
@@ -124,29 +126,34 @@ def _fit(image: Image.Image) -> Image.Image:
     return rgb.resize(size, Image.Resampling.LANCZOS)
 
 
-def _decode(data: bytes) -> Image.Image:
-    """Decode bytes already re-encoded or produced by our child (MAX_IMAGE_PIXELS still on)."""
+def _decode_child_png(data: bytes) -> Image.Image:
+    """Decode a PNG our child rendered. It was told the size cap; refuse rather than downscale."""
     try:
-        with Image.open(io.BytesIO(data)) as im:
-            fmt = im.format
-            im.load()
-            fitted = _fit(im)
+        im = Image.open(io.BytesIO(data), formats=("PNG",))
     except (Image.DecompressionBombError, OSError, SyntaxError, ValueError) as exc:
         raise UploadRejected("image could not be decoded safely") from exc
-    if fmt != "PNG":
-        raise UploadRejected("image could not be decoded safely")
-    return fitted
+    with im:
+        if max(im.size) > MAX_LONG_SIDE:
+            raise UploadRejected("image could not be decoded safely")
+        try:
+            im.load()
+        except (Image.DecompressionBombError, OSError, SyntaxError, ValueError) as exc:
+            raise UploadRejected("image could not be decoded safely") from exc
+        return im.convert("RGB")
 
 
 def _read_capped(path: Path, max_bytes: int, *, truncate: bool = False) -> bytes:
     """Read a regular file without following a final symlink; refuse (or truncate) past max."""
+    # O_NONBLOCK: opening a FIFO for reading would otherwise block until a writer appears.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        fd = os.open(path, flags)
     except OSError as exc:
         raise UploadRejected("source file could not be opened") from exc
     with os.fdopen(fd, "rb") as fh:
-        if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise UploadRejected("source is not a regular file")
+        fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK)
         data = fh.read(max_bytes + 1)
     if len(data) > max_bytes:
         if truncate:
@@ -155,9 +162,25 @@ def _read_capped(path: Path, max_bytes: int, *, truncate: bool = False) -> bytes
     return data
 
 
+_ASCII_DIGITS = re.compile(r"([0-9]+)")
+
+
 def _natural_key(name: str) -> tuple[tuple[int, int, str], ...]:
-    parts = re.split(r"(\d+)", name.casefold())
-    return tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in parts if p)
+    """Digit runs compare by value without int(): (length without leading zeros, digits).
+
+    Only ASCII digits count as numbers, so '²' and other Unicode digits sort as text, and a
+    hostile 5000-digit name cannot hit int()'s digit limit.
+    """
+    key = []
+    for part in _ASCII_DIGITS.split(name.casefold()):
+        if not part:
+            continue
+        if _ASCII_DIGITS.fullmatch(part):
+            digits = part.lstrip("0") or "0"
+            key.append((0, len(digits), digits))
+        else:
+            key.append((1, 0, part))
+    return tuple(key)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -166,38 +189,54 @@ def _natural_key(name: str) -> tuple[tuple[int, int, str], ...]:
 
 def _iter_cbz(path: Path, page_start: int, page_end: int) -> Iterator[tuple[int, Image.Image]]:
     entries = safe_read_zip(_read_capped(path, MAX_CBZ_BYTES), ArchiveLimits())
-    images = sorted(
-        ((name, data) for name, data in entries if _is_image(data)),
-        key=lambda e: _natural_key(e[0]),
-    )
+    images = [(name, data) for name, data in entries if _is_page_image(data)]
+    _log_skipped(len(entries) - len(images))
+    images.sort(key=lambda e: _natural_key(e[0]))
     _check_range(len(images), page_start, page_end)
     for index in range(page_start, page_end + 1):
         _, data = images[index - 1]
-        sniff(data, IMAGE_MIMES, MAX_IMAGE_BYTES)
-        yield index, _decode(reencode_image(data))
+        yield index, _fit(decode_image(data, IMAGE_MIMES, MAX_IMAGE_BYTES))
 
 
-def _is_image(data: bytes) -> bool:
+def _is_page_image(data: bytes) -> bool:
+    """True for png/jpeg/webp, False for non-images (ComicInfo.xml, __MACOSX/...).
+
+    Any other image type is a page we cannot read: refuse instead of silently shifting the page
+    numbers of everything after it.
+    """
     kind = filetype.guess(data[:8192]) if data else None
-    return kind is not None and kind.mime in IMAGE_MIMES
+    if kind is None or not kind.mime.startswith("image/"):
+        return False
+    if kind.mime not in IMAGE_MIMES:
+        raise UploadRejected("unsupported image format: pages must be PNG, JPEG or WebP")
+    return True
+
+
+def _log_skipped(count: int) -> None:
+    if count:
+        log.info("skipped %d non-image entries", count)
 
 
 def _iter_images(folder: Path, page_start: int, page_end: int) -> Iterator[tuple[int, Image.Image]]:
     if folder.is_symlink() or not folder.is_dir():
         raise UploadRejected("image source must be a folder")
     files = []
+    skipped = 0
     for entry in os.scandir(folder):
         # regular files only: no symlinks, no subdirectories, no devices
         if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+            skipped += 1
             continue
-        if _is_image(_read_capped(Path(entry.path), 8192, truncate=True)):
+        if _is_page_image(_read_capped(Path(entry.path), 8192, truncate=True)):
             files.append(entry.name)
+        else:
+            skipped += 1
+    _log_skipped(skipped)
     files.sort(key=_natural_key)
     _check_range(len(files), page_start, page_end)
     for index in range(page_start, page_end + 1):
         data = _read_capped(folder / files[index - 1], MAX_IMAGE_BYTES)
-        sniff(data, IMAGE_MIMES, MAX_IMAGE_BYTES)
-        yield index, _decode(reencode_image(data))
+        yield index, _fit(decode_image(data, IMAGE_MIMES, MAX_IMAGE_BYTES))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -209,47 +248,58 @@ def _child_argv(args: list[str]) -> list[str]:
     return [sys.executable, "-I", "-m", CHILD_MODULE, *args]
 
 
-def _limits_for_child() -> Callable[[], None]:
-    """Snapshot the (patchable) limits now: the preexec hook runs after fork."""
-    limits = (
-        (resource.RLIMIT_AS, CHILD_AS_BYTES),
-        (resource.RLIMIT_CPU, CHILD_CPU_S),
-        (resource.RLIMIT_FSIZE, CHILD_FSIZE_BYTES),
-        (resource.RLIMIT_NOFILE, CHILD_NOFILE),
-        (resource.RLIMIT_CORE, 0),
-    )
+class _Budget:
+    """Wall-clock budget shared by the probe and all page children of one document."""
 
-    def apply() -> None:  # pragma: no cover - runs in the forked child before exec
-        for which, value in limits:
-            resource.setrlimit(which, (value, value))
+    def __init__(self) -> None:
+        self.remaining = DOC_DEADLINE_S
 
-    return apply
+    def timeout(self) -> tuple[float, bool]:
+        """(timeout for the next child, whether the document budget is what binds)."""
+        if self.remaining <= 0:
+            raise UploadRejected("document took too long to render")
+        return min(CHILD_TIMEOUT_S, self.remaining), self.remaining < CHILD_TIMEOUT_S
 
 
-def _run_child(args: list[str], cwd: Path) -> dict[str, object]:
-    argv = _child_argv(args)
+def _run_child(args: list[str], cwd: Path, budget: _Budget | None = None) -> dict[str, object]:
+    budget = budget or _Budget()
+    timeout, doc_bound = budget.timeout()
+    # The child applies these to itself before importing pypdfium2 (no preexec_fn: not
+    # thread-safe, and Prefect runs tasks in threads).
+    limits = [str(CHILD_AS_BYTES), str(CHILD_CPU_S), str(CHILD_FSIZE_BYTES), str(CHILD_NOFILE)]
+    argv = _child_argv([*limits, *args])
+    started = time.monotonic()
     try:
         # Fixed argv list (our own module, file paths as separate arguments), never a shell.
-        proc = subprocess.run(  # noqa: S603  # nosec B603
+        proc = subprocess.Popen(  # noqa: S603  # nosec B603
             argv,
-            capture_output=True,
-            timeout=CHILD_TIMEOUT_S,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             close_fds=True,
             env=dict(CHILD_ENV),
             cwd=cwd,
-            preexec_fn=_limits_for_child(),
-            stdin=subprocess.DEVNULL,
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        log.warning("pdf child timed out after %ss (args=%s)", CHILD_TIMEOUT_S, args[:1])
-        raise UploadRejected("PDF processing timed out") from exc
     except OSError as exc:
         log.error("pdf child could not start: %s", exc)
         raise UploadRejected("the PDF could not be processed") from exc
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_group(proc)
+        budget.remaining -= time.monotonic() - started
+        log.warning("pdf child timed out after %.1fs (cmd=%s)", timeout, args[:1])
+        if doc_bound:
+            raise UploadRejected("document took too long to render") from exc
+        raise UploadRejected("PDF processing timed out") from exc
+    finally:
+        if proc.poll() is None:
+            _kill_group(proc)
+    budget.remaining -= time.monotonic() - started
 
     try:
-        result = json.loads(proc.stdout.decode("utf-8", "replace").strip() or "null")
+        result = json.loads(stdout.decode("utf-8", "replace").strip() or "null")
     except json.JSONDecodeError:
         result = None
     if isinstance(result, dict) and result.get("ok") is False and proc.returncode == 2:
@@ -260,10 +310,19 @@ def _run_child(args: list[str], cwd: Path) -> dict[str, object]:
         log.warning(
             "pdf child failed: rc=%s stderr=%r",
             proc.returncode,
-            proc.stderr[-2000:].decode("utf-8", "replace"),
+            stderr[-2000:].decode("utf-8", "replace"),
         )
         raise UploadRejected("the PDF could not be processed")
     return result
+
+
+def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+    """Kill the child's whole session (it may have spawned helpers), then reap it."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+    proc.communicate()
 
 
 def _iter_pdf(path: Path, page_start: int, page_end: int) -> Iterator[tuple[int, Image.Image]]:
@@ -277,8 +336,9 @@ def _iter_pdf(path: Path, page_start: int, page_end: int) -> Iterator[tuple[int,
         raise UploadRejected(f"file is larger than {MAX_PDF_BYTES} bytes")
     pdf = str(path.resolve())
     workdir = Path(tempfile.mkdtemp(prefix="kagebox-pdf-"))
+    budget = _Budget()
     try:
-        probe = _run_child(["probe", pdf], workdir)
+        probe = _run_child(["probe", pdf], workdir, budget)
         total = probe.get("pages")
         if not isinstance(total, int) or isinstance(total, bool) or total < 0:
             raise UploadRejected("the PDF could not be processed")
@@ -288,9 +348,10 @@ def _iter_pdf(path: Path, page_start: int, page_end: int) -> Iterator[tuple[int,
             _run_child(
                 ["render", pdf, str(index), str(out), repr(RENDER_DPI), str(MAX_LONG_SIDE)],
                 workdir,
+                budget,
             )
             data = _read_capped(out, MAX_RENDERED_PNG_BYTES)
             out.unlink()
-            yield index, _decode(data)
+            yield index, _decode_child_png(data)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)

@@ -43,16 +43,48 @@ def sniff(data: bytes, allowed: dict[str, str], max_bytes: int) -> Sniffed:
     return Sniffed(kind.mime, allowed[kind.mime])
 
 
+_PIL_FORMATS = {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}
+_DECODE_ERRORS = (Image.DecompressionBombError, OSError, SyntaxError, ValueError)
+
+
+def _open_checked(data: bytes, formats: tuple[str, ...]) -> Image.Image:
+    """Open (header only), refuse more than Image.MAX_IMAGE_PIXELS strictly, then decode.
+
+    Pillow only warns between MAX_IMAGE_PIXELS and twice that; we refuse before any pixel data
+    is decoded so a small file cannot claim a huge canvas.
+    """
+    try:
+        im = Image.open(io.BytesIO(data), formats=formats)
+    except _DECODE_ERRORS as exc:
+        raise UploadRejected("image could not be decoded safely") from exc
+    width, height = im.size
+    cap = Image.MAX_IMAGE_PIXELS
+    if cap is not None and width * height > cap:
+        im.close()
+        raise UploadRejected("image is too large")
+    try:
+        im.load()
+    except _DECODE_ERRORS as exc:
+        im.close()
+        raise UploadRejected("image could not be decoded safely") from exc
+    return im
+
+
+def decode_image(data: bytes, allowed: dict[str, str], max_bytes: int) -> Image.Image:
+    """Sniff, size-check and decode once; returns the decoded image (metadata is not kept)."""
+    sniffed = sniff(data, allowed, max_bytes)
+    fmt = _PIL_FORMATS.get(sniffed.mime)
+    if fmt is None:
+        raise UploadRejected("file type not allowed")
+    return _open_checked(data, (fmt,))
+
+
 def reencode_image(data: bytes) -> bytes:
     """Decode and re-encode as PNG: drops metadata and anything appended (polyglots)."""
-    try:
-        with Image.open(io.BytesIO(data)) as im:
-            im.load()
-            out = io.BytesIO()
-            im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB").save(out, "PNG")
-            return out.getvalue()
-    except (Image.DecompressionBombError, OSError, SyntaxError, ValueError) as exc:
-        raise UploadRejected("image could not be decoded safely") from exc
+    with _open_checked(data, tuple(_PIL_FORMATS.values())) as im:
+        out = io.BytesIO()
+        im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB").save(out, "PNG")
+        return out.getvalue()
 
 
 @dataclass(frozen=True)

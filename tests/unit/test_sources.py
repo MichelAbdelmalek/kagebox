@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 import time
 import zipfile
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import pypdfium2 as pdfium
 import pytest
-from PIL import Image
+from PIL import Image, ImageFile
 
 from pipeline.common.uploads import UploadRejected
 from pipeline.ingest import sources
@@ -224,15 +225,245 @@ def test_temp_dir_removed_on_early_stop(tmp_path: Path, monkeypatch: pytest.Monk
 def test_child_runs_with_rlimits_and_minimal_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The real pdf_child entry point applies all five limits to itself (no preexec_fn)."""
     monkeypatch.setenv("TOGETHER_API_KEY", "secret-should-not-leak")
+    monkeypatch.setattr(sources, "CHILD_NOFILE", 48)
     script = (
-        "import json, os, resource as r; print(json.dumps({'ok': True,"
-        " 'as': r.getrlimit(r.RLIMIT_AS)[0], 'cpu': r.getrlimit(r.RLIMIT_CPU)[0],"
-        " 'nofile': r.getrlimit(r.RLIMIT_NOFILE)[0], 'env': sorted(os.environ)}))"
+        "import json, os, sys, resource as r\n"
+        "from pipeline.ingest import pdf_child\n"
+        "def fake_probe(pdf):\n"
+        "    names = ['AS', 'CPU', 'FSIZE', 'NOFILE', 'CORE']\n"
+        "    lim = {n: list(r.getrlimit(getattr(r, 'RLIMIT_' + n))) for n in names}\n"
+        "    return {'ok': True, 'lim': lim, 'env': sorted(os.environ),\n"
+        "            'pdfium_loaded': 'pypdfium2' in sys.modules}\n"
+        "pdf_child.probe = fake_probe\n"
+        "sys.exit(pdf_child.main(sys.argv[1:]))\n"
     )
-    monkeypatch.setattr(sources, "_child_argv", lambda args: [sys.executable, "-I", "-c", script])
+    monkeypatch.setattr(
+        sources, "_child_argv", lambda args: [sys.executable, "-I", "-c", script, *args]
+    )
     out = sources._run_child(["probe", "x"], tmp_path)
-    assert out["as"] == 2 * 1024**3
-    assert out["cpu"] == 60
-    assert out["nofile"] == sources.CHILD_NOFILE
+    lim = out["lim"]
+    assert lim == {
+        "AS": [2 * 1024**3] * 2,
+        "CPU": [60, 60],
+        "FSIZE": [sources.CHILD_FSIZE_BYTES] * 2,
+        "NOFILE": [48, 48],
+        "CORE": [0, 0],
+    }
     assert "TOGETHER_API_KEY" not in out["env"]  # type: ignore[operator]
+    assert out["pdfium_loaded"] is False
+
+
+def test_run_child_does_not_use_preexec_fn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+    real_popen = sources.subprocess.Popen
+
+    def spy(*a: object, **k: object) -> object:
+        seen.update(k)
+        return real_popen(*a, **k)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(sources.subprocess, "Popen", spy)
+    ok = "print('{\"ok\": true}')"
+    monkeypatch.setattr(sources, "_child_argv", lambda args: [sys.executable, "-I", "-c", ok])
+    sources._run_child(["probe", "x"], tmp_path)
+    assert seen.get("preexec_fn") is None
+    assert seen.get("start_new_session") is True
+
+
+# --- fix round 1 ---------------------------------------------------------------------------
+
+FAKE_CHILD = """
+import json, sys, time
+args = sys.argv[1:]
+time.sleep(float({sleep!r}))
+if "probe" in args:
+    print(json.dumps({{"ok": True, "pages": {pages}}}))
+else:
+    from PIL import Image
+    i = args.index("render")
+    Image.new("RGB", ({side}, {side}), "white").save(args[i + 3], "PNG")
+    print(json.dumps({{"ok": True}}))
+"""
+
+
+def fake_child(
+    monkeypatch: pytest.MonkeyPatch, *, sleep: float = 0, pages: int = 3, side: int = 50
+) -> None:
+    script = FAKE_CHILD.format(sleep=sleep, pages=pages, side=side)
+    monkeypatch.setattr(
+        sources, "_child_argv", lambda args: [sys.executable, "-I", "-c", script, *args]
+    )
+
+
+def cbz_of(tmp_path: Path, entries: list[tuple[str, bytes]]) -> Path:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in entries:
+            zf.writestr(name, data)
+    path = tmp_path / "x.cbz"
+    path.write_bytes(buf.getvalue())
+    return path
+
+
+def img_bytes(fmt: str, size: tuple[int, int] = (8, 8)) -> bytes:
+    out = io.BytesIO()
+    Image.new("RGB", size, "white").save(out, fmt)
+    return out.getvalue()
+
+
+@pytest.mark.parametrize("fmt", ["GIF", "BMP", "TIFF"])
+def test_cbz_unsupported_image_format_refused_not_skipped(tmp_path: Path, fmt: str) -> None:
+    cbz = cbz_of(
+        tmp_path,
+        [
+            ("1.png", png_bytes((4, 4))),
+            (f"2.{fmt.lower()}", img_bytes(fmt)),
+            ("3.png", png_bytes((4, 4))),
+        ],
+    )
+    with pytest.raises(UploadRejected, match="unsupported image format"):
+        list(iter_pages(cbz, "cbz", 1, 1))
+
+
+def test_images_folder_unsupported_image_format_refused(tmp_path: Path) -> None:
+    folder = tmp_path / "pages"
+    folder.mkdir()
+    (folder / "1.png").write_bytes(png_bytes((4, 4)))
+    (folder / "2.bmp").write_bytes(img_bytes("BMP"))
+    with pytest.raises(UploadRejected, match="unsupported image format"):
+        list(iter_pages(folder, "images", 1, 1))
+
+
+def test_natural_key_hostile_names() -> None:
+    names = ["a\u00b2.png", "a10.png", "a2.png", "9" * 5000 + ".png", "0099.png", "10.png"]
+    ordered = sorted(names, key=sources._natural_key)
+    assert ordered.index("a2.png") < ordered.index("a10.png")
+    assert ordered.index("10.png") < ordered.index("0099.png") < ordered.index("9" * 5000 + ".png")
+
+
+def test_cbz_hostile_names_sort(tmp_path: Path) -> None:
+    cbz = cbz_of(
+        tmp_path,
+        [("p\u00b2.png", png_bytes((10, 4))), ("1" * 5000 + ".png", png_bytes((20, 4)))],
+    )
+    pages = list(iter_pages(cbz, "cbz", 1, 2))
+    assert [im.size[0] for _, im in pages] == [20, 10]
+
+
+class Blocked(BaseException):
+    """Not an OSError, so code under test cannot swallow it as an open() failure."""
+
+
+def _run_with_alarm(fn: object, seconds: int = 3) -> None:
+    import signal
+
+    def boom(*_: object) -> None:
+        raise Blocked("blocked on a FIFO")
+
+    old = signal.signal(signal.SIGALRM, boom)
+    signal.alarm(seconds)
+    try:
+        fn()  # type: ignore[operator]
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+@pytest.mark.parametrize("kind", ["detect", "pdf", "cbz"])
+def test_fifo_refused_promptly(tmp_path: Path, kind: str) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    def go() -> None:
+        with pytest.raises(UploadRejected):
+            if kind == "detect":
+                detect_kind(fifo)
+            else:
+                list(iter_pages(fifo, kind, 1, 1))  # type: ignore[arg-type]
+
+    _run_with_alarm(go)
+
+
+def test_read_capped_fifo_refused_promptly(tmp_path: Path) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+
+    def go() -> None:
+        with pytest.raises(UploadRejected, match="regular file"):
+            sources._read_capped(fifo, 100)
+
+    _run_with_alarm(go)
+
+
+def test_cbz_pixel_cap_is_strict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1600 px is between the cap and 2x the cap, where Pillow only warns.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    cbz = cbz_of(tmp_path, [("1.png", png_bytes((40, 40)))])
+    with pytest.raises(UploadRejected, match="too large"):
+        list(iter_pages(cbz, "cbz", 1, 1))
+
+
+def test_images_folder_pixel_cap_is_strict(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    folder = tmp_path / "pages"
+    folder.mkdir()
+    (folder / "1.png").write_bytes(png_bytes((40, 40)))
+    with pytest.raises(UploadRejected, match="too large"):
+        list(iter_pages(folder, "images", 1, 1))
+
+
+def test_decode_image_checks_size_before_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pipeline.common import uploads
+
+    data = png_bytes((40, 40))  # built before the spy: saving calls load()
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1000)
+    loaded: list[bool] = []
+    real_load = Image.Image.load
+
+    def spy(self: Image.Image) -> object:
+        loaded.append(True)
+        return real_load(self)
+
+    monkeypatch.setattr(Image.Image, "load", spy)
+    monkeypatch.setattr(ImageFile.ImageFile, "load", spy)
+    with pytest.raises(UploadRejected, match="too large"):
+        uploads.decode_image(data, uploads.IMAGE_MIMES, 10_000)
+    assert not loaded
+
+
+def test_child_png_over_long_side_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pdf = make_pdf(tmp_path / "ok.pdf", 3)
+    fake_child(monkeypatch, side=50)
+    monkeypatch.setattr(sources, "MAX_LONG_SIDE", 10)
+    with pytest.raises(UploadRejected, match="could not be decoded safely"):
+        list(iter_pages(pdf, "pdf", 1, 1))
+
+
+def test_document_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pdf = make_pdf(tmp_path / "ok.pdf", 1)
+    fake_child(monkeypatch, sleep=0.3, pages=20)
+    monkeypatch.setattr(sources, "DOC_DEADLINE_S", 1.5)
+    got: list[int] = []
+    start = time.monotonic()
+    with pytest.raises(UploadRejected, match="document took too long to render"):
+        for index, _ in iter_pages(pdf, "pdf", 1, 20):
+            got.append(index)
+    assert 0 < len(got) < 20
+    assert time.monotonic() - start < 6
+
+
+def test_timeout_kills_process_group(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = tmp_path / "grandchild-alive"
+    grandchild = f"import time; time.sleep(2); open({str(marker)!r}, 'w').close()"
+    script = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}])\n"
+        "time.sleep(30)\n"
+    )
+    monkeypatch.setattr(sources, "CHILD_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(sources, "_child_argv", lambda args: [sys.executable, "-I", "-c", script])
+    with pytest.raises(UploadRejected, match="timed out"):
+        sources._run_child(["probe", "x"], tmp_path)
+    time.sleep(2.5)
+    assert not marker.exists()

@@ -1,11 +1,15 @@
 """PDF child process: the only place an untrusted PDF is parsed.
 
-Started by pipeline.ingest.sources with ``python -I -m pipeline.ingest.pdf_child`` under
-resource limits (address space, CPU, file size, open files) and a minimal environment.
-It never decides policy: limits arrive as arguments, and the parent re-validates every output.
+Started by pipeline.ingest.sources with ``python -I -m pipeline.ingest.pdf_child`` in its own
+session with a minimal environment. The first thing ``main`` does, before pypdfium2 is even
+imported, is apply the resource limits it was given (no preexec_fn in the parent, which is
+unsafe in a threaded worker). It never decides policy: limits arrive as arguments, and the
+parent re-validates every output.
 
-  probe  <pdf>                                          -> {"ok": true, "pages": N}
-  render <pdf> <page 1-based> <out.png> <dpi> <max_long_side> -> {"ok": true}
+  <as> <cpu> <fsize> <nofile> probe <pdf>
+      -> {"ok": true, "pages": N}
+  <as> <cpu> <fsize> <nofile> render <pdf> <page> <out.png> <dpi> <max_long_side>
+      -> {"ok": true}
 
 Known failures print {"ok": false, "error": <code>} and exit 2. The parent maps codes to fixed
 user-safe messages; it never shows anything the child wrote.
@@ -14,13 +18,13 @@ user-safe messages; it never shows anything the child wrote.
 from __future__ import annotations
 
 import json
+import resource
 import sys
 from pathlib import Path
-
-import pypdfium2 as pdfium
-import pypdfium2.raw as pdfium_c
+from typing import Any
 
 EXIT_REFUSED = 2
+N_LIMIT_ARGS = 4
 
 
 class Refused(Exception):
@@ -29,7 +33,25 @@ class Refused(Exception):
         self.code = code
 
 
-def _open(pdf: Path) -> pdfium.PdfDocument:
+def apply_limits(address_space: int, cpu_s: int, fsize: int, nofile: int) -> None:
+    """Lower soft and hard limits on this process (never above an existing hard limit)."""
+    for which, value in (
+        (resource.RLIMIT_AS, address_space),
+        (resource.RLIMIT_CPU, cpu_s),
+        (resource.RLIMIT_FSIZE, fsize),
+        (resource.RLIMIT_NOFILE, nofile),
+        (resource.RLIMIT_CORE, 0),
+    ):
+        _, hard = resource.getrlimit(which)
+        if hard != resource.RLIM_INFINITY:
+            value = min(value, hard)
+        resource.setrlimit(which, (value, value))
+
+
+def _open(pdf: Path) -> Any:
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_c
+
     try:
         doc = pdfium.PdfDocument(pdf)
     except pdfium.PdfiumError as exc:
@@ -52,6 +74,9 @@ def probe(pdf: Path) -> dict[str, object]:
 
 
 def render(pdf: Path, page_no: int, out: Path, dpi: float, max_long_side: int) -> dict[str, object]:
+    import pypdfium2 as pdfium
+    from PIL import Image
+
     doc = _open(pdf)
     try:
         if not 1 <= page_no <= len(doc):
@@ -71,6 +96,8 @@ def render(pdf: Path, page_no: int, out: Path, dpi: float, max_long_side: int) -
             raise Refused("page") from exc
         finally:
             page.close()
+        if max(image.size) > max_long_side:  # rounding in pdfium; the parent refuses oversize
+            image.thumbnail((max_long_side, max_long_side), Image.Resampling.LANCZOS)
         image.save(out, "PNG")
         return {"ok": True}
     finally:
@@ -79,12 +106,18 @@ def render(pdf: Path, page_no: int, out: Path, dpi: float, max_long_side: int) -
 
 def main(argv: list[str]) -> int:
     try:
-        if len(argv) == 2 and argv[0] == "probe":
-            result = probe(Path(argv[1]))
-        elif len(argv) == 6 and argv[0] == "render":
-            result = render(
-                Path(argv[1]), int(argv[2]), Path(argv[3]), float(argv[4]), int(argv[5])
-            )
+        if len(argv) < N_LIMIT_ARGS:
+            raise Refused("usage")
+        try:
+            limits = [int(v) for v in argv[:N_LIMIT_ARGS]]
+            apply_limits(*limits)
+        except (ValueError, OSError) as exc:
+            raise Refused("limits") from exc
+        cmd = argv[N_LIMIT_ARGS:]
+        if len(cmd) == 2 and cmd[0] == "probe":
+            result = probe(Path(cmd[1]))
+        elif len(cmd) == 6 and cmd[0] == "render":
+            result = render(Path(cmd[1]), int(cmd[2]), Path(cmd[3]), float(cmd[4]), int(cmd[5]))
         else:
             raise Refused("usage")
     except Refused as exc:
