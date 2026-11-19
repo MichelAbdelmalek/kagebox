@@ -64,7 +64,7 @@ First run on 2026-11-19 with `make up-cloud` then `make ingest-sample` (cloud pr
 | Pages with at least one review item | 51 of 56 (91 %) | 51 of 56 (91 %) |
 | Wall time (import accepted → `ready`) | 273 s | 492 s (stack had just restarted; first run is the steady-state figure, about 4.9 s per page) |
 
-**What works.** Dialogue OCR on clean balloons is close to exact. All six balloons on page 7 are read correctly with confidence of 0.97 or more. Right-to-left panel order is correct on page 7 and on the normal pages checked. Full-page art gives one panel: page 4 (the first half of the spread; fill 0.93, so not flagged), page 5 (the second half, see below) and pages 34–37 (flagged `panel_full_page` for confirmation). Balloons and captions are boxed and ordered right to left within each panel.
+**What works.** Dialogue OCR on clean balloons is close to exact. All six balloons on page 7 are read correctly with confidence of 0.97 or more. Right-to-left panel order is correct on page 7 and on the normal pages checked. Full-page art gives one panel: page 4 (the first half of the spread; fill 0.93, so not flagged) and pages 34–37 (flagged `panel_full_page` for confirmation). Page 5, the second half of the spread, is not a full-page detection: it comes out as one merged component panel, flagged `panel_merged` and `panel_irregular` (see below). Balloons and captions are boxed and ordered right to left within each panel.
 
 **Panel merge (ruling P4).** Candidates whose boxes overlap by more than 10 % of the smaller box are merged into one panel, and every merged panel gets a `panel_merged` review item whatever its fill. A merge of real panels can fill its union box well, so the fill test alone would let it through silently. Effect on this chapter:
 
