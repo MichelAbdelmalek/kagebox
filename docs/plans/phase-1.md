@@ -62,3 +62,9 @@ These are candidates. Milestone 1.0 verifies each license and format before anyt
 - **Licenses** may rule out a candidate; each stage has a fallback.
 - **Together catalogue drift.** Model IDs are pinned, recorded fixtures keep CI independent of the catalogue, and each stage has a fallback.
 - **Scope.** Ten PRs; I'll stop for review after each and report test and scan results.
+
+## Known security follow-ups
+
+Accepted for milestone 1.1 (single operator, local stack); to be fixed before any shared deployment.
+
+- **PDF render child isolation.** Untrusted PDFs are rendered in a child process of `worker-cpu` (`pipeline/ingest/sources.py`) limited by rlimits, a scrubbed environment and a new session only. It runs as the same uid in the same container, so a pdfium memory-safety exploit could read every secret mounted into `worker-cpu` (the database password and the object-store keys) and reach Postgres, MinIO and the internet through the `back` and `egress` networks. Milestone 1.1 mounts only the secrets worker code reads (the media signing key, session secret and Together key were removed; `tests/unit/test_compose.py` enforces it). Follow-up: render PDFs in a dedicated container (or `bwrap`/`nsjail` with `--unshare-net`) on an internal-only network, under its own uid, with no secrets and a minimal read-only bind set, and consider moving ingest off the egress-attached worker. Cost if left: a pdfium RCE could read the DB password and object-store keys.

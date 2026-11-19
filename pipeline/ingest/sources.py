@@ -10,6 +10,11 @@ is safe to show to the user; details (exit codes, child stderr) go to the log on
 Untrusted PDFs are never opened in this process: page counting, encryption probing and every
 page render run in ``pipeline.ingest.pdf_child`` under rlimits, one child per call, so the CPU
 limit applies per page and a crash only loses that page.
+
+Known limit (docs/plans/phase-1.md, "Known security follow-ups"): the child runs as the same uid
+in the same container, with the worker's network access and its mounted secrets (only the database
+password and object-store keys). Isolating it (own uid or container, no network, no secrets) is a
+follow-up before any shared deployment.
 """
 
 from __future__ import annotations

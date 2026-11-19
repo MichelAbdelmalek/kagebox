@@ -132,12 +132,15 @@ services:
     pull_policy: never
     environment:
       <<: *python-env
-      KAGEBOX_TOGETHER_API_KEY_FILE: /run/secrets/together_api_key
       PREFECT_RUNNER_SERVER_ENABLE: "true"
       PREFECT_RUNNER_SERVER_HOST: 127.0.0.1
       PREFECT_RUNNER_SERVER_PORT: "8080"
-    secrets: [db_password, s3_access_key, s3_secret_key, media_signing_key, session_secret,
-              together_api_key]
+    # Only the secrets worker code reads (tests/unit/test_compose.py): the PDF render child runs
+    # in this container as the same uid and could read anything mounted here. The Together key
+    # is added back by the first stage that calls Together (milestone 1.2). Moving the PDF child
+    # to its own uid / container without secrets or network is a known follow-up
+    # (docs/plans/phase-1.md, "Known security follow-ups").
+    secrets: [db_password, s3_access_key, s3_secret_key]
     volumes:
       - models:/models:ro
       - ../data/imports:/imports:ro  # same per-project directories the api lists for imports
