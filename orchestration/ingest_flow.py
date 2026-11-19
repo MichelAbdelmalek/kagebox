@@ -24,9 +24,11 @@ in the store (unreferenced; rows never reference a missing object).
 ``chapter.error`` holds only a user-safe message: the ``UploadRejected`` / ``RightsDenied``
 message, ``"ingest failed"``, ``"ingest was interrupted"`` (cancellation, termination or a
 crash: a ``BaseException`` in the run, or Prefect's ``on_cancellation`` / ``on_crashed`` hooks),
-or ``"ingest could not start"`` (the run ended before taking the chapter: cancelled while queued,
-``build_deps`` failed, crashed early; set by the hooks, including ``on_failure``, only while the
-chapter is still ``pending`` and its latest job is this run). Details go to the log; validation
+``"ingest timed out"`` (the flow's 3 h ``timeout_seconds``; a hung run would otherwise hold the
+deployment's only concurrency slot), or ``"ingest could not start"`` (the run ended before
+taking the chapter: cancelled while queued, ``build_deps`` failed, crashed early; set by the
+hooks, including ``on_failure``, only while the chapter is still ``pending`` and its latest job
+is this run). Details go to the log; validation
 errors are logged by field and type only, never with input.
 
 Jobs: the API records a ``jobs`` row per started run (``flow_run_id``); the run moves it to
@@ -68,6 +70,12 @@ from typing import Any, cast
 import filetype
 import numpy as np
 from prefect import Flow, flow
+
+# Raised inside a sync flow when its timeout_seconds expire (by SIGALRM in the main thread, else
+# injected by a watcher thread between bytecodes); Prefect then raises FlowRunTimeoutError.
+# A private module: tests/unit/test_ingest_flow.py::test_timed_out_run_marks_failed runs a real
+# timeout, so a Prefect upgrade that moves it fails loudly.
+from prefect._internal.concurrency.cancellation import CancelledError as ScopeCancelled
 from prefect.client.schemas.objects import FlowRun, State
 from prefect.runtime import flow_run as prefect_flow_run
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -125,6 +133,10 @@ DIRECTIONS: dict[str, Direction] = {
 GENERIC_ERROR = "ingest failed"
 INTERRUPTED = "ingest was interrupted"
 NOT_STARTED = "ingest could not start"
+TIMED_OUT = "ingest timed out"
+# Prefect ends a run that exceeds this (a hung model call or DB wait would otherwise hold the
+# deployment's only concurrency slot for good). Far above a real chapter (minutes per 100 pages).
+FLOW_TIMEOUT_S = 3 * 3600
 JOB_OPEN = ("submitted", "running")  # job statuses a run may still move on
 ALREADY_RUNNING = "ingest already running"
 IMPORT_MISSING = "the imported source file is not available"
@@ -544,6 +556,11 @@ def run_ingest(chapter_id: str, deps: IngestDeps, run_id: str | None = None) -> 
         _safe_fail(deps.engine, chapter_id, GENERIC_ERROR, ch.run_id)
         _safe_set_job(deps.engine, ch.run_id, "failed")
         raise
+    except ScopeCancelled:  # the flow's timeout_seconds expired (Prefect's cancel scope)
+        log.error("chapter %s ingest timed out after %ss", chapter_id, FLOW_TIMEOUT_S)
+        _safe_fail(deps.engine, chapter_id, TIMED_OUT, ch.run_id)
+        _safe_set_job(deps.engine, ch.run_id, "failed")
+        raise  # Prefect turns it into FlowRunTimeoutError and a TimedOut (failed) state
     except BaseException:  # cancellation, termination signal, KeyboardInterrupt
         # The job's final status (cancelled / failed) is left to the Prefect hooks.
         log.warning("chapter %s ingest interrupted", chapter_id)
@@ -651,6 +668,7 @@ def on_failed(flow: Flow[Any, Any], flow_run: FlowRun, state: State[Any] | None)
     on_cancellation=[on_cancelled],
     on_crashed=[on_crashed],
     on_failure=[on_failed],
+    timeout_seconds=FLOW_TIMEOUT_S,
 )
 def ingest_flow(chapter_id: str) -> IngestSummary:
     """Deployment entry point. Parameters must stay JSON-serializable."""

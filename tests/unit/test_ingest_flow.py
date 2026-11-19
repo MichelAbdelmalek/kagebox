@@ -831,6 +831,32 @@ def test_hook_of_a_superseded_run_leaves_the_pending_chapter_alone(
     assert job_status(env, old) == "failed"
 
 
+def test_flow_has_a_three_hour_timeout() -> None:
+    assert ingest_flow.timeout_seconds == 3 * 3600
+
+
+def test_timed_out_run_marks_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hung run is ended by Prefect's flow timeout and says so (not 'interrupted')."""
+    import time
+
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+
+    def hang(call: int) -> None:
+        if call == 2:
+            for _ in range(100):  # 10 s at most; the timeout fires between the short sleeps
+                time.sleep(0.1)
+
+    env.ocr.on_call = hang
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        ingest_flow.with_options(timeout_seconds=1)(cid)
+    assert time.monotonic() - started < 8
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "ingest timed out")
+    assert count(env, PageRow, cid) == 0
+
+
 def test_flow_run_id_is_the_owner_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env = make_env(tmp_path, monkeypatch)
     cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
