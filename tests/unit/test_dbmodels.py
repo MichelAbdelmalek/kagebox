@@ -192,7 +192,8 @@ def test_chapter_ingest_started_at_nullable(tmp_path: Any) -> None:
     ids = _seed(s)
     chapter = s.get(ChapterRow, ids["chap"])
     assert chapter is not None
-    assert chapter.ingest_started_at is None
-    chapter.ingest_started_at = NOW
+    assert (chapter.ingest_started_at, chapter.ingest_run_id) == (None, None)
+    chapter.ingest_started_at, chapter.ingest_run_id = NOW, "f3c1e2d4-run"
     s.commit()
     assert aware(chapter.ingest_started_at) == NOW
+    assert chapter.ingest_run_id == "f3c1e2d4-run"

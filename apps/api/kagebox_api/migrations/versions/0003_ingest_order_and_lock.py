@@ -8,6 +8,7 @@ Create Date: 2026-11-19 16:00:00
   Existing rows are backfilled in id order (ingest handed out ids in reading order before this
   revision) with a portable correlated subquery, then the column becomes NOT NULL.
 - chapters.ingest_started_at: when the current ingest run took the chapter (stale-run takeover).
+- chapters.ingest_run_id: the owning run's token (its Prefect flow-run id).
 
 Artifacts written before this revision lack the new Page / Bubble fields (source_page,
 reading_order); re-run ingest for such chapters.
@@ -28,6 +29,7 @@ UQ = "uq_bubbles_panel_id_reading_order"
 
 def upgrade() -> None:
     op.add_column("chapters", sa.Column("ingest_started_at", sa.DateTime(timezone=True)))
+    op.add_column("chapters", sa.Column("ingest_run_id", sa.String(length=80)))
     op.add_column("bubbles", sa.Column("reading_order", sa.Integer(), nullable=True))
     op.execute(
         "UPDATE bubbles SET reading_order = ("
@@ -45,4 +47,5 @@ def downgrade() -> None:
         batch.drop_constraint(UQ, type_="unique")
         batch.drop_column("reading_order")
     with op.batch_alter_table("chapters") as batch:
+        batch.drop_column("ingest_run_id")
         batch.drop_column("ingest_started_at")

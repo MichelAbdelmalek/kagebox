@@ -3,8 +3,10 @@
 Status goes ``pending`` -> ``ingesting`` -> ``ready`` | ``failed``. Taking the chapter is one
 conditional UPDATE: it succeeds only if no other run holds it (``status <> 'ingesting'``) or
 that run started more than ``STALE_INGEST_S`` ago; otherwise ``IngestAlreadyRunning`` is raised
-and the chapter is not touched. ``chapters.ingest_started_at`` identifies the owning run: a run
-that was taken over writes nothing and leaves the status to the new owner.
+and the chapter is not touched. ``chapters.ingest_run_id`` (the Prefect flow-run id, or a fresh
+token for a direct call) identifies the owning run: a run that was taken over writes nothing
+and leaves the status alone, and the cancellation / crash hook only fails the chapter when the
+interrupted flow run is its owner.
 
 The rights gate runs first, and again inside the final transaction after the chapter row is
 locked, so a record revoked mid-run stores no rows.
@@ -45,6 +47,7 @@ import logging
 import os
 import stat
 import tempfile
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -55,6 +58,7 @@ import filetype
 import numpy as np
 from prefect import Flow, flow
 from prefect.client.schemas.objects import FlowRun, State
+from prefect.runtime import flow_run as prefect_flow_run
 from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy import CursorResult, Engine, delete, or_, select, update
 from sqlalchemy.orm import Session
@@ -69,7 +73,6 @@ from pipeline.common.dbmodels import (
     ProjectRow,
     ReviewItemRow,
     RightsRow,
-    aware,
 )
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import RightsDenied, RightsRecord, require_render_allowed
@@ -149,7 +152,7 @@ class _Chapter:
     source_sha256: str
     page_start: int
     page_end: int
-    started_at: datetime  # identifies this run as the chapter's owner
+    run_id: str  # this run's owner token
 
 
 def build_deps() -> IngestDeps:
@@ -270,7 +273,13 @@ def open_source(ch: _Chapter, deps: IngestDeps) -> Iterator[tuple[Path, SourceKi
 # database
 
 
-def _start(engine: Engine, chapter_id: str) -> _Chapter:
+def current_run_id() -> str:
+    """The current Prefect flow-run id; a fresh token outside a flow run."""
+    run_id = prefect_flow_run.id
+    return str(run_id) if run_id else f"direct-{uuid.uuid4()}"
+
+
+def _start(engine: Engine, chapter_id: str, run_id: str) -> _Chapter:
     """Take the chapter for this run with one conditional UPDATE, or refuse."""
     now = datetime.now(UTC)
     stale = now - timedelta(seconds=STALE_INGEST_S)
@@ -287,7 +296,7 @@ def _start(engine: Engine, chapter_id: str) -> _Chapter:
                         ChapterRow.ingest_started_at < stale,
                     ),
                 )
-                .values(status="ingesting", error=None, ingest_started_at=now)
+                .values(status="ingesting", error=None, ingest_started_at=now, ingest_run_id=run_id)
                 .execution_options(synchronize_session=False)
             ),
         )
@@ -309,33 +318,26 @@ def _start(engine: Engine, chapter_id: str) -> _Chapter:
             source_sha256=row.source_sha256,
             page_start=row.page_start,
             page_end=row.page_end,
-            started_at=now,
+            run_id=run_id,
         )
 
 
-def _owns(row: ChapterRow, started_at: datetime) -> bool:
-    return (
-        row.status == "ingesting"
-        and row.ingest_started_at is not None
-        and aware(row.ingest_started_at) == started_at
-    )
+def _owns(row: ChapterRow, run_id: str) -> bool:
+    return row.status == "ingesting" and row.ingest_run_id == run_id
 
 
-def _fail(engine: Engine, chapter_id: str, message: str, started_at: datetime | None) -> None:
-    """Mark an 'ingesting' chapter failed; with ``started_at``, only if this run still owns it."""
+def _fail(engine: Engine, chapter_id: str, message: str, run_id: str) -> None:
+    """Mark the chapter failed, only while ``run_id`` still owns it."""
     with Session(engine) as s, s.begin():
         row = s.get(ChapterRow, chapter_id, with_for_update=True)
-        if row is None or row.status != "ingesting":
-            return
-        if started_at is not None and not _owns(row, started_at):
-            return
-        row.status, row.error = "failed", message
+        if row is not None and _owns(row, run_id):
+            row.status, row.error = "failed", message
 
 
-def _safe_fail(engine: Engine, chapter_id: str, message: str, started_at: datetime | None) -> None:
+def _safe_fail(engine: Engine, chapter_id: str, message: str, run_id: str) -> None:
     """``_fail`` that never raises, so the caller re-raises the ORIGINAL error."""
     try:
-        _fail(engine, chapter_id, message, started_at)
+        _fail(engine, chapter_id, message, run_id)
     except Exception:
         log.exception("could not mark chapter %s failed", chapter_id)
 
@@ -352,7 +354,7 @@ def _commit(engine: Engine, ch: _Chapter, results: list[PageResult]) -> int:
         row = s.get(ChapterRow, ch.id, with_for_update=True)
         if row is None:
             raise LookupError("chapter not found")
-        if not _owns(row, ch.started_at):
+        if not _owns(row, ch.run_id):
             raise IngestAlreadyRunning(ALREADY_RUNNING)  # taken over: the new owner writes
         _rights_in(s, ch.project_id)  # under the chapter lock, in the writing transaction
         s.execute(
@@ -471,8 +473,8 @@ def _ingest(ch: _Chapter, deps: IngestDeps) -> IngestSummary:
     )
 
 
-def run_ingest(chapter_id: str, deps: IngestDeps) -> IngestSummary:
-    ch = _start(deps.engine, chapter_id)  # IngestAlreadyRunning: nothing touched
+def run_ingest(chapter_id: str, deps: IngestDeps, run_id: str | None = None) -> IngestSummary:
+    ch = _start(deps.engine, chapter_id, run_id or current_run_id())  # refused: nothing touched
     try:
         summary = _ingest(ch, deps)
     except IngestAlreadyRunning:
@@ -480,20 +482,20 @@ def run_ingest(chapter_id: str, deps: IngestDeps) -> IngestSummary:
         raise
     except (UploadRejected, RightsDenied) as exc:
         log.warning("chapter %s refused: %s", chapter_id, exc)
-        _safe_fail(deps.engine, chapter_id, str(exc), ch.started_at)
+        _safe_fail(deps.engine, chapter_id, str(exc), ch.run_id)
         raise
     except ValidationError as exc:  # never log or re-raise it with its (untrusted) input
         errors = safe_errors(exc)
         log.error("chapter %s ingest failed: invalid artifact: %s", chapter_id, errors)
-        _safe_fail(deps.engine, chapter_id, GENERIC_ERROR, ch.started_at)
+        _safe_fail(deps.engine, chapter_id, GENERIC_ERROR, ch.run_id)
         raise RuntimeError(f"invalid artifact: {errors}") from None
     except Exception:
         log.exception("chapter %s ingest failed", chapter_id)
-        _safe_fail(deps.engine, chapter_id, GENERIC_ERROR, ch.started_at)
+        _safe_fail(deps.engine, chapter_id, GENERIC_ERROR, ch.run_id)
         raise
     except BaseException:  # cancellation, termination signal, KeyboardInterrupt
         log.warning("chapter %s ingest interrupted", chapter_id)
-        _safe_fail(deps.engine, chapter_id, INTERRUPTED, ch.started_at)
+        _safe_fail(deps.engine, chapter_id, INTERRUPTED, ch.run_id)
         raise
     log.info("chapter %s ready: %s", chapter_id, summary)
     return summary
@@ -505,7 +507,11 @@ def on_interrupted(flow: Flow[Any, Any], flow_run: FlowRun, state: State[Any] | 
     if not isinstance(chapter_id, str):
         return
     try:
-        _fail(build_deps().engine, chapter_id, INTERRUPTED, None)
+        engine = build_deps().engine
+        try:
+            _fail(engine, chapter_id, INTERRUPTED, str(flow_run.id))  # only if this run owns it
+        finally:
+            engine.dispose()
     except Exception:
         log.exception("could not mark chapter %s failed after interruption", chapter_id)
 

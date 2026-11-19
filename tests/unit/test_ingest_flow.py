@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -17,6 +18,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 from prefect import flow
+from prefect.runtime import flow_run as prefect_flow_run
 from prefect.testing.utilities import prefect_test_harness
 from sqlalchemy import Engine, func, select
 from sqlalchemy.orm import Session
@@ -641,30 +643,69 @@ def test_interrupted_run_marks_failed(tmp_path: Path, monkeypatch: pytest.Monkey
     assert count(env, PageRow, cid) == 0
 
 
-def test_flow_hooks_mark_interrupted_chapter_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    env = make_env(tmp_path, monkeypatch)
-    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+def test_flow_hooks_registered() -> None:
     assert ingest_mod.on_interrupted in ingest_flow.on_crashed_hooks
     assert ingest_mod.on_interrupted in ingest_flow.on_cancellation_hooks
-    with Session(env.engine) as s, s.begin():
-        row = s.get(ChapterRow, cid)
-        assert row is not None
-        row.status, row.ingest_started_at = "ingesting", datetime.now(UTC)
-    run = SimpleNamespace(parameters={"chapter_id": cid})
-    ingest_mod.on_interrupted(ingest_flow, run, None)  # type: ignore[arg-type]
-    assert (chapter(env, cid).status, chapter(env, cid).error) == (
-        "failed",
-        "ingest was interrupted",
-    )
-    # a chapter that is not ingesting (already failed with a better message) is left alone
-    with Session(env.engine) as s, s.begin():
-        row = s.get(ChapterRow, cid)
-        assert row is not None
-        row.error = "rights record has expired"
-    ingest_mod.on_interrupted(ingest_flow, run, None)  # type: ignore[arg-type]
-    assert chapter(env, cid).error == "rights record has expired"
+
+
+def test_hook_for_other_run_leaves_owner_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run B (cancelled while waiting, a subflow, a stale pair) must not fail run A's chapter."""
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    other = SimpleNamespace(id="run-b", parameters={"chapter_id": cid})
+
+    def b_interrupted(call: int) -> None:
+        if call == 1:
+            ingest_mod.on_interrupted(ingest_flow, other, None)  # type: ignore[arg-type]
+            assert chapter(env, cid).status == "ingesting"
+
+    env.ocr.on_call = b_interrupted
+    summary = ingest_mod.run_ingest(cid, ingest_mod.build_deps(), run_id="run-a")
+    assert summary.pages == 1
+    row = chapter(env, cid)
+    assert (row.status, row.error, row.ingest_run_id) == ("ready", None, "run-a")
+
+
+def test_hook_for_owning_run_marks_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    own = SimpleNamespace(id="run-a", parameters={"chapter_id": cid})
+
+    def a_crashed(call: int) -> None:
+        if call == 1:
+            ingest_mod.on_interrupted(ingest_flow, own, None)  # type: ignore[arg-type]
+
+    env.ocr.on_call = a_crashed
+    with pytest.raises(ingest_mod.IngestAlreadyRunning):  # A no longer owns it: writes nothing
+        ingest_mod.run_ingest(cid, ingest_mod.build_deps(), run_id="run-a")
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "ingest was interrupted")
+    assert count(env, PageRow, cid) == 0
+    # a chapter that is no longer ingesting keeps its message
+    ingest_mod.on_interrupted(ingest_flow, own, None)  # type: ignore[arg-type]
+    assert chapter(env, cid).error == "ingest was interrupted"
+
+
+def test_flow_run_id_is_the_owner_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    seen: list[str | None] = []
+
+    def record(call: int) -> None:
+        if call == 1:
+            seen.append(chapter(env, cid).ingest_run_id)
+            seen.append(prefect_flow_run.id)
+
+    env.ocr.on_call = record
+    ingest_flow(cid)
+    assert seen[0] is not None and seen[0] == seen[1]
+    # direct (non-Prefect) calls get a fresh token each time
+    ingest_mod.run_ingest(cid, ingest_mod.build_deps())
+    first = chapter(env, cid).ingest_run_id
+    ingest_mod.run_ingest(cid, ingest_mod.build_deps())
+    assert first and chapter(env, cid).ingest_run_id not in (first, seen[0])
 
 
 def test_failing_fail_does_not_mask_original_error(
@@ -718,7 +759,7 @@ def test_taken_over_run_does_not_write(tmp_path: Path, monkeypatch: pytest.Monke
             with Session(env.engine) as s, s.begin():
                 row = s.get(ChapterRow, cid)
                 assert row is not None
-                row.ingest_started_at = datetime.now(UTC) + timedelta(seconds=1)
+                row.ingest_run_id = "run-other"
 
     env.ocr.on_call = take_over
     with pytest.raises(ingest_mod.IngestAlreadyRunning):
@@ -744,6 +785,9 @@ def test_invalid_ocr_result_becomes_review_item(
     field_name: str,
     error_type: str,
 ) -> None:
+    caplog.set_level(logging.DEBUG)
+    for name in ("orchestration.ingest_flow", "pipeline.ingest.process", "prefect"):
+        caplog.set_level(logging.DEBUG, logger=name)
     env = make_env(tmp_path, monkeypatch)
     env.ocr.results = [result]  # first bubble read (top panel, right balloon) is bad
     cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
@@ -755,6 +799,7 @@ def test_invalid_ocr_result_becomes_review_item(
     assert len(invalid) == 1
     assert field_name in invalid[0].reason and error_type in invalid[0].reason
     assert "秘" not in invalid[0].reason and "nan" not in invalid[0].reason.lower()
+    assert "ready" in caplog.text  # the capture sees this module's records
     assert "秘秘" not in caplog.text
     with Session(env.engine) as s:
         top = s.scalars(

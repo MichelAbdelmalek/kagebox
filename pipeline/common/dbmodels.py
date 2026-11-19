@@ -101,6 +101,8 @@ class ChapterRow(Base):
     # Set when a run takes the chapter to 'ingesting'; a run older than the stale limit may be
     # taken over, and a run only writes results while it still owns the chapter.
     ingest_started_at: Mapped[datetime | None] = mapped_column(default=None)
+    # The owning run (its Prefect flow-run id, or a fresh token for direct calls).
+    ingest_run_id: Mapped[str | None] = mapped_column(String(80), default=None)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
