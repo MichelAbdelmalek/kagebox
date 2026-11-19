@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -17,10 +16,8 @@ from pipeline.providers.base import (
 from pipeline.providers.registry import (
     ModelNotApproved,
     UnsafeWeights,
-    WeightFile,
     model_for_stage,
     trust_remote_code,
-    verify_weight_file,
 )
 from pipeline.providers.together import TogetherProvider
 
@@ -87,21 +84,7 @@ def test_fence_cannot_be_closed_from_inside() -> None:
 
 def test_unapproved_model_refused() -> None:
     with pytest.raises(ModelNotApproved):
-        model_for_stage("director")
-
-
-def test_weights_policy(tmp_path: Path) -> None:
-    data = b"weights"
-    good = tmp_path / "m.safetensors"
-    good.write_bytes(data)
-    digest = hashlib.sha256(data).hexdigest()
-    assert verify_weight_file(WeightFile(good, digest)) == good
-    with pytest.raises(UnsafeWeights, match="checksum"):
-        verify_weight_file(WeightFile(good, "0" * 64))
-    pickle = tmp_path / "m.bin"
-    pickle.write_bytes(data)
-    with pytest.raises(UnsafeWeights, match="safetensors"):
-        verify_weight_file(WeightFile(pickle, digest))
+        model_for_stage("understand")  # proposed until the 1.2 bake-off
 
 
 def test_trust_remote_code_denied_by_default(tmp_path: Path) -> None:

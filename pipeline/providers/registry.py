@@ -2,27 +2,23 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from pipeline.providers.base import ModelSpec
+from pipeline.providers.weights import UnsafeWeights
+
+__all__ = ["ModelNotApproved", "UnsafeWeights", "load_yaml", "model_for_stage", "trust_remote_code"]
 
 CONFIG_DIR = Path(
     os.environ.get("KAGEBOX_CONFIG_DIR") or Path(__file__).resolve().parents[2] / "configs"
 )
-ALLOWED_WEIGHT_SUFFIXES = frozenset({".safetensors"})
 
 
 class ModelNotApproved(LookupError):
-    pass
-
-
-class UnsafeWeights(PermissionError):
     pass
 
 
@@ -50,25 +46,6 @@ def model_for_stage(stage: str, config_dir: Path = CONFIG_DIR) -> ModelSpec:
         license=entry["license"],
         source_url=entry["source"],
     )
-
-
-@dataclass(frozen=True)
-class WeightFile:
-    path: Path
-    sha256: str
-
-
-def verify_weight_file(wf: WeightFile) -> Path:
-    """Only checksummed .safetensors files load; pickle formats (.bin/.pt/.ckpt) never do."""
-    if wf.path.suffix not in ALLOWED_WEIGHT_SUFFIXES:
-        raise UnsafeWeights(f"{wf.path.name}: only .safetensors weights are allowed")
-    h = hashlib.sha256()
-    with wf.path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    if h.hexdigest() != wf.sha256.lower():
-        raise UnsafeWeights(f"{wf.path.name}: checksum mismatch")
-    return wf.path
 
 
 def trust_remote_code(repo: str, revision: str, config_dir: Path = CONFIG_DIR) -> bool:

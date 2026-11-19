@@ -238,11 +238,12 @@ services:
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
     cap_add: ["CHOWN"]
-    command: ["chown", "10001:10001", "/v/objects", "/v/caddy-data", "/v/caddy-config"]  # roots only; services own their contents
+    command: ["chown", "10001:10001", "/v/objects", "/v/caddy-data", "/v/caddy-config", "/v/models"]  # roots only; services own their contents
     volumes:
       - objects:/v/objects
       - caddy-data:/v/caddy-data
       - caddy-config:/v/caddy-config
+      - models:/v/models
 
   # One-shot model download (Phase 1): pinned .safetensors revisions with sha256 checks.
   models-fetch:
@@ -252,10 +253,12 @@ services:
     restart: "no"
     command: ["python", "-m", "orchestration.models_fetch"]
     environment:
-      HF_HUB_OFFLINE: "0"
+      KAGEBOX_MODELS_DIR: /models
     volumes:
       - models:/models
     networks: [egress]
+    depends_on:
+      volume-init: {condition: service_completed_successfully}
 
 networks:
   edge: {}

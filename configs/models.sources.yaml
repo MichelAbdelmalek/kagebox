@@ -1,0 +1,63 @@
+# Human-edited list of approved local models. `make pin-models` turns this into the `models:`
+# section of configs/models.yaml, with every file's sha256 and size read from Hugging Face at the
+# pinned commit. Only files matching `allow` are pinned; models-fetch never downloads anything else.
+#
+# Approved 2026-11-19 (milestone 1.0; see docs/plans/phase-1-model-audit.md).
+# Models that ship only pickle weights (manga-ocr, CosyVoice2, AudioSeal, LaMa) are added with the
+# offline conversion job, not here.
+
+siglip-so400m:
+  repo: google/siglip-so400m-patch14-384
+  revision: 9fdffc58afc957d1a03a25b10dba0329ab15c2a3
+  license: Apache-2.0
+  stage: bible (character embeddings)
+  allow: [model.safetensors, config.json, preprocessor_config.json]
+
+sam2-1-hiera-small:
+  repo: facebook/sam2.1-hiera-small
+  revision: ee5bba1d82bb8749febdf90f45e84b687142ba03
+  license: Apache-2.0
+  stage: render (layer masks)
+  allow: [model.safetensors, "*.json"]
+
+depth-anything-v2-small:
+  repo: depth-anything/Depth-Anything-V2-Small-hf
+  revision: 5426e4f0f36572d16453bbda7a8389317b1bef99
+  license: Apache-2.0  # Small only; Base/Large/Giant are CC-BY-NC and must never be added
+  stage: render (depth order)
+  allow: [model.safetensors, "*.json"]
+
+pp-ocrv5-det:
+  repo: PaddlePaddle/PP-OCRv5_mobile_det_safetensors
+  revision: c5041d225cf951ff06900ab81a3c7d543c45e2ad
+  license: Apache-2.0
+  stage: ingest (text detection)
+  allow: [model.safetensors, "*.json", inference.yml]  # repo also has ocr_pipeline.py; never fetched
+
+pp-ocrv5-rec-en:
+  repo: PaddlePaddle/en_PP-OCRv5_mobile_rec_safetensors
+  revision: e4abce2bbd335f6c3eda0507b7f8e8abd5af3419
+  license: Apache-2.0
+  stage: ingest (English OCR)
+  allow: [model.safetensors, "*.json", inference.yml]
+
+pp-ocrv5-rec-ko:
+  repo: PaddlePaddle/korean_PP-OCRv5_mobile_rec_safetensors
+  revision: 6ef525a357645ce46495c7ed1fef622c4e009e7a
+  license: Apache-2.0
+  stage: ingest (Korean OCR)
+  allow: [model.safetensors, "*.json", inference.yml]
+
+manga-bubble-detector:
+  repo: NorwayFish/manga-bubble-detector
+  revision: bcf342f296beb56005e044da15990502629015de
+  license: Apache-2.0  # card tag only; training pages undisclosed (open legal item)
+  stage: ingest (speech bubbles)
+  allow: [model.safetensors, "*.json"]
+
+whisper-large-v3-turbo:
+  repo: openai/whisper-large-v3-turbo
+  revision: 41f01f3fe87f28c78e2fbf8b568835947dd65ed9
+  license: MIT
+  stage: validate (speech round-trip)
+  allow: [model.safetensors, "*.json", "*.txt"]

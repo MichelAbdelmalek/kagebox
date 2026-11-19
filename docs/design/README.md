@@ -28,3 +28,7 @@ https://claude.ai/artifact/6fPYG972D3v9LDvK48RwwG
 - WCAG 2.2 AA contrast, real buttons / links / labels, 44 px minimum touch targets, full keyboard navigation.
 - Side navigation collapses above the content on narrow screens; wide tables scroll inside their own container.
 - Use straight sample data placeholders like `[ACTOR NAME]` until real data exists; never invent metrics.
+
+## Adaptation standard
+
+The quality bar for every episode (shot fidelity, limited-animation timing, drawn look, pacing, score) is in [`adaptation-standard.md`](adaptation-standard.md). It was written from studying acclaimed adaptations; none of their material enters Kagebox.
