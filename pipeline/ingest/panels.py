@@ -1,9 +1,24 @@
 """Classical panel detection, XY-cut reading order and manhwa strip slicing.
 
-``detect_panels`` finds panels on one page: Otsu ink mask, 3x3 dilation to close hairline breaks,
-white flooded in from the page border is the gutter, and every remaining connected component
-covering at least ``MIN_PANEL_FRACTION`` of the page is a panel. No panel, or one covering at
-least ``FULL_PAGE_FRACTION``, means the page is a single full-page panel (full-bleed art).
+``find_panels`` finds panel candidates on one page: Otsu ink mask, 3x3 dilation to close hairline
+breaks, paper flooded in from the page border is the gutter, and every remaining connected
+component with at least ``MIN_PANEL_FRACTION`` of the page's pixels is a panel. No component, or
+one whose bounding box covers at least ``FULL_PAGE_FRACTION`` of the page, means a single panel
+that is the whole page (full-bleed art; margin narration stays inside it). Each candidate says
+why it exists and how much of its box it fills, so callers can send doubtful ones to review
+(fill below ``IRREGULAR_FILL`` usually means panels merged by art breaking out of a frame).
+``detect_panels`` is the same, boxes only.
+
+Decisions beyond the plain algorithm, both made on real pages:
+
+- ``PAPER_MIN``: on light paper, a pixel darker than 160 is never gutter, whatever Otsu says.
+  Without it Otsu on a full-bleed mid-grey page calls the grey "white" and the dark art a panel.
+  Risk: scans of very dark or yellowed paper (gutters below 160) lose their gutters, and the
+  page degrades to one full-page panel (reason ``full_page``, sent to review).
+- Black paper: when at least ``DARK_BORDER_SHARE`` (half) of a thin border ring is near-black
+  (<= ``DARK_BORDER_LEVEL``), the page is inverted first so the black gutters are the "paper".
+  Half, not most: panels that bleed off two edges leave only ~60-70 % of the ring black.
+  A mid-tone dark border (night scene) is not near-black and keeps the light-paper path.
 
 ``reading_order`` is pure (boxes only, no image) so it also orders regions inside a panel.
 """
@@ -11,6 +26,7 @@ least ``FULL_PAGE_FRACTION``, means the page is a single full-page panel (full-b
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Literal
 
 import cv2
@@ -20,13 +36,16 @@ import numpy.typing as npt
 from pipeline.common.schemas import BBox
 
 Direction = Literal["rtl", "ltr"]
+Reason = Literal["component", "full_page", "no_components"]
 
 MIN_PANEL_FRACTION = 0.02
 FULL_PAGE_FRACTION = 0.90
 FALLBACK_BANDS = 20  # overlap fallback: rows are 1/20 of the boxes' height span
-# Gutters are paper: a pixel darker than this is never gutter, whatever Otsu says. Without the
-# floor, Otsu on a full-bleed mid-grey page calls the grey "white" and the dark art a panel.
-PAPER_MIN = 160
+IRREGULAR_FILL = 0.85  # component pixels / bbox area below this: likely merged panels
+PAPER_MIN = 160  # see module docstring
+BORDER_RING_FRACTION = 0.01  # ring width: 1 % of the short side, at least 2 px
+DARK_BORDER_LEVEL = 50
+DARK_BORDER_SHARE = 0.50  # i.e. the ring's median is near-black
 
 U8 = npt.NDArray[np.uint8]
 
@@ -51,8 +70,26 @@ def _ink(gray: U8) -> U8:
     return (gray <= thresh).astype(np.uint8)
 
 
-def detect_panels(img: npt.NDArray[np.generic]) -> list[BBox]:
+@dataclass(frozen=True)
+class PanelCandidate:
+    bbox: BBox
+    fill: float  # component pixels / bbox area; 1.0 for a whole-page panel
+    reason: Reason
+
+
+def _black_paper(gray: U8) -> bool:
+    h, w = gray.shape
+    r = max(2, int(min(h, w) * BORDER_RING_FRACTION))
+    ring = np.concatenate(
+        [gray[:r].ravel(), gray[-r:].ravel(), gray[r:-r, :r].ravel(), gray[r:-r, -r:].ravel()]
+    )
+    return bool(np.mean(ring <= DARK_BORDER_LEVEL) >= DARK_BORDER_SHARE)
+
+
+def find_panels(img: npt.NDArray[np.generic]) -> list[PanelCandidate]:
     gray = _gray(img)
+    if _black_paper(gray):
+        gray = (255 - gray).astype(np.uint8)
     h, w = gray.shape
     page = BBox(x=0, y=0, w=w, h=h)
     ink = cv2.dilate(_ink(gray), np.ones((3, 3), np.uint8))
@@ -66,14 +103,19 @@ def detect_panels(img: npt.NDArray[np.generic]) -> list[BBox]:
     content = (~gutter).astype(np.uint8)
     n, _, stats, _ = cv2.connectedComponentsWithStats(content, connectivity=8)
     area = float(h * w)
-    boxes: list[BBox] = []
+    cands: list[PanelCandidate] = []
     for i in range(1, n):
         x, y, bw, bh, px = (int(v) for v in stats[i])
-        if px >= FULL_PAGE_FRACTION * area:
-            return [page]
-        if px >= MIN_PANEL_FRACTION * area:
-            boxes.append(BBox(x=x, y=y, w=bw, h=bh))
-    return boxes or [page]
+        if px < MIN_PANEL_FRACTION * area:
+            continue
+        if bw * bh >= FULL_PAGE_FRACTION * area:
+            return [PanelCandidate(page, 1.0, "full_page")]
+        cands.append(PanelCandidate(BBox(x=x, y=y, w=bw, h=bh), px / (bw * bh), "component"))
+    return cands or [PanelCandidate(page, 1.0, "no_components")]
+
+
+def detect_panels(img: npt.NDArray[np.generic]) -> list[BBox]:
+    return [c.bbox for c in find_panels(img)]
 
 
 # ---------------------------------------------------------------------------------------------

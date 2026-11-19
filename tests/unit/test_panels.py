@@ -9,7 +9,14 @@ import numpy as np
 import pytest
 
 from pipeline.common.schemas import BBox
-from pipeline.ingest.panels import detect_panels, reading_order, slice_strip
+from pipeline.ingest.panels import (
+    IRREGULAR_FILL,
+    PanelCandidate,
+    detect_panels,
+    find_panels,
+    reading_order,
+    slice_strip,
+)
 
 W, H = 1000, 1400
 
@@ -117,6 +124,78 @@ def test_hairline_gap_in_border_is_closed() -> None:
     img = grid_2x2()
     img[300:302, 36:45] = 255  # a 2 px break in the top-left frame's left border
     assert len(detect_panels(img)) == 4
+
+
+def test_black_paper_page_rtl() -> None:
+    # Colour page on black paper: light panels, black gutters (Black Jack p6).
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    for x0, y0, x1, y1 in (
+        (40, 40, 480, 680),
+        (520, 40, 960, 680),
+        (40, 720, 480, 1360),
+        (520, 720, 960, 1360),
+    ):
+        cv2.rectangle(img, (x0, y0), (x1, y1), (210, 190, 150), thickness=-1)
+        cv2.line(img, (x0 + 30, y0 + 30), (x1 - 30, y1 - 30), (30, 20, 10), thickness=3)
+    boxes = ordered(img, "rtl")
+    assert [corner(b) for b in boxes] == [TR, TL, BR, BL]
+
+
+def test_black_paper_panels_bleeding_off_top_and_bottom() -> None:
+    # Black Jack p6: black side margins, but the panels run off the top and bottom edges, so
+    # only ~63 % of the border ring is black.
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    for x0, y0, x1, y1 in ((40, 0, 480, 680), (520, 0, 960, 680), (40, 720, 960, 1399)):
+        cv2.rectangle(img, (x0, y0), (x1, y1), (210, 190, 150), thickness=-1)
+    boxes = ordered(img, "rtl")
+    assert [corner(b) for b in boxes] == [(520, 0), (40, 0), (40, 720)]
+
+
+def test_dark_full_bleed_page_single_panel() -> None:
+    # Dark but not near-black border (night scene in mid tones): not a black-paper page.
+    img = np.full((H, W), 70, dtype=np.uint8)
+    cv2.circle(img, (500, 700), 200, 200, thickness=-1)
+    assert find_panels(img) == [PanelCandidate(BBox(x=0, y=0, w=W, h=H), 1.0, "full_page")]
+
+
+def test_candidates_reasons() -> None:
+    page = BBox(x=0, y=0, w=W, h=H)
+    assert find_panels(blank()) == [PanelCandidate(page, 1.0, "no_components")]
+    assert find_panels(np.zeros((H, W), dtype=np.uint8)) == [
+        PanelCandidate(page, 1.0, "no_components")
+    ]
+    grey = np.full((H, W), 128, dtype=np.uint8)
+    cv2.circle(grey, (500, 700), 200, 30, thickness=-1)
+    assert find_panels(grey) == [PanelCandidate(page, 1.0, "full_page")]
+
+
+def test_rectangle_fill_near_one() -> None:
+    cands = find_panels(grid_2x2())
+    assert len(cands) == 4
+    assert all(c.reason == "component" and c.fill > 0.98 for c in cands)
+    assert [c.bbox for c in cands] == detect_panels(grid_2x2())
+
+
+def test_merged_l_shape_is_irregular() -> None:
+    # A character breaking out of the frame joins two panels into one L-shaped component.
+    img = blank()
+    frame(img, 40, 40, 480, 680)
+    frame(img, 520, 40, 960, 680)
+    frame(img, 40, 720, 480, 1360)
+    cv2.rectangle(img, (470, 600), (530, 780), 0, thickness=-1)  # break-out joins all three
+    [merged] = find_panels(img)
+    assert merged.reason == "component"
+    assert merged.fill < IRREGULAR_FILL
+
+
+def test_single_component_by_bbox_area_is_whole_page() -> None:
+    # Art box covers >= 90 % of the page by bbox but < 90 % by pixels (white narration margin
+    # cuts into it from the right, Black Jack p34): the panel is the whole page.
+    img = blank()
+    cv2.rectangle(img, (0, 0), (949, 1399), 100, thickness=-1)
+    cv2.rectangle(img, (500, 300), (999, 1000), 255, thickness=-1)
+    cv2.putText(img, "|", (965, 600), cv2.FONT_HERSHEY_SIMPLEX, 1, 0, 2)  # margin text
+    assert find_panels(img) == [PanelCandidate(BBox(x=0, y=0, w=W, h=H), 1.0, "full_page")]
 
 
 def test_detect_rejects_bad_input() -> None:
