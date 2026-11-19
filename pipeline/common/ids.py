@@ -28,7 +28,21 @@ ObjectRef = Annotated[
 ]
 
 PREFIXES = frozenset(
-    {"proj", "chap", "page", "panel", "bubble", "char", "shot", "v", "line", "rights", "user"}
+    {
+        "proj",
+        "chap",
+        "page",
+        "panel",
+        "bubble",
+        "char",
+        "shot",
+        "v",
+        "line",
+        "rights",
+        "user",
+        "rev",
+        "job",
+    }
 )
 
 

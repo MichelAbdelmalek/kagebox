@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from alembic import context
 
-from kagebox_api.db import Base, make_engine
+from pipeline.common.database import make_engine
+from pipeline.common.dbmodels import Base
 from pipeline.common.settings import get_settings
 
 target_metadata = Base.metadata
