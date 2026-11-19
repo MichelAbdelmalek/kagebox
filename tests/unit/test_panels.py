@@ -1,0 +1,202 @@
+"""Panel detection, XY-cut reading order and manhwa strip slicing on synthetic pages."""
+
+from __future__ import annotations
+
+import itertools
+
+import cv2
+import numpy as np
+import pytest
+
+from pipeline.common.schemas import BBox
+from pipeline.ingest.panels import detect_panels, reading_order, slice_strip
+
+W, H = 1000, 1400
+
+
+def blank(w: int = W, h: int = H) -> np.ndarray:
+    return np.full((h, w), 255, dtype=np.uint8)
+
+
+def frame(img: np.ndarray, x0: int, y0: int, x1: int, y1: int, ink: int = 0) -> None:
+    cv2.rectangle(img, (x0, y0), (x1, y1), ink, thickness=4)
+    # some interior art so the panel is not only a border
+    cv2.line(img, (x0 + 20, y0 + 20), (x1 - 20, y1 - 20), ink, thickness=3)
+
+
+def near(box: BBox, x: int, y: int, w: int, h: int, tol: int = 8) -> bool:
+    return (
+        abs(box.x - x) <= tol
+        and abs(box.y - y) <= tol
+        and abs(box.w - w) <= tol
+        and abs(box.h - h) <= tol
+    )
+
+
+def ordered(img: np.ndarray, direction: str) -> list[BBox]:
+    boxes = detect_panels(img)
+    perm = reading_order(boxes, direction)  # type: ignore[arg-type]
+    assert sorted(perm) == list(range(len(boxes)))
+    return [boxes[i] for i in perm]
+
+
+def grid_2x2() -> np.ndarray:
+    img = blank()
+    frame(img, 40, 40, 480, 680)  # top-left
+    frame(img, 520, 40, 960, 680)  # top-right
+    frame(img, 40, 720, 480, 1360)  # bottom-left
+    frame(img, 520, 720, 960, 1360)  # bottom-right
+    return img
+
+
+TL, TR = (40, 40), (520, 40)
+BL, BR = (40, 720), (520, 720)
+
+
+def corner(box: BBox) -> tuple[int, int]:
+    return (round(box.x / 20) * 20, round(box.y / 20) * 20)
+
+
+def test_grid_2x2_rtl_order() -> None:
+    boxes = ordered(grid_2x2(), "rtl")
+    assert [corner(b) for b in boxes] == [TR, TL, BR, BL]
+    assert near(boxes[0], 518, 38, 445, 645)
+
+
+def test_grid_2x2_ltr_order() -> None:
+    boxes = ordered(grid_2x2(), "ltr")
+    assert [corner(b) for b in boxes] == [TL, TR, BL, BR]
+
+
+def test_grid_2x2_rgb_input() -> None:
+    rgb = cv2.cvtColor(grid_2x2(), cv2.COLOR_GRAY2RGB)
+    assert len(detect_panels(rgb)) == 4
+
+
+def test_tall_left_panel_rtl() -> None:
+    img = blank()
+    frame(img, 40, 40, 480, 1360)  # tall left
+    frame(img, 520, 40, 960, 680)  # right top
+    frame(img, 520, 720, 960, 1360)  # right bottom
+    boxes = ordered(img, "rtl")
+    assert [corner(b) for b in boxes] == [(520, 40), (520, 720), (40, 40)]
+
+
+def test_full_bleed_page_single_panel() -> None:
+    img = np.full((H, W), 128, dtype=np.uint8)
+    cv2.circle(img, (500, 700), 200, 30, thickness=-1)  # dark art
+    cv2.rectangle(img, (300, 1100), (700, 1300), 230, thickness=-1)  # light art, off the border
+    assert detect_panels(img) == [BBox(x=0, y=0, w=W, h=H)]
+
+
+def test_uniform_and_empty_pages_single_panel() -> None:
+    assert detect_panels(np.full((H, W), 128, dtype=np.uint8)) == [BBox(x=0, y=0, w=W, h=H)]
+    assert detect_panels(blank()) == [BBox(x=0, y=0, w=W, h=H)]
+
+
+def test_large_framed_panel_counts_as_full_page() -> None:
+    img = blank()
+    frame(img, 10, 10, 990, 1390)  # >= 90 % of the page
+    assert detect_panels(img) == [BBox(x=0, y=0, w=W, h=H)]
+
+
+def test_noise_specks_ignored() -> None:
+    img = grid_2x2()
+    rng = np.random.default_rng(7)
+    for _ in range(60):  # specks and short scratches in the gutters
+        x, y = int(rng.integers(0, W)), int(rng.integers(0, H))
+        cv2.circle(img, (x, y), int(rng.integers(1, 6)), 0, thickness=-1)
+    cv2.line(img, (490, 100), (510, 140), 0, thickness=2)
+    boxes = detect_panels(img)
+    assert len(boxes) == 4  # a speck touching a frame may grow that box by a few px
+    for x, y in (TL, TR, BL, BR):
+        assert any(abs(b.x - x) <= 15 and abs(b.y - y) <= 15 for b in boxes)
+
+
+def test_hairline_gap_in_border_is_closed() -> None:
+    img = grid_2x2()
+    img[300:302, 36:45] = 255  # a 2 px break in the top-left frame's left border
+    assert len(detect_panels(img)) == 4
+
+
+def test_detect_rejects_bad_input() -> None:
+    with pytest.raises(ValueError):
+        detect_panels(np.zeros((10, 10, 2), dtype=np.uint8))
+    with pytest.raises(ValueError):
+        detect_panels(np.zeros((10, 10), dtype=np.float32))
+
+
+# ---- reading_order on bare boxes (Task 5 reuses it for regions inside a panel) ----------------
+
+
+def b(x: int, y: int, w: int, h: int) -> BBox:
+    return BBox(x=x, y=y, w=w, h=h)
+
+
+def test_reading_order_empty_and_single() -> None:
+    assert reading_order([], "rtl") == []
+    assert reading_order([b(0, 0, 5, 5)], "ltr") == [0]
+
+
+def test_reading_order_widest_horizontal_gap_first() -> None:
+    # Three rows; the gap under row 1 is narrow, under row 2 wide. Result is still top to bottom.
+    boxes = [b(0, 220, 50, 50), b(0, 0, 50, 100), b(0, 105, 50, 50)]
+    assert reading_order(boxes, "rtl") == [1, 2, 0]
+
+
+def test_reading_order_vertical_split_rtl_and_ltr() -> None:
+    boxes = [b(0, 0, 40, 40), b(100, 0, 40, 40), b(50, 0, 40, 40)]
+    assert reading_order(boxes, "rtl") == [1, 2, 0]
+    assert reading_order(boxes, "ltr") == [0, 2, 1]
+
+
+def test_reading_order_overlap_fallback() -> None:
+    # Pairwise overlapping in both axes, so no XY cut exists: fall back to bands of 1/20 of the
+    # boxes' height span, then right edge (rtl) or left edge (ltr). Spans 110 px: bands of 5.5 px.
+    boxes = [b(0, 0, 60, 60), b(40, 2, 60, 60), b(20, 50, 60, 60)]
+    assert reading_order(boxes, "rtl") == [1, 0, 2]
+    assert reading_order(boxes, "ltr") == [0, 1, 2]
+
+
+def test_reading_order_is_permutation_for_random_boxes() -> None:
+    rng = np.random.default_rng(3)
+    boxes = [
+        b(int(rng.integers(0, 900)), int(rng.integers(0, 900)), int(rng.integers(1, 200)), 30)
+        for _ in range(50)
+    ]
+    for d in ("rtl", "ltr"):
+        assert sorted(reading_order(boxes, d)) == list(range(50))  # type: ignore[arg-type]
+
+
+# ---- manhwa strips ----------------------------------------------------------------------------
+
+
+def test_slice_strip_cuts_at_gutters() -> None:
+    img = np.full((7000, 800), 255, dtype=np.uint8)
+    # art blocks with gutters: 1800-1900 (100 px), 2600-2640 (40 px), 4500-4900 (400 px)
+    for y0, y1 in ((0, 1800), (1900, 2600), (2640, 4500), (4900, 7000)):
+        cv2.rectangle(img, (20, y0 + 5), (780, y1 - 5), 0, thickness=-1)
+    ranges = slice_strip(img, max_height=3000)
+    assert ranges[0][0] == 0 and ranges[-1][1] == 7000
+    assert all(a[1] == c[0] for a, c in itertools.pairwise(ranges))
+    assert all(0 < y1 - y0 <= 3000 for y0, y1 in ranges)
+    # First window [0, 3000]: widest gutter is 1800-1900, so cut in it, not in 2600-2640.
+    assert 1800 <= ranges[0][1] <= 1900
+    # Next window from ~1850: 4500-4900 is beyond 1850+3000? No: 4850 > 4500, so cut there.
+    assert 4500 <= ranges[1][1] <= 4900
+    assert len(ranges) == 3
+
+
+def test_slice_strip_hard_cut_without_gutter() -> None:
+    img = np.zeros((7000, 100), dtype=np.uint8)
+    img[::2, ::2] = 255  # texture, never a white row
+    assert slice_strip(img, max_height=3000) == [(0, 3000), (3000, 6000), (6000, 7000)]
+
+
+def test_slice_strip_short_image_single_range() -> None:
+    assert slice_strip(blank(), max_height=3000) == [(0, H)]
+
+
+def test_slice_strip_rejects_bad_max_height() -> None:
+    with pytest.raises(ValueError):
+        slice_strip(blank(), max_height=0)
