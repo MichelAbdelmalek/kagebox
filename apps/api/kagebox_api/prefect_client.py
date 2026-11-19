@@ -21,7 +21,7 @@ def start_ingest(chapter_id: str, api_url: str, *, timeout: httpx.Timeout = TIME
     """Create a run of the chapter-ingest deployment; returns the Prefect flow-run id."""
     url = f"{api_url.rstrip('/')}/deployments/name/{INGEST_DEPLOYMENT}/create_flow_run"
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             resp = client.post(url, json={"parameters": {"chapter_id": chapter_id}})
     except httpx.HTTPError as exc:
         log.warning("prefect create_flow_run failed: %s", type(exc).__name__)

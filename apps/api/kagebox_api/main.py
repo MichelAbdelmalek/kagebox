@@ -45,6 +45,7 @@ def create_app(
         redoc_url=None,
         openapi_url="/api/openapi.json",
     )
+    app.state.upload_slots = chapters.UploadSlots(chapters.MAX_CONCURRENT_UPLOADS)
     app.state.kagebox = AppState(
         settings, db, store or make_store(settings), key.get_secret_value().encode()
     )

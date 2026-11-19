@@ -8,20 +8,22 @@ OCR text is returned as JSON data only.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
 import os
 import re
 import stat
+import threading
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import IO, Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
-from sqlalchemy import CursorResult, select, update
+from sqlalchemy import CursorResult, and_, or_, select, update
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile
 from starlette.types import Message
@@ -37,11 +39,13 @@ from kagebox_api.db import (
     RightsRow,
     User,
     audit,
+    aware,
     utcnow,
 )
 from kagebox_api.deps import DB, AppState, CurrentUser, require_project_role, state
 from kagebox_api.prefect_client import PrefectError, start_ingest
 from kagebox_api.security import sign_media
+from pipeline.common.dbmodels import STALE_INGEST_S
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import (
     BBox,
@@ -67,6 +71,9 @@ CHUNK = 1024 * 1024
 FORM_SLACK = 64 * 1024  # multipart boundaries, part headers and the two small range fields
 MANHWA_PDF = "manhwa sources must be images or CBZ"  # same message as the ingest flow
 START_FAILED = "could not start ingest; try again"
+MAX_CONCURRENT_UPLOADS = 2
+UPLOADS_BUSY = "too many uploads in progress, try again"
+SPOOL_FAILED = "the server could not store the upload; try again later"
 _DIGITS = re.compile(r"^[0-9]{1,6}$")
 
 
@@ -216,12 +223,28 @@ def _require_rights(db: Session, user: User, project_id: str) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
 
+def _stale_before() -> datetime:
+    return utcnow() - timedelta(seconds=STALE_INGEST_S)
+
+
+def _busy(row: ChapterRow) -> bool:
+    """'ingesting' and owned by a run that is not stale (same rule as the ingest flow)."""
+    started = row.ingest_started_at
+    return row.status == "ingesting" and started is not None and aware(started) >= _stale_before()
+
+
 def _prepare(db: Session, user: User, chapter_id: str) -> ChapterRow:
-    """Checks shared by upload and import, before any bytes are read."""
+    """Checks shared by upload and import, before any bytes are read.
+
+    Ends the transaction before returning, so no pooled connection is held while a large body
+    is streamed or hashed (the session does not expire loaded objects on commit). The final
+    conditional UPDATE re-checks the state.
+    """
     row = _chapter_for(db, user, chapter_id, "editor")
     _require_rights(db, user, row.project_id)
-    if row.status == "ingesting":
+    if _busy(row):
         raise HTTPException(status.HTTP_409_CONFLICT, "chapter is being ingested")
+    db.commit()  # read-only so far; commit (not rollback, which expires) frees the connection
     return row
 
 
@@ -246,7 +269,14 @@ def _set_source_and_start(
         CursorResult[Any],
         db.execute(
             update(ChapterRow)
-            .where(ChapterRow.id == row.id, ChapterRow.status != "ingesting")
+            .where(
+                ChapterRow.id == row.id,
+                or_(
+                    ChapterRow.status != "ingesting",
+                    ChapterRow.ingest_started_at.is_(None),
+                    ChapterRow.ingest_started_at < _stale_before(),
+                ),
+            )
             .values(
                 source_kind=kind,
                 source_ref=ref,
@@ -255,7 +285,11 @@ def _set_source_and_start(
                 page_end=rng.page_end,
                 status="pending",
                 error=None,
+                # Taking over a stale run: it no longer owns the chapter and writes nothing.
+                ingest_started_at=None,
+                ingest_run_id=None,
             )
+            .execution_options(synchronize_session=False)
         ),
     )
     if result.rowcount != 1:
@@ -348,6 +382,25 @@ def get_chapter(chapter_id: str, user: CurrentUser, db: DB) -> ChapterOut:
 
 class _BodyTooLarge(Exception):
     pass
+
+
+class UploadSlots:
+    """Non-blocking limit on concurrent uploads (each may spool up to the upload limit)."""
+
+    def __init__(self, size: int) -> None:
+        self._free = size
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._free <= 0:
+                return False
+            self._free -= 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._free += 1
 
 
 def _capped(
@@ -451,6 +504,28 @@ async def upload_source(
     """Multipart upload (``file``, optional ``page_start`` / ``page_end``), at most the limit."""
     st = state(request)
     row = await run_in_threadpool(_prepare, db, user, chapter_id)
+    slots: UploadSlots = request.app.state.upload_slots
+    if not slots.try_acquire():
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, UPLOADS_BUSY)
+    try:
+        ref, sha256_hex, rng = await _receive_upload(request, st, row)
+    except OSError as exc:  # spool volume full or failing: never a bare 500
+        log.warning("upload spooling failed: %s", type(exc).__name__)
+        await run_in_threadpool(_audit_spool_failure, db, user, row.id, exc)
+        raise HTTPException(status.HTTP_507_INSUFFICIENT_STORAGE, SPOOL_FAILED) from None
+    finally:
+        slots.release()
+    return await run_in_threadpool(
+        lambda: _set_source_and_start(
+            db, st, user, row, kind="upload", ref=ref, sha256_hex=sha256_hex, rng=rng
+        )
+    )
+
+
+async def _receive_upload(
+    request: Request, st: AppState, row: ChapterRow
+) -> tuple[str, str, PageRange]:
+    """Parse the capped multipart body (spooled under TMPDIR), then sniff, hash and store."""
     limited = Request(
         request.scope, _capped(request.receive, st.settings.max_upload_bytes + FORM_SLACK)
     )
@@ -468,16 +543,14 @@ async def upload_source(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "a file is required")
         if start is not None and end is not None:
             _range(start, end)  # malformed or reversed ranges fail before any work
-        ref, sha256_hex, rng = await run_in_threadpool(
-            _store_upload, st, row, upload.file, start, end
-        )
+        return await run_in_threadpool(_store_upload, st, row, upload.file, start, end)
     finally:
         await form.close()
-    return await run_in_threadpool(
-        lambda: _set_source_and_start(
-            db, st, user, row, kind="upload", ref=ref, sha256_hex=sha256_hex, rng=rng
-        )
-    )
+
+
+def _audit_spool_failure(db: Session, user: User, chapter_id: str, exc: OSError) -> None:
+    audit(db, user.id, "upload.spool_failed", chapter_id, errno=exc.errno)
+    db.commit()
 
 
 def _open_import(root: str, name: str) -> int | None:
@@ -542,14 +615,61 @@ def _load(model: type[Any], artifact: dict[str, Any]) -> Any:
     return model.model_validate_json(json.dumps(artifact))
 
 
-@router.get("/chapters/{chapter_id}/pages", response_model=list[PageOut])
-def list_pages(chapter_id: str, request: Request, user: CurrentUser, db: DB) -> list[PageOut]:
+Limit = Annotated[int, Query(ge=1, le=1000)]
+Cursor = Annotated[str | None, Query(min_length=1, max_length=512)]
+BAD_CURSOR = "invalid cursor"
+
+
+def _encode_cursor(key: int | str, row_id: str) -> str:
+    raw = json.dumps([key, row_id], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[object, str]:
+    """Opaque keyset cursor -> (sort key, id). Malformed -> 422. The caller checks key types."""
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        data = json.loads(raw)
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, BAD_CURSOR) from None
+    if not (
+        isinstance(data, list)
+        and len(data) == 2
+        and isinstance(data[1], str)
+        and 0 < len(data[1]) <= 80
+    ):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, BAD_CURSOR)
+    return data[0], data[1]
+
+
+class PagesOut(BaseModel):
+    items: list[PageOut]
+    next: str | None  # pass as ?cursor= for the following page; null at the end
+
+
+@router.get("/chapters/{chapter_id}/pages", response_model=PagesOut)
+def list_pages(
+    chapter_id: str,
+    request: Request,
+    user: CurrentUser,
+    db: DB,
+    limit: Limit = 200,
+    cursor: Cursor = None,
+) -> PagesOut:
+    """Pages in reading order, keyset-paginated on (index, id)."""
     st = state(request)
     row = _chapter_for(db, user, chapter_id, "viewer")
+    q = select(PageRow).where(PageRow.chapter_id == row.id)
+    if cursor is not None:
+        key, after_id = _decode_cursor(cursor)
+        if type(key) is not int:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, BAD_CURSOR)
+        q = q.where(or_(PageRow.index > key, and_(PageRow.index == key, PageRow.id > after_id)))
+    rows = list(db.scalars(q.order_by(PageRow.index, PageRow.id).limit(limit + 1)))
+    more = len(rows) > limit
+    rows = rows[:limit]
     out: list[PageOut] = []
-    for prow in db.scalars(
-        select(PageRow).where(PageRow.chapter_id == row.id).order_by(PageRow.index)
-    ):
+    for prow in rows:
         page: Page = _load(Page, prow.artifact)
         out.append(
             PageOut(
@@ -563,7 +683,8 @@ def list_pages(chapter_id: str, request: Request, user: CurrentUser, db: DB) -> 
                 image_url=_media_url(st, user.id, page.image_ref),
             )
         )
-    return out
+    nxt = _encode_cursor(rows[-1].index, rows[-1].id) if more else None
+    return PagesOut(items=out, next=nxt)
 
 
 @router.get("/pages/{page_id}/panels", response_model=list[PanelOut])
@@ -621,23 +742,47 @@ def list_panels(page_id: str, request: Request, user: CurrentUser, db: DB) -> li
     return out
 
 
-@router.get("/projects/{project_id}/review-items", response_model=list[ReviewItemOut])
+class ReviewItemsOut(BaseModel):
+    items: list[ReviewItemOut]
+    next: str | None  # pass as ?cursor= for the following page; null at the end
+
+
+@router.get("/projects/{project_id}/review-items", response_model=ReviewItemsOut)
 def list_review_items(
     project_id: str,
     user: CurrentUser,
     db: DB,
     status_: Annotated[Literal["open", "resolved"], Query(alias="status")] = "open",
     chapter_id: Annotated[str | None, Query(max_length=80)] = None,
-    limit: Annotated[int, Query(ge=1, le=1000)] = 500,
-) -> list[ReviewItemOut]:
+    limit: Limit = 200,
+    cursor: Cursor = None,
+) -> ReviewItemsOut:
+    """Review items oldest first, keyset-paginated on (created_at, id)."""
     require_project_role(db, user, project_id, "viewer")
     q = select(ReviewItemRow).where(
         ReviewItemRow.project_id == project_id, ReviewItemRow.status == status_
     )
     if chapter_id is not None:
         q = q.where(ReviewItemRow.chapter_id == chapter_id)
-    q = q.order_by(ReviewItemRow.created_at, ReviewItemRow.id).limit(limit)
-    return [
+    if cursor is not None:
+        key, after_id = _decode_cursor(cursor)
+        try:
+            after = aware(datetime.fromisoformat(key)) if isinstance(key, str) else None
+        except ValueError:
+            after = None
+        if after is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, BAD_CURSOR)
+        q = q.where(
+            or_(
+                ReviewItemRow.created_at > after,
+                and_(ReviewItemRow.created_at == after, ReviewItemRow.id > after_id),
+            )
+        )
+    q = q.order_by(ReviewItemRow.created_at, ReviewItemRow.id).limit(limit + 1)
+    rows = list(db.scalars(q))
+    more = len(rows) > limit
+    rows = rows[:limit]
+    items = [
         ReviewItemOut(
             id=r.id,
             chapter_id=r.chapter_id,
@@ -647,5 +792,8 @@ def list_review_items(
             status=r.status,
             created_at=r.created_at,
         )
-        for r in db.scalars(q)
+        for r in rows
     ]
+    last = rows[-1] if more else None
+    nxt = _encode_cursor(aware(last.created_at).isoformat(), last.id) if last else None
+    return ReviewItemsOut(items=items, next=nxt)

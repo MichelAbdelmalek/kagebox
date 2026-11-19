@@ -76,11 +76,15 @@ services:
       <<: *python-env
       KAGEBOX_ALLOWED_ORIGIN: https://${KAGEBOX_HOST:-localhost}:${KAGEBOX_PORT:-8443}
       KAGEBOX_PREFECT_API_URL: http://prefect-server:4200/api  # start ingest runs (internal)
+      # Upload parts over 1 MB spool to disk via tempfile: keep them off the /tmp tmpfs (RAM).
+      TMPDIR: /spool
     secrets: [db_password, s3_access_key, s3_secret_key, media_signing_key, session_secret]
     volumes:
       - ../data/imports:/imports:ro  # server-side imports by bare file name (mkdir -p data/imports)
+      - api-spool:/spool  # at most MAX_CONCURRENT_UPLOADS x 200 MB in flight
     networks: [front, back]
     depends_on:
+      volume-init: {condition: service_completed_successfully}
       migrate: {condition: service_completed_successfully}
       objects-init: {condition: service_completed_successfully}
     mem_limit: 1g
@@ -249,7 +253,7 @@ services:
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
     cap_add: ["CHOWN"]
-    command: ["chown", "10001:10001", "/v/objects", "/v/caddy-data", "/v/caddy-config", "/v/models", "/v/quarantine", "/v/staging"]  # roots only; services own their contents
+    command: ["chown", "10001:10001", "/v/objects", "/v/caddy-data", "/v/caddy-config", "/v/models", "/v/quarantine", "/v/staging", "/v/api-spool"]  # roots only; services own their contents
     volumes:
       - objects:/v/objects
       - caddy-data:/v/caddy-data
@@ -257,6 +261,7 @@ services:
       - models:/v/models
       - models-quarantine:/v/quarantine
       - models-staging:/v/staging
+      - api-spool:/v/api-spool
 
   # One-shot model download (Phase 1): pinned .safetensors revisions with sha256 checks.
   models-fetch:
@@ -350,6 +355,7 @@ volumes:
   models-staging: {}
   caddy-data: {}
   caddy-config: {}
+  api-spool: {}
 
 secrets:
   db_password: {file: ./secrets/db_password.txt}

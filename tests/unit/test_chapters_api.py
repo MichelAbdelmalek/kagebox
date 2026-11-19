@@ -453,7 +453,8 @@ def test_refused_while_ingesting(env: Env) -> None:
     cid = chapter(env, pid)
     (env.imports / "v.pdf").write_bytes(PDF)
     with env.session() as s:
-        s.get(ChapterRow, cid).status = "ingesting"
+        row = s.get(ChapterRow, cid)
+        row.status, row.ingest_started_at = "ingesting", datetime.now(UTC)
         s.commit()
     with respx.mock(assert_all_called=False) as mock:
         route = ok_prefect(mock)
@@ -573,7 +574,8 @@ def test_pages_returns_signed_urls_only(env: Env) -> None:
     login(env.c, "vi")
     r = env.c.get(f"/api/chapters/{cid}/pages")
     assert r.status_code == 200, r.text
-    pages = r.json()
+    assert r.json()["next"] is None
+    pages = r.json()["items"]
     assert len(pages) == 1
     p = pages[0]
     assert p["id"] == seeded["page_id"] and p["index"] == 1 and p["source_page"] == 4
@@ -611,10 +613,10 @@ def test_review_items_filtered_by_status(env: Env) -> None:
     login(env.c, "vi")
     r = env.c.get(f"/api/projects/{pid}/review-items", params={"status": "open"})
     assert r.status_code == 200, r.text
-    assert [i["kind"] for i in r.json()] == ["ocr_low_confidence"]
-    assert r.json()[0]["chapter_id"] == cid
+    assert [i["kind"] for i in r.json()["items"]] == ["ocr_low_confidence"]
+    assert r.json()["items"][0]["chapter_id"] == cid and r.json()["next"] is None
     r = env.c.get(f"/api/projects/{pid}/review-items", params={"status": "resolved"})
-    assert [i["kind"] for i in r.json()] == ["panel_full_page"]
+    assert [i["kind"] for i in r.json()["items"]] == ["panel_full_page"]
     assert env.c.get(f"/api/projects/{pid}/review-items", params={"status": "x"}).status_code == 422
     login(env.c, "eve")
     assert env.c.get(f"/api/projects/{pid}/review-items").status_code == 404
@@ -631,3 +633,236 @@ def test_store_put_fileobj_matches_put_and_checks_digest() -> None:
         store.put_fileobj("media", io.BytesIO(data), "0" * 64, "pdf", "application/pdf")
     with pytest.raises(ValueError):
         make_ref_from_digest("media", "../x", "pdf")
+
+
+# ---------------------------------------------------------------------------------------------
+# fix round 1: spool, concurrency, pagination, connection release, stale ingest
+
+
+def upload_png(e: Env, cid: str) -> httpx.Response:
+    return e.c.post(
+        f"/api/chapters/{cid}/upload", files={"file": ("p.png", png_bytes(), "image/png")}
+    )
+
+
+def test_upload_slots_full_is_503(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    slots = env.c.app.state.upload_slots  # type: ignore[attr-defined]
+    assert slots.try_acquire() and slots.try_acquire()  # MAX_CONCURRENT_UPLOADS = 2
+    with respx.mock(assert_all_called=False) as mock:
+        route = ok_prefect(mock)
+        r = upload_png(env, cid)
+        assert r.status_code == 503
+        assert r.json()["detail"] == "too many uploads in progress, try again"
+        assert route.call_count == 0
+        slots.release()
+        assert upload_png(env, cid).status_code == 202
+        assert route.call_count == 1
+    # The slot is returned after the request, success or not.
+    assert slots.try_acquire() and not slots.try_acquire()
+
+
+def test_spool_oserror_is_507(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    import errno
+    import tempfile
+
+    import starlette.formparsers
+
+    class FullDisk(tempfile.SpooledTemporaryFile):  # type: ignore[type-arg]
+        def write(self, s: Any) -> int:
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    pid = project(env)
+    cid = chapter(env, pid)
+    monkeypatch.setattr(starlette.formparsers, "SpooledTemporaryFile", FullDisk)
+    with respx.mock(assert_all_called=False) as mock:
+        route = ok_prefect(mock)
+        r = upload_png(env, cid)
+        assert r.status_code == 507, r.text
+        assert r.json()["detail"] == "the server could not store the upload; try again later"
+        assert "No space" not in r.text
+        assert route.call_count == 0
+    from kagebox_api.db import AuditEvent
+
+    with env.session() as s:
+        ev = s.scalars(select(AuditEvent).where(AuditEvent.action == "upload.spool_failed")).all()
+        assert [(e.target, e.detail) for e in ev] == [(cid, {"errno": errno.ENOSPC})]
+    slots = env.c.app.state.upload_slots  # type: ignore[attr-defined]
+    assert slots.try_acquire() and slots.try_acquire()  # released after the failure
+
+
+def test_no_db_transaction_held_while_reading_source(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kagebox_api.deps import get_db
+    from kagebox_api.routes import chapters as routes
+
+    app = env.c.app
+    sessions: list[Any] = []
+
+    def spy_db() -> Iterator[Any]:
+        for s in app.state.kagebox.db.session():  # type: ignore[attr-defined]
+            sessions.append(s)
+            yield s
+
+    app.dependency_overrides[get_db] = spy_db  # type: ignore[attr-defined]
+    seen: list[bool] = []
+    real_capped, real_hash = routes._capped, routes._hash_stream
+
+    def capped(receive: Any, cap: int) -> Any:
+        inner = real_capped(receive, cap)
+
+        async def spy() -> Any:
+            seen.append(sessions[-1].in_transaction())
+            return await inner()
+
+        return spy
+
+    def hash_stream(f: Any, cap: int | None) -> Any:
+        seen.append(sessions[-1].in_transaction())
+        return real_hash(f, cap)
+
+    monkeypatch.setattr(routes, "_capped", capped)
+    monkeypatch.setattr(routes, "_hash_stream", hash_stream)
+    pid = project(env)
+    cid = chapter(env, pid)
+    (env.imports / "v.pdf").write_bytes(PDF)
+    with respx.mock() as mock:
+        ok_prefect(mock)
+        assert upload_png(env, cid).status_code == 202
+        n_upload = len(seen)
+        r = env.c.post(
+            f"/api/chapters/{cid}/import", json={"name": "v.pdf", "page_start": 1, "page_end": 1}
+        )
+        assert r.status_code == 202, r.text
+    assert n_upload >= 2 and len(seen) > n_upload  # body reads + hash, then the import hash
+    assert not any(seen), seen
+
+
+def test_stale_ingesting_chapter_accepts_a_new_source(env: Env) -> None:
+    from datetime import timedelta
+
+    from pipeline.common.dbmodels import STALE_INGEST_S
+
+    pid = project(env)
+    cid = chapter(env, pid)
+    (env.imports / "v.pdf").write_bytes(PDF)
+    body = {"name": "v.pdf", "page_start": 1, "page_end": 1}
+
+    def set_running(age_s: int) -> None:
+        with env.session() as s:
+            row = s.get(ChapterRow, cid)
+            row.status, row.ingest_run_id = "ingesting", "old-run"
+            row.ingest_started_at = datetime.now(UTC) - timedelta(seconds=age_s)
+            s.commit()
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = ok_prefect(mock)
+        set_running(STALE_INGEST_S - 60)  # live run
+        assert env.c.post(f"/api/chapters/{cid}/import", json=body).status_code == 409
+        assert upload_png(env, cid).status_code == 409
+        assert route.call_count == 0
+        set_running(STALE_INGEST_S + 60)  # stale run (worker killed): may be taken over
+        assert env.c.post(f"/api/chapters/{cid}/import", json=body).status_code == 202
+        row = chapter_row(env, cid)
+        assert (row.status, row.ingest_run_id, row.ingest_started_at) == ("pending", None, None)
+        set_running(STALE_INGEST_S + 60)
+        assert upload_png(env, cid).status_code == 202
+        assert route.call_count == 2
+
+
+def _cursor(payload: Any) -> str:
+    import base64
+
+    raw = json.dumps(payload).encode()
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def test_review_items_keyset_pagination_walks_everything(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    base = datetime(2026, 11, 19, 12, tzinfo=UTC)
+    seeded: set[str] = set()
+    with env.session() as s:
+        for i in range(11):  # several share a created_at: the id breaks the tie
+            rid = new_id("rev")
+            seeded.add(rid)
+            s.add(
+                ReviewItemRow(
+                    id=rid,
+                    project_id=pid,
+                    chapter_id=cid,
+                    artifact_id="page_x",
+                    kind="page_no_text",
+                    reason="r",
+                    status="open",
+                    created_at=base.replace(second=i // 3),
+                )
+            )
+        s.commit()
+    got: list[str] = []
+    cursor: str | None = None
+    pages = 0
+    while True:
+        params: dict[str, Any] = {"limit": 3}
+        if cursor:
+            params["cursor"] = cursor
+        r = env.c.get(f"/api/projects/{pid}/review-items", params=params)
+        assert r.status_code == 200, r.text
+        got += [i["id"] for i in r.json()["items"]]
+        cursor = r.json()["next"]
+        pages += 1
+        if cursor is None:
+            break
+    assert pages == 4 and len(got) == 11 and set(got) == seeded
+    full = env.c.get(f"/api/projects/{pid}/review-items").json()
+    assert [i["id"] for i in full["items"]] == got and full["next"] is None
+    for bad in ("!!!", _cursor([1]), _cursor(["not-a-date", "rev_x"]), _cursor([1, "rev_x"])):
+        r = env.c.get(f"/api/projects/{pid}/review-items", params={"cursor": bad})
+        assert r.status_code == 422, bad
+    for lim in (0, 1001):
+        r = env.c.get(f"/api/projects/{pid}/review-items", params={"limit": lim})
+        assert r.status_code == 422
+
+
+def test_pages_keyset_pagination(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ref = env.store.put("media", png_bytes(), "png", "image/png")
+    with env.session() as s:
+        for index in range(1, 6):
+            page = Page.model_validate(
+                {
+                    "id": new_id("page"),
+                    "chapter_id": cid,
+                    "index": index,
+                    "source_page": index,
+                    "width": 8,
+                    "height": 8,
+                    "image_ref": ref,
+                    "provenance": PROV,
+                }
+            )
+            s.add(
+                PageRow(
+                    id=page.id, chapter_id=cid, index=index, artifact=page.model_dump(mode="json")
+                )
+            )
+        s.commit()
+    got: list[int] = []
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": 2}
+        if cursor:
+            params["cursor"] = cursor
+        r = env.c.get(f"/api/chapters/{cid}/pages", params=params)
+        assert r.status_code == 200, r.text
+        got += [p["index"] for p in r.json()["items"]]
+        cursor = r.json()["next"]
+        if cursor is None:
+            break
+    assert got == [1, 2, 3, 4, 5]
+    for bad in ("%%%", _cursor(["1", "page_x"]), _cursor([True, "page_x"]), _cursor([1, 2])):
+        r = env.c.get(f"/api/chapters/{cid}/pages", params={"cursor": bad})
+        assert r.status_code == 422, bad

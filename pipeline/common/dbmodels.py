@@ -81,6 +81,11 @@ class AuditEvent(Base):
     detail: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
 
+# An 'ingesting' chapter whose run started longer ago than this may be taken over (by a new
+# flow run, or by the API accepting a new source). Shared by orchestration and the API.
+STALE_INGEST_S = 7200
+
+
 class ChapterRow(Base):
     __tablename__ = "chapters"
     id: Mapped[str] = mapped_column(String(80), primary_key=True)

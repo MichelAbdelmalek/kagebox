@@ -66,6 +66,7 @@ from sqlalchemy.orm import Session
 from orchestration.flows import StageResult, db_rights_loader
 from orchestration.models_fetch import load_models
 from pipeline.common.dbmodels import (
+    STALE_INGEST_S,
     BubbleRow,
     ChapterRow,
     PageRow,
@@ -107,7 +108,6 @@ DIRECTIONS: dict[str, Direction] = {
     "manhwa_vertical": "ltr",
 }
 
-STALE_INGEST_S = 7200  # an 'ingesting' run older than this may be taken over
 
 GENERIC_ERROR = "ingest failed"
 INTERRUPTED = "ingest was interrupted"
