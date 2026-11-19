@@ -44,4 +44,16 @@ HEALTHCHECK --interval=15s --timeout=3s --retries=5 CMD ["python", "-c", "import
 CMD ["uvicorn", "kagebox_api.main:app_factory", "--factory", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--no-server-header"]
 
 FROM runtime AS worker
+# FFmpeg for render and assembly (Debian build, GPL: fine to run as a service; revisit before
+# distributing images). Unpinned apt versions: we take Debian's current security releases.
+USER root
+# hadolint ignore=DL3008
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ffmpeg \
+ && rm -rf /var/lib/apt/lists/*
+USER 10001:10001
+ENV KAGEBOX_MODELS_DIR=/models \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    OMP_NUM_THREADS=4
 CMD ["python", "-m", "orchestration.serve"]

@@ -229,3 +229,51 @@ models:
       sha256: e2aa043ef015641d363d8288e7c241c85e36a5c761fb303598e0710233344387
       size_bytes: 1036558
       format: json
+conversions:
+  manga-ocr:
+    status: approved
+    repo: kha-white/manga-ocr-base
+    revision: aa6573bd10b0d446cbf622e29c3e084914df9741
+    license: CC-BY-SA-4.0
+    source: https://huggingface.co/kha-white/manga-ocr-base/tree/aa6573bd10b0d446cbf622e29c3e084914df9741
+    sources:
+    - path: pytorch_model.bin
+      sha256: c63e0bb5b3ff798c5991de18a8e0956c7ee6d1563aca6729029815eda6f5c2eb
+      size_bytes: 444135475
+      format: torch-pickle
+    steps:
+    - src: pytorch_model.bin
+      dst: model.safetensors
+    data_files:
+    - path: config.json
+      sha256: 8c0e395de8fa699daaac21aee33a4ba9bd1309cfbff03147813d2a025f39f349
+      size_bytes: 77546
+      format: json
+    - path: preprocessor_config.json
+      sha256: af4eb4d79cf61b47010fc0bc9352ee967579c417423b4917188d809b7e048948
+      size_bytes: 228
+      format: json
+    - path: special_tokens_map.json
+      sha256: 303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3
+      size_bytes: 112
+      format: json
+    - path: tokenizer_config.json
+      sha256: d775ad1deac162dc56b84e9b8638f95ed8a1f263d0f56f4f40834e26e205e266
+      size_bytes: 486
+      format: json
+    - path: vocab.txt
+      sha256: 344fbb6b8bf18c57839e924e2c9365434697e0227fac00b88bb4899b78aa594d
+      size_bytes: 24072
+      format: text
+    outputs:
+      model.safetensors: 2124dd4998d65c912ea88292e28bbfee85c42174675983a81889e6b1aee65d67
+    reference:
+      step_dst: model.safetensors
+      repo: kha-white/manga-ocr-base
+      revision: 82c77fb84369e0fce0d6e8f0ad96fa82646d0346
+      path: model.safetensors
+      sha256: 218bc3b6f1bce855a8d6eb86150de1f0407115627e68729ab36a6e4f33480ad9
+      size_bytes: 444059876
+    tied:
+      decoder.cls.predictions.decoder.weight: decoder.bert.embeddings.word_embeddings.weight
+      decoder.cls.predictions.decoder.bias: decoder.cls.predictions.bias

@@ -11,7 +11,7 @@ GITLEAKS_IMAGE := zricethezav/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f6
 UV := docker run --rm -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox-uvcache:/root/.cache/uv -w /app -e UV_LINK_MODE=copy $(UV_IMAGE) uv
 PNPM := docker run --rm -v "$(CURDIR)/apps/web":/app -v "$(CURDIR)/docs":/docs:ro -v kagebox-web-nm:/app/node_modules -v kagebox-pnpm:/root/.local/share/pnpm -w /app -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 -e npm_config_store_dir=/root/.local/share/pnpm/store -e CI=true $(NODE_IMAGE) sh -c
 
-.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models
+.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models worker-image
 
 help:
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -59,11 +59,12 @@ lint: ## ruff, mypy, bandit
 	$(UV) run bandit -q -c pyproject.toml -r pipeline orchestration apps/api
 
 scan: lint ## security scans: pip-audit, pnpm audit, hadolint, trivy, gitleaks (fail on high/critical)
-	$(UV) run sh -c 'uv export -q --locked --all-extras --no-dev --no-emit-project -o /tmp/r.txt && pip-audit --strict --disable-pip -r /tmp/r.txt'
+	# torch/torchvision come from PyTorch's CPU index (+cpu builds); audit them as the same upstream release.
+	$(UV) run sh -c 'uv export -q --locked --all-extras --no-dev --no-emit-project -o /tmp/r.txt && sed -E -i "s/^(torch(vision)?==[0-9.]+)\+cpu/\1/" /tmp/r.txt && grep -E "^torch(vision)?==" /tmp/r.txt && pip-audit --strict --disable-pip -r /tmp/r.txt'
 	$(PNPM) 'corepack enable && pnpm audit --prod --audit-level high'
 	docker run --rm -i -v "$(CURDIR)/.hadolint.yaml":/.hadolint.yaml:ro $(HADOLINT_IMAGE) hadolint --config /.hadolint.yaml - < deploy/docker/python.Dockerfile
 	docker run --rm -i -v "$(CURDIR)/.hadolint.yaml":/.hadolint.yaml:ro $(HADOLINT_IMAGE) hadolint --config /.hadolint.yaml - < deploy/docker/web.Dockerfile
-	docker run --rm -v "$(CURDIR)":/src:ro -v kagebox-trivy:/root/.cache $(TRIVY_IMAGE) fs --scanners vuln,misconfig,secret --severity HIGH,CRITICAL --exit-code 1 --skip-dirs /src/apps/web/node_modules --skip-dirs /src/.venv /src
+	docker run --rm -v "$(CURDIR)":/src:ro -v kagebox-trivy:/root/.cache $(TRIVY_IMAGE) fs --scanners vuln,misconfig,secret --severity HIGH,CRITICAL --exit-code 1 --skip-dirs /src/apps/web/node_modules --skip-dirs /src/.venv --skip-dirs /src/data /src
 	docker run --rm -v "$(CURDIR)":/repo:ro $(GITLEAKS_IMAGE) git --no-banner /repo
 
 scan-images: ## trivy scan of the built images (exported tarballs; the Docker socket is never mounted)
@@ -76,5 +77,15 @@ scan-images: ## trivy scan of the built images (exported tarballs; the Docker so
 pin-models: ## regenerate pinned files/hashes in configs/models.yaml from models.sources.yaml
 	$(UV) run python deploy/scripts/pin_models.py configs
 
-fetch-models: ## download pinned model weights into the models volume (Phase 1)
+worker-image:
+	$(COMPOSE) build prefect-server
+
+fetch-models: worker-image ## download pinned model files (pickle sources go to quarantine only)
 	$(COMPOSE) --profile fetch run --rm models-fetch
+
+check-models: worker-image ## offline: verify hashes, load every approved model, run one inference
+	$(COMPOSE) --profile fetch run --rm models-check
+
+convert-models: worker-image ## offline: pickle -> safetensors in a sandbox, then promote pinned outputs
+	$(COMPOSE) --profile fetch run --rm models-convert
+	$(COMPOSE) --profile fetch run --rm models-promote

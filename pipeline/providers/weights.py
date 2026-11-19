@@ -13,11 +13,13 @@ Policy:
 from __future__ import annotations
 
 import hashlib
+import json
 import zipfile
 from datetime import date
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
+import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -133,14 +135,128 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def validate_content(path: Path, fmt: str) -> None:
+    """Format-aware content check, run after the hash matches and before a file is used.
+
+    Safetensors are parsed structurally (a header-length byte of 0x80 is valid, not a pickle).
+    Text formats must decode and parse. Opaque binary formats get the pickle sniff.
+    """
+    if fmt == "safetensors":
+        size = path.stat().st_size
+        with path.open("rb") as fh:
+            raw = fh.read(8)
+            n = int.from_bytes(raw, "little") if len(raw) == 8 else 0
+            if not 2 <= n <= min(size - 8, 100 * 1024**2):
+                raise UnsafeWeights(f"{path.name}: not a valid safetensors header")
+            header = fh.read(n)
+        try:
+            if not header.startswith(b"{") or not isinstance(json.loads(header), dict):
+                raise ValueError
+        except ValueError as exc:
+            raise UnsafeWeights(f"{path.name}: not a valid safetensors header") from exc
+        return
+    if fmt in ("json", "yaml", "text"):
+        try:
+            text = path.read_text(encoding="utf-8")
+            if fmt == "json":
+                json.loads(text)
+            elif fmt == "yaml":
+                yaml.safe_load(text)
+        except (UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+            raise UnsafeWeights(f"{path.name}: not valid {fmt}") from exc
+        return
+    with path.open("rb") as fh:
+        head = fh.read(8)
+    if looks_like_pickle(head, path):
+        raise UnsafeWeights(f"{path.name}: file content is a pickle")
+
+
 def verify_file(path: Path, spec: FileSpec) -> Path:
     """Check a file on disk against its pinned spec. Used after download and before loading."""
     if path.stat().st_size != spec.size_bytes:
         raise UnsafeWeights(f"{spec.path}: size mismatch")
-    with path.open("rb") as fh:
-        head = fh.read(8)
-    if looks_like_pickle(head, path):
-        raise UnsafeWeights(f"{spec.path}: file content is a pickle")
     if sha256_file(path) != spec.sha256:
         raise UnsafeWeights(f"{spec.path}: checksum mismatch")
+    validate_content(path, spec.format)
     return path
+
+
+# --- Offline conversions ------------------------------------------------------------------------
+# Pickle checkpoints are allowed ONLY as conversion sources: fetched into a quarantine volume that
+# runtime workers never mount, and read only by the network-less models-convert job.
+
+
+class SourceFile(_Strict):
+    path: Annotated[str, StringConstraints(min_length=1, max_length=300)]
+    sha256: Sha256
+    size_bytes: Annotated[int, Field(gt=0, le=200 * 1024**3)]
+    format: Literal["torch-pickle", "safetensors"]
+
+    _safe = field_validator("path")(FileSpec._safe_relative.__func__)  # type: ignore[attr-defined]
+
+
+class ConversionStep(_Strict):
+    src: Annotated[str, StringConstraints(min_length=1, max_length=300)]
+    dst: Annotated[str, StringConstraints(pattern=r"^[\w./-]+\.safetensors$", max_length=300)]
+    key: Annotated[str, StringConstraints(max_length=100)] | None = None
+
+    _safe_src = field_validator("src")(FileSpec._safe_relative.__func__)  # type: ignore[attr-defined]
+    _safe_dst = field_validator("dst")(FileSpec._safe_relative.__func__)  # type: ignore[attr-defined]
+
+
+class Reference(_Strict):
+    """An independent safetensors copy the converted tensors must equal (e.g. an official one)."""
+
+    step_dst: str
+    repo: RepoId
+    revision: CommitSha
+    path: Annotated[str, StringConstraints(pattern=r"^[\w./-]+\.safetensors$", max_length=300)]
+    sha256: Sha256
+    size_bytes: Annotated[int, Field(gt=0)]
+
+
+class Conversion(_Strict):
+    name: Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,62}$")]
+    status: Literal["approved", "proposed"]
+    repo: RepoId
+    revision: CommitSha
+    license: Annotated[str, StringConstraints(min_length=2, max_length=100)]
+    source: Annotated[str, StringConstraints(pattern=r"^https://", max_length=300)]
+    sources: list[SourceFile] = Field(max_length=50)
+    steps: list[ConversionStep] = Field(min_length=1, max_length=50)
+    data_files: list[FileSpec] = Field(default_factory=list, max_length=100)
+    # Output sha256 per step dst; null until the first conversion has been reviewed and pinned.
+    outputs: dict[str, Sha256 | None]
+    reference: Reference | None = None
+    # Extra tensor name -> reference tensor it must equal (tied weights a converter dropped).
+    tied: dict[
+        Annotated[str, StringConstraints(max_length=200)],
+        Annotated[str, StringConstraints(max_length=200)],
+    ] = Field(default_factory=dict)
+    safe_globals: list[Annotated[str, StringConstraints(pattern=r"^[\w.]+$")]] = Field(
+        default_factory=list, max_length=20
+    )
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Conversion:
+        pinned = {s.path for s in self.sources}
+        for step in self.steps:
+            if step.src not in pinned:
+                raise ValueError(f"{self.name}: step source {step.src} is not a pinned source")
+        if set(self.outputs) != {s.dst for s in self.steps}:
+            raise ValueError(f"{self.name}: outputs must list exactly the step destinations")
+        if self.reference and self.reference.step_dst not in self.outputs:
+            raise ValueError(f"{self.name}: reference names an unknown step")
+        if self.tied and not self.reference:
+            raise ValueError(f"{self.name}: `tied` only applies to a reference comparison")
+        for f in self.data_files:
+            if f.format not in ("json", "text", "sentencepiece", "tiktoken", "yaml"):
+                raise ValueError(f"{self.name}: data file {f.path} must be a data format")
+        return self
+
+
+def load_conversions(raw: dict[str, Any]) -> list[Conversion]:
+    items = raw.get("conversions") or {}
+    if not isinstance(items, dict):
+        raise ValueError("models.yaml: `conversions` must be a mapping")
+    return [Conversion.model_validate({"name": k, **v}) for k, v in items.items()]

@@ -3,8 +3,9 @@
 # pinned commit. Only files matching `allow` are pinned; models-fetch never downloads anything else.
 #
 # Approved 2026-11-19 (milestone 1.0; see docs/plans/phase-1-model-audit.md).
-# Models that ship only pickle weights (manga-ocr, CosyVoice2, AudioSeal, LaMa) are added with the
-# offline conversion job, not here.
+# Entries with a `convert:` block ship only pickle weights. Their pickle sources are fetched into a
+# quarantine volume and converted offline by `make convert-models` (no network); only the
+# resulting .safetensors files and the `allow`ed data files reach the models volume.
 
 siglip-so400m:
   repo: google/siglip-so400m-patch14-384
@@ -61,3 +62,23 @@ whisper-large-v3-turbo:
   license: MIT
   stage: validate (speech round-trip)
   allow: [model.safetensors, "*.json", "*.txt"]
+
+manga-ocr:
+  repo: kha-white/manga-ocr-base
+  revision: aa6573bd10b0d446cbf622e29c3e084914df9741
+  license: CC-BY-SA-4.0  # card says Apache-2.0; decoder inherits CC-BY-SA-4.0 from bert-base-japanese-char-v2
+  stage: ingest (Japanese OCR)
+  allow: [config.json, preprocessor_config.json, special_tokens_map.json, tokenizer_config.json, vocab.txt]
+  convert:
+    sources: [pytorch_model.bin]
+    steps: [{src: pytorch_model.bin, dst: model.safetensors}]
+    tied:  # BERT LM-head ties that Hugging Face's converter drops; verified 2026-11-19
+      decoder.cls.predictions.decoder.weight: decoder.bert.embeddings.word_embeddings.weight
+      decoder.cls.predictions.decoder.bias: decoder.cls.predictions.bias
+    outputs:  # pinned 2026-11-19: two offline runs identical; equal to the reference incl. declared ties
+      model.safetensors: 2124dd4998d65c912ea88292e28bbfee85c42174675983a81889e6b1aee65d67
+    reference:  # Hugging Face's own safetensors conversion (unmerged PR #4): an independent check
+      step_dst: model.safetensors
+      repo: kha-white/manga-ocr-base
+      revision: 82c77fb84369e0fce0d6e8f0ad96fa82646d0346
+      path: model.safetensors

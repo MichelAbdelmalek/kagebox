@@ -67,19 +67,86 @@ def pin(client: httpx.Client, name: str, src: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def lfs_file(client: httpx.Client, repo: str, rev: str, path: str) -> dict[str, Any]:
+    for item in tree(client, repo, rev):
+        if item["path"] == path:
+            if not item.get("lfs"):
+                raise SystemExit(f"{repo}@{rev}/{path} is not an LFS file")
+            return {"sha256": item["lfs"]["oid"], "size_bytes": int(item["lfs"]["size"])}
+    raise SystemExit(f"{repo}@{rev}: {path} not found")
+
+
+def carry_outputs(new: dict[str, Any], prior: dict[str, Any] | None) -> dict[str, str | None]:
+    """Output hashes for every step. A previously pinned hash is kept only when the revision and
+    every source hash are unchanged; otherwise the output must be re-converted and re-reviewed."""
+    given = new.get("outputs") or {}
+    out: dict[str, str | None] = {s["dst"]: given.get(s["dst"]) for s in new["steps"]}
+    if (
+        prior
+        and prior.get("revision") == new["revision"]
+        and (
+            {s["path"]: s["sha256"] for s in prior.get("sources", [])}
+            == {s["path"]: s["sha256"] for s in new["sources"]}
+        )
+    ):
+        for dst in out:
+            out[dst] = out[dst] or (prior.get("outputs") or {}).get(dst)
+    return out
+
+
+def pin_conversion(client: httpx.Client, name: str, src: dict[str, Any]) -> dict[str, Any]:
+    repo, rev, conv = src["repo"], src["revision"], src["convert"]
+    data = pin(client, name, src)["files"] if src.get("allow") else []
+    out: dict[str, Any] = {
+        "status": "approved",
+        "repo": repo,
+        "revision": rev,
+        "license": src["license"],
+        "source": f"{HF}/{repo}/tree/{rev}",
+        "sources": [
+            {"path": p, **lfs_file(client, repo, rev, p), "format": "torch-pickle"}
+            for p in conv["sources"]
+        ],
+        "steps": conv["steps"],
+        "data_files": data,
+        "outputs": conv.get("outputs") or {s["dst"]: None for s in conv["steps"]},
+    }
+    if ref := conv.get("reference"):
+        out["reference"] = {
+            "step_dst": ref["step_dst"],
+            "repo": ref["repo"],
+            "revision": ref["revision"],
+            "path": ref["path"],
+            **lfs_file(client, ref["repo"], ref["revision"], ref["path"]),
+        }
+    if conv.get("tied"):
+        out["tied"] = conv["tied"]
+    if conv.get("safe_globals"):
+        out["safe_globals"] = conv["safe_globals"]
+    return out
+
+
 def main(config_dir: str) -> int:
     cfg = Path(config_dir)
     sources = yaml.safe_load((cfg / "models.sources.yaml").read_text()) or {}
     models_path = cfg / "models.yaml"
     current = yaml.safe_load(models_path.read_text()) or {}
     with httpx.Client(timeout=60, headers={"user-agent": "kagebox-pin-models"}) as client:
-        models = {name: pin(client, name, src) for name, src in sources.items()}
+        models = {n: pin(client, n, s) for n, s in sources.items() if "convert" not in s}
+        conversions = {
+            n: pin_conversion(client, n, s) for n, s in sources.items() if "convert" in s
+        }
+        for n, c in conversions.items():
+            c["outputs"] = carry_outputs(c, (current.get("conversions") or {}).get(n))
     for name, m in models.items():
         print(
             f"{name}: {len(m['files'])} file(s), "
             f"{sum(f['size_bytes'] for f in m['files']) / 1e6:.0f} MB"
         )
     current["models"] = models
+    current["conversions"] = conversions
+    for n, c in conversions.items():
+        print(f"{n}: convert {len(c['sources'])} source(s), {len(c['data_files'])} data file(s)")
     header = models_path.read_text().split("\nversion:", 1)[0]
     body = yaml.safe_dump(current, sort_keys=False, width=100)
     models_path.write_text(header.rstrip() + "\n\n" + body)
