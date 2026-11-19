@@ -554,6 +554,35 @@ def test_irregular_panel_threshold_from_config(
     assert kinds(env, cid) == {"panel_irregular": 2}
 
 
+def test_merged_panel_always_goes_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An L-shaped frame and a frame in its notch: two components, one merged panel (ruling P4).
+    env = make_env(tmp_path, monkeypatch)
+    env.detector.regions = []
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+    l_shape = [(40, 40), (W - 40, 40), (W - 40, H - 40), (W // 2 + 20, H - 40)]
+    l_shape += [(W // 2 + 20, H * 2 // 3), (40, H * 2 // 3)]
+    draw.line([*l_shape, l_shape[0]], fill="black", width=4)
+    draw.rectangle((40, H * 2 // 3 + 30, W // 2 - 20, H - 40), outline="black", width=4)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    cid = add_chapter(env, make_cbz([buf.getvalue()]), page_end=1)
+    # Fill threshold 0: panel_irregular can never fire, panel_merged must anyway.
+    monkeypatch.setattr(ingest_mod, "load_thresholds", lambda: {"panel_irregular_fill": 0.0})
+    ingest_flow(cid)
+    assert kinds(env, cid) == {"panel_merged": 1}
+    with Session(env.engine) as s:
+        [item] = s.scalars(select(ReviewItemRow).where(ReviewItemRow.chapter_id == cid)).all()
+        [panel] = s.scalars(select(PanelRow).where(PanelRow.chapter_id == cid)).all()
+    assert item.artifact_id == panel.id
+    assert "2 components" in item.reason and "fills" in item.reason
+
+    ingest_flow(cid)  # a re-run replaces the item instead of adding a second one
+    assert kinds(env, cid) == {"panel_merged": 1}
+
+
 def test_thresholds_yaml_has_panel_irregular_fill() -> None:
     assert ingest_mod.load_thresholds()["panel_irregular_fill"] == 0.85
 

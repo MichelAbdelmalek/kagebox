@@ -9,6 +9,16 @@ why it exists and how much of its box it fills, so callers can send doubtful one
 (fill below ``IRREGULAR_FILL`` usually means panels merged by art breaking out of a frame).
 ``detect_panels`` is the same, boxes only.
 
+Overlapping candidates are merged (ruling P4): panels do not overlap, so two candidates whose
+boxes overlap by more than ``MERGE_OVERLAP`` of the smaller box are pieces of one panel (a
+painting cut by dark strokes that reach a black margin, or a fragment nested in its panel).
+Union-find merges chains; the merged box is the union, its fill the summed component pixels
+over the union box, and the whole-page rule is applied again to the merged result. A merged
+candidate is marked ``merged`` (with its piece count): pieces of different panels can fill
+their union well, so the fill test alone would let such a merge through silently; callers
+send every merged candidate to review. Merging
+repeats until no two boxes overlap that much, since a union can reach a box its parts missed.
+
 Decisions beyond the plain algorithm, both made on real pages:
 
 - ``PAPER_MIN``: on light paper, a pixel darker than 160 is never gutter, whatever Otsu says.
@@ -46,6 +56,7 @@ PAPER_MIN = 160  # see module docstring
 BORDER_RING_FRACTION = 0.01  # ring width: 1 % of the short side, at least 2 px
 DARK_BORDER_LEVEL = 50
 DARK_BORDER_SHARE = 0.50  # i.e. the ring's median is near-black
+MERGE_OVERLAP = 0.10  # share of the smaller box: above it, two candidates are one panel
 
 U8 = npt.NDArray[np.uint8]
 
@@ -75,6 +86,8 @@ class PanelCandidate:
     bbox: BBox
     fill: float  # component pixels / bbox area; 1.0 for a whole-page panel
     reason: Reason
+    merged: bool = False  # True when >= 2 overlapping components were unioned (ruling P4)
+    pieces: int = 1  # how many components make up this candidate
 
 
 def _black_paper(gray: U8) -> bool:
@@ -103,15 +116,70 @@ def find_panels(img: npt.NDArray[np.generic]) -> list[PanelCandidate]:
     content = (~gutter).astype(np.uint8)
     n, _, stats, _ = cv2.connectedComponentsWithStats(content, connectivity=8)
     area = float(h * w)
-    cands: list[PanelCandidate] = []
+    parts: list[tuple[BBox, int]] = []
     for i in range(1, n):
         x, y, bw, bh, px = (int(v) for v in stats[i])
-        if px < MIN_PANEL_FRACTION * area:
-            continue
-        if bw * bh >= FULL_PAGE_FRACTION * area:
+        if px >= MIN_PANEL_FRACTION * area:
+            parts.append((BBox(x=x, y=y, w=bw, h=bh), px))
+    cands: list[PanelCandidate] = []
+    for box, px, pieces in merge_overlapping(parts):
+        if box.w * box.h >= FULL_PAGE_FRACTION * area:
             return [PanelCandidate(page, 1.0, "full_page")]
-        cands.append(PanelCandidate(BBox(x=x, y=y, w=bw, h=bh), px / (bw * bh), "component"))
+        fill = px / (box.w * box.h)
+        cands.append(PanelCandidate(box, fill, "component", pieces > 1, pieces))
     return cands or [PanelCandidate(page, 1.0, "no_components")]
+
+
+def _overlap_area(a: BBox, b: BBox) -> int:
+    ow = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+    oh = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+    return ow * oh if ow > 0 and oh > 0 else 0
+
+
+def _union(a: BBox, b: BBox) -> BBox:
+    x0, y0 = min(a.x, b.x), min(a.y, b.y)
+    x1, y1 = max(a.x + a.w, b.x + b.w), max(a.y + a.h, b.y + b.h)
+    return BBox(x=x0, y=y0, w=x1 - x0, h=y1 - y0)
+
+
+def _root(parent: list[int], i: int) -> int:
+    """Union-find root with path halving."""
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+    return i
+
+
+def merge_overlapping(parts: Sequence[tuple[BBox, int]]) -> list[tuple[BBox, int, int]]:
+    """Merge (box, pixel count) pairs whose boxes overlap > ``MERGE_OVERLAP`` of the smaller.
+
+    Union-find over all pairs (chains merge), repeated until stable. Returns (box, pixels,
+    pieces) in the order of each group's first member; pixel counts add up (components never
+    share pixels) and ``pieces`` counts the components in the group.
+    """
+    items = [(box, px, 1) for box, px in parts]
+    while True:
+        parent = list(range(len(items)))
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a, b = items[i][0], items[j][0]
+                smaller = min(a.w * a.h, b.w * b.h)
+                if _overlap_area(a, b) > MERGE_OVERLAP * smaller:
+                    ri, rj = _root(parent, i), _root(parent, j)
+                    if ri != rj:
+                        parent[max(ri, rj)] = min(ri, rj)
+        groups: dict[int, tuple[BBox, int, int]] = {}
+        for i, (box, px, n) in enumerate(items):
+            r = _root(parent, i)
+            if r in groups:
+                gbox, gpx, gn = groups[r]
+                groups[r] = (_union(gbox, box), gpx + px, gn + n)
+            else:
+                groups[r] = (box, px, n)
+        merged = [groups[r] for r in sorted(groups)]
+        if len(merged) == len(items):
+            return merged
+        items = merged
 
 
 def detect_panels(img: npt.NDArray[np.generic]) -> list[BBox]:

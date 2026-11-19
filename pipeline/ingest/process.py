@@ -10,6 +10,8 @@ Nothing fails silently. Review notes:
 
 * ``panel_full_page``: a whole-page panel (``full_page`` or ``no_components``), to confirm;
 * ``panel_irregular``: a component panel whose fill is below ``panel_irregular_fill``;
+* ``panel_merged``: a panel unioned from overlapping components (ruling P4), always, whatever
+  its fill: pieces of different panels can fill their union well;
 * ``region_outside_panels``: a region overlapping no panel; it never becomes a Bubble (R1);
 * ``ocr_low_confidence``: OCR confidence below ``OCR_CONFIDENCE_MIN``;
 * ``page_no_text``: the page had regions to read and every OCR result was empty;
@@ -45,6 +47,7 @@ from pipeline.ingest.sources import Fit
 ReviewKind = Literal[
     "panel_full_page",
     "panel_irregular",
+    "panel_merged",
     "region_outside_panels",
     "ocr_low_confidence",
     "page_no_text",
@@ -53,6 +56,7 @@ ReviewKind = Literal[
 REVIEW_KINDS: tuple[ReviewKind, ...] = (
     "panel_full_page",
     "panel_irregular",
+    "panel_merged",
     "region_outside_panels",
     "ocr_low_confidence",
     "page_no_text",
@@ -283,13 +287,20 @@ def _panel_notes(ctx: PageContext, panel: Panel, cand: PanelCandidate) -> list[R
     if cand.reason != "component":
         reason = f"single whole-page panel ({cand.reason}); confirm the page has one panel"
         return [ReviewNote(panel.id, "panel_full_page", reason)]
+    notes: list[ReviewNote] = []
+    if cand.merged:
+        reason = (
+            f"panel at {_where(cand.bbox)} merged from {cand.pieces} components with "
+            f"overlapping boxes; fills {cand.fill:.2f} of its box; confirm it is one panel"
+        )
+        notes.append(ReviewNote(panel.id, "panel_merged", reason))
     if cand.fill < ctx.irregular_fill:
         reason = (
             f"panel at {_where(cand.bbox)} fills {cand.fill:.2f} of its box "
             f"(below {ctx.irregular_fill:.2f}); panels may be merged"
         )
-        return [ReviewNote(panel.id, "panel_irregular", reason)]
-    return []
+        notes.append(ReviewNote(panel.id, "panel_irregular", reason))
+    return notes
 
 
 def _bubble(

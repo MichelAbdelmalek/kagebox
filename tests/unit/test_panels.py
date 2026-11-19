@@ -198,6 +198,87 @@ def test_single_component_by_bbox_area_is_whole_page() -> None:
     assert find_panels(img) == [PanelCandidate(BBox(x=0, y=0, w=W, h=H), 1.0, "full_page")]
 
 
+def test_painting_split_by_dark_art_on_black_paper_is_one_panel() -> None:
+    # Black Jack p5: one painting on black paper. Dark strokes that reach the black margin
+    # become "gutter" after inversion and cut it into pieces whose boxes overlap (ruling P4).
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    cv2.rectangle(img, (40, 100), (960, 1300), (200, 160, 90), thickness=-1)
+    cv2.line(img, (0, 0), (W - 1, H - 1), (0, 0, 0), thickness=24)
+    cv2.line(img, (W - 1, 0), (0, H - 1), (0, 0, 0), thickness=24)
+    raw = find_panels(img)
+    assert len(raw) == 1
+    [panel] = raw
+    assert panel.reason == "component"
+    assert panel.merged  # pieces were unioned: the flow sends it to review (panel_merged)
+    assert near(panel.bbox, 40, 100, 921, 1201)
+    assert 0.9 < panel.fill <= 1.0  # summed pieces / union box: the strokes are the gap
+
+
+def test_nested_fragment_merges_into_its_panel() -> None:
+    # Black Jack p6: a light shape inside a panel, cut off by dark art, came out as its own
+    # candidate inside the panel's box. Nested boxes overlap 100 % of the smaller one.
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    cv2.rectangle(img, (520, 40), (960, 1360), (210, 190, 150), thickness=-1)
+    cv2.rectangle(img, (40, 40), (480, 1360), (210, 190, 150), thickness=-1)
+    cv2.rectangle(img, (600, 300), (900, 1100), (0, 0, 0), thickness=20)  # dark ring
+    cv2.line(img, (900, 700), (W - 1, 700), (0, 0, 0), thickness=20)  # ring reaches the margin
+    boxes = ordered(img, "rtl")
+    assert [corner(b) for b in boxes] == [(520, 40), (40, 40)]
+    merged = {corner(c.bbox): c.merged for c in find_panels(img)}
+    assert merged == {(520, 40): True, (40, 40): False}
+
+
+def test_black_paper_page6_layout_keeps_four_panels() -> None:
+    # Black Jack p6 layout: wide top panel, tall right panel, two stacked left panels.
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    for x0, y0, x1, y1 in (
+        (60, 0, 940, 540),
+        (540, 580, 940, 1399),
+        (60, 580, 500, 960),
+        (60, 1000, 500, 1399),
+    ):
+        cv2.rectangle(img, (x0, y0), (x1, y1), (210, 190, 150), thickness=-1)
+        cv2.line(img, (x0 + 30, y0 + 30), (x1 - 30, y1 - 30), (30, 20, 10), thickness=3)
+    boxes = ordered(img, "rtl")
+    assert [corner(b) for b in boxes] == [(60, 0), (540, 580), (60, 580), (60, 1000)]
+
+
+def test_white_paper_grid_unchanged_by_merge() -> None:
+    cands = find_panels(grid_2x2())
+    assert len(cands) == 4 and all(c.reason == "component" for c in cands)
+    assert not any(c.merged for c in cands)
+
+
+def test_touching_and_slightly_overlapping_boxes_stay_separate() -> None:  # ruling P4 (d)
+    img = blank()
+    # Two frames separated by a thin gutter: boxes touch, never overlap.
+    frame(img, 40, 40, 496, 680)
+    frame(img, 504, 40, 960, 680)
+    # Two panels split by a slanted gutter: their boxes overlap in a 20-row band, about 6 % of
+    # the smaller box, under MERGE_OVERLAP.
+    upper = np.array([[40, 720], [960, 720], [960, 1020], [40, 1080]])
+    lower = np.array([[40, 1120], [960, 1060], [960, 1360], [40, 1360]])
+    for poly in (upper, lower):
+        cv2.polylines(img, [poly], isClosed=True, color=0, thickness=4)
+        x0, y0 = poly.min(axis=0)
+        x1, y1 = poly.max(axis=0)
+        cv2.line(img, (int(x0) + 30, int(y0) + 30), (int(x1) - 30, int(y1) - 40), 0, thickness=3)
+    cands = find_panels(img)
+    assert len(cands) == 4 and not any(c.merged for c in cands)
+
+
+def test_l_shaped_panel_and_notch_panel_merge_and_are_marked() -> None:
+    # An L-shaped panel's box always contains a panel in its notch (100 % of the smaller box),
+    # so ruling P4 merges them; the flag makes sure a reviewer sees it.
+    img = blank()
+    pts = np.array([[40, 40], [960, 40], [960, 1360], [600, 1360], [600, 1000], [40, 1000]])
+    cv2.polylines(img, [pts], isClosed=True, color=0, thickness=4)
+    cv2.line(img, (60, 60), (940, 980), 0, thickness=3)
+    frame(img, 40, 1040, 560, 1360)
+    [cand] = find_panels(img)
+    assert cand.merged and cand.reason == "component"
+
+
 def test_detect_rejects_bad_input() -> None:
     with pytest.raises(ValueError):
         detect_panels(np.zeros((10, 10, 2), dtype=np.uint8))
