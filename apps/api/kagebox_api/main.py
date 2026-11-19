@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from kagebox_api.db import Base, Database, make_engine
 from kagebox_api.deps import SAFE_METHODS, AppState
+from kagebox_api.limits import BodyLimit
 from kagebox_api.routes import auth, chapters, media, projects
 from pipeline.common.settings import Settings, get_settings
 from pipeline.common.storage import ObjectStore, make_store
@@ -50,6 +51,10 @@ def create_app(
         settings, db, store or make_store(settings), key.get_secret_value().encode()
     )
 
+    # Innermost of the two: bodies are capped before routing, and its 413 still passes through
+    # `guard` (added after it, so outermost) for the origin check and security headers.
+    app.add_middleware(BodyLimit)
+
     @app.middleware("http")
     async def guard(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
@@ -58,7 +63,7 @@ def create_app(
         origin = request.headers.get("origin")
         if request.method not in SAFE_METHODS and allowed_origin and origin != allowed_origin:
             return JSONResponse({"detail": "cross-origin request refused"}, status_code=403)
-        length = request.headers.get("content-length")
+        length = request.headers.get("content-length")  # upload routes (BodyLimit exempts them)
         if length and length.isdigit() and int(length) > settings.max_upload_bytes + 1_000_000:
             return JSONResponse({"detail": "request too large"}, status_code=413)
         response = await call_next(request)

@@ -13,8 +13,24 @@
 
 https://{$KAGEBOX_HOST:localhost}:8443 {
 	encode zstd gzip
-	request_body {
+	# Bodies: 210 MB only for the multipart upload routes (chapter source, rights evidence),
+	# 1 MB everywhere else, so no large body reaches a route that parses it before auth.
+	# The API enforces the same split itself (apps/api/kagebox_api/limits.py).
+	@uploads {
+		method POST
+		path_regexp ^/api/(chapters/[^/]+/upload|projects/[^/]+/rights)$
+	}
+	@not_uploads {
+		not {
+			method POST
+			path_regexp ^/api/(chapters/[^/]+/upload|projects/[^/]+/rights)$
+		}
+	}
+	request_body @uploads {
 		max_size 210MB
+	}
+	request_body @not_uploads {
+		max_size 1MB
 	}
 	header {
 		Strict-Transport-Security "max-age=31536000"

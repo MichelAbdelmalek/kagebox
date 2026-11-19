@@ -186,3 +186,66 @@ def test_signed_media_url_bound_to_user_and_expiry(
 
 def test_new_id_shapes() -> None:
     assert new_id("user").startswith("user_")
+
+
+# ---------------------------------------------------------------------------------------------
+# request body limits (pre-auth memory DoS)
+
+MB = 1_000_000
+
+
+def _chunks(total: int, size: int = 64 * 1024) -> Iterator[bytes]:
+    sent = 0
+    while sent < total:
+        n = min(size, total - sent)
+        sent += n
+        yield b"1," * (n // 2) + b"1" * (n % 2)
+
+
+def test_json_body_over_1mb_is_413_before_parsing(
+    app_client: tuple[TestClient, Settings],
+) -> None:
+    c, _ = app_client
+    big = b"[" + b"1," * MB + b"1]"
+    r = c.post("/api/auth/login", content=big, headers={"content-type": "application/json"})
+    assert r.status_code == 413, r.text
+    assert r.headers["x-content-type-options"] == "nosniff"
+    # also on an authenticated route, before authentication
+    r = c.post("/api/projects", content=big, headers={"content-type": "application/json"})
+    assert r.status_code == 413, r.text
+
+
+def test_chunked_body_without_content_length_is_413(
+    app_client: tuple[TestClient, Settings],
+) -> None:
+    c, _ = app_client
+    r = c.post(
+        "/api/auth/login",
+        content=_chunks(2 * MB),
+        headers={"content-type": "application/json"},
+    )
+    assert "content-length" not in {k.lower() for k in r.request.headers}
+    assert r.status_code == 413, r.text
+
+
+def test_multipart_is_exempt_only_on_the_upload_routes(
+    app_client: tuple[TestClient, Settings],
+) -> None:
+    c, _ = app_client
+    blob = b"%PDF-1.7\n" + b"0" * (MB + 500_000) + b"\n%%EOF\n"
+    r = c.post("/api/auth/login", files={"f": ("x.pdf", blob, "application/pdf")})
+    assert r.status_code == 413, r.text
+    pid = make_project_with_rights(c)  # small evidence; then a 1.5 MB one
+    r = c.post(
+        f"/api/projects/{pid}/rights",
+        data={"basis": "public_domain", "justification": "Published 1941"},
+        files={"evidence": ("e.pdf", blob, "application/pdf")},
+    )
+    assert r.status_code == 201, r.text
+
+
+def test_small_json_still_works(app_client: tuple[TestClient, Settings]) -> None:
+    c, _ = app_client
+    login(c, "ed@example.com")
+    r = c.post("/api/projects", json={"title": "x" * 400, "format": "comic_ltr"})
+    assert r.status_code == 201, r.text
