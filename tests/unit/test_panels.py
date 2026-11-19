@@ -12,10 +12,12 @@ from pipeline.common.schemas import BBox
 from pipeline.ingest.panels import (
     IRREGULAR_FILL,
     PanelCandidate,
+    Slice,
     detect_panels,
     find_panels,
     reading_order,
     slice_strip,
+    slice_strip_cuts,
 )
 
 W, H = 1000, 1400
@@ -360,3 +362,30 @@ def test_slice_strip_short_image_single_range() -> None:
 def test_slice_strip_rejects_bad_max_height() -> None:
     with pytest.raises(ValueError):
         slice_strip(blank(), max_height=0)
+
+
+def test_slice_strip_cuts_report_hard_cuts() -> None:
+    img = np.zeros((7000, 100), dtype=np.uint8)
+    img[::2, ::2] = 255  # texture, never a white row: both cuts are hard
+    assert slice_strip_cuts(img, max_height=3000) == [
+        Slice(0, 3000, hard_cut_after=True),
+        Slice(3000, 6000, hard_cut_after=True),
+        Slice(6000, 7000, hard_cut_after=False),
+    ]
+
+
+def test_slice_strip_cuts_at_gutters_are_not_hard() -> None:
+    img = np.full((7000, 800), 255, dtype=np.uint8)
+    for y0, y1 in ((0, 1800), (1900, 2600), (2640, 4500), (4900, 7000)):
+        cv2.rectangle(img, (20, y0 + 5), (780, y1 - 5), 0, thickness=-1)
+    cuts = slice_strip_cuts(img, max_height=3000)
+    assert [(c.y0, c.y1) for c in cuts] == slice_strip(img, max_height=3000)
+    assert not any(c.hard_cut_after for c in cuts)
+
+
+def test_slice_strip_cuts_mixed() -> None:
+    img = np.zeros((6000, 100), dtype=np.uint8)  # all ink ...
+    img[2000:2100] = 255  # ... with one gutter in the first window only
+    cuts = slice_strip_cuts(img, max_height=3000)
+    assert [c.hard_cut_after for c in cuts] == [False, True, False]
+    assert 2000 <= cuts[0].y1 <= 2100 and cuts[1].y1 == cuts[0].y1 + 3000

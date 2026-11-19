@@ -477,6 +477,32 @@ def test_manhwa_strip_sliced_into_pages(tmp_path: Path, monkeypatch: pytest.Monk
     assert (row.status, row.error) == ("failed", "manhwa sources must be images or CBZ")
 
 
+def test_manhwa_hard_cut_goes_to_review(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A strip with no gutter is cut through its art: the page before each cut is flagged."""
+    env = make_env(tmp_path, monkeypatch, fmt="manhwa_vertical")
+    env.detector.regions = []
+    arr = np.zeros((7000, 400, 3), dtype=np.uint8)
+    arr[::2, ::2] = 255  # texture: no all-white row anywhere
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, "PNG")
+    cid = add_chapter(env, make_cbz([buf.getvalue()]), page_end=1, fmt="manhwa_vertical")
+
+    ingest_flow(cid)
+
+    with Session(env.engine) as s:
+        pages = list(
+            s.scalars(select(PageRow).where(PageRow.chapter_id == cid).order_by(PageRow.index))
+        )
+    cuts = [r for r in reviews(env, cid) if r.kind == "slice_hard_cut"]
+    assert len(pages) == 3
+    assert sorted(r.artifact_id for r in cuts) == sorted([pages[0].id, pages[1].id])
+    by_page = {r.artifact_id: r.reason for r in cuts}
+    assert "3000" in by_page[pages[0].id] and "6000" in by_page[pages[1].id]
+    # re-running replaces them like every other ingest review item
+    ingest_flow(cid)
+    assert kinds(env, cid)["slice_hard_cut"] == 2
+
+
 # ---------------------------------------------------------------------------------------------
 # sources, review kinds and wiring
 

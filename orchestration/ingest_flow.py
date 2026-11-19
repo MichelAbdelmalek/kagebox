@@ -43,7 +43,8 @@ re-hashed against ``source_sha256`` before use. A single image becomes a one-pag
 
 ``Page.index`` is the 1-based reading position in the chapter; ``Page.source_page`` the page
 number in the source file. ``manhwa_vertical`` projects read pages at full height and cut each
-with ``slice_strip``; every slice is its own Page with its ``source_y0``/``source_y1`` rows.
+with ``slice_strip_cuts``; every slice is its own Page with its ``source_y0``/``source_y1`` rows.
+A hard cut (no gutter within reach) files a ``slice_hard_cut`` review item on the page before it.
 
 Models load once per run (one detector, one OCR for the chapter's language).
 """
@@ -101,7 +102,7 @@ from pipeline.common.schemas import RightsDenied, RightsRecord, require_render_a
 from pipeline.common.storage import ObjectStore, parse_ref
 from pipeline.common.uploads import IMAGE_MIMES, UploadRejected
 from pipeline.ingest import bubbles
-from pipeline.ingest.panels import Direction, slice_strip
+from pipeline.ingest.panels import Direction, slice_strip_cuts
 from pipeline.ingest.process import (
     REVIEW_KINDS,
     Detector,
@@ -109,6 +110,7 @@ from pipeline.ingest.process import (
     Ocr,
     PageContext,
     PageResult,
+    ReviewNote,
     SourcePosition,
     process_page,
     safe_errors,
@@ -479,6 +481,15 @@ def _check_rights(engine: Engine, project_id: str) -> None:
     require_render_allowed(db_rights_loader(engine)(project_id), datetime.now(UTC))
 
 
+def _hard_cut_note(page_id: str, source_page: int, y: int) -> ReviewNote:
+    return ReviewNote(
+        page_id,
+        "slice_hard_cut",
+        f"source page {source_page} was cut at row {y} with no gutter in reach: a panel or "
+        "balloon may be split between this page and the next; check both",
+    )
+
+
 def _ingest(ch: _Chapter, deps: IngestDeps) -> IngestSummary:
     _check_rights(deps.engine, ch.project_id)  # fail fast; re-checked inside _commit
     direction = DIRECTIONS[ch.format]
@@ -516,10 +527,13 @@ def _ingest(ch: _Chapter, deps: IngestDeps) -> IngestSummary:
                 results.append(process_page(ctx, len(results) + 1, position, img))
                 _beat(deps.engine, ch)
                 continue
-            for y0, y1 in slice_strip(np.asarray(img)):
+            for y0, y1, hard_cut_after in slice_strip_cuts(np.asarray(img)):
                 piece = img.crop((0, y0, img.width, y1))
                 position = SourcePosition(number, y0, y1)
-                results.append(process_page(ctx, len(results) + 1, position, piece))
+                result = process_page(ctx, len(results) + 1, position, piece)
+                if hard_cut_after:  # no gutter: a panel or balloon may be cut in two
+                    result.reviews.append(_hard_cut_note(result.page.id, number, y1))
+                results.append(result)
                 _beat(deps.engine, ch)
             log.info("page %d done (%d pages so far)", number, len(results))
     flagged = _commit(deps.engine, ch, results)

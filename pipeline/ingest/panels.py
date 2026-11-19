@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import cv2
 import numpy as np
@@ -247,12 +247,21 @@ def reading_order(boxes: Sequence[BBox], direction: Direction) -> list[int]:
 # manhwa strips
 
 
-def slice_strip(img: npt.NDArray[np.generic], max_height: int = 3000) -> list[tuple[int, int]]:
-    """Cut a vertical strip into contiguous [y0, y1) ranges no taller than ``max_height``.
+class Slice(NamedTuple):
+    """Rows [y0, y1) of a strip; ``hard_cut_after`` when the cut at y1 found no gutter (so a
+    panel or balloon may be split across this slice and the next)."""
+
+    y0: int
+    y1: int
+    hard_cut_after: bool
+
+
+def slice_strip_cuts(img: npt.NDArray[np.generic], max_height: int = 3000) -> list[Slice]:
+    """Cut a vertical strip into contiguous slices no taller than ``max_height``.
 
     Each cut goes in the middle of the widest all-white row run inside the window (a run that
     begins at the window's top is the gutter just cut through and is skipped). With no gutter
-    the cut is a hard one at ``max_height``.
+    the cut is a hard one at ``max_height``, and the slice before it says so.
     """
     if max_height < 1:
         raise ValueError("max_height must be positive")
@@ -265,7 +274,7 @@ def slice_strip(img: npt.NDArray[np.generic], max_height: int = 3000) -> list[tu
     edges = np.flatnonzero(np.diff(padded))
     runs = list(zip(edges[0::2].tolist(), edges[1::2].tolist(), strict=True))
 
-    ranges: list[tuple[int, int]] = []
+    slices: list[Slice] = []
     y0 = 0
     while total - y0 > max_height:
         limit = y0 + max_height
@@ -278,7 +287,12 @@ def slice_strip(img: npt.NDArray[np.generic], max_height: int = 3000) -> list[tu
             if best is None or ce - s > best[0]:
                 best = (ce - s, cut)
         y1 = best[1] if best is not None else limit
-        ranges.append((y0, y1))
+        slices.append(Slice(y0, y1, hard_cut_after=best is None))
         y0 = y1
-    ranges.append((y0, total))
-    return ranges
+    slices.append(Slice(y0, total, hard_cut_after=False))
+    return slices
+
+
+def slice_strip(img: npt.NDArray[np.generic], max_height: int = 3000) -> list[tuple[int, int]]:
+    """``slice_strip_cuts`` as plain [y0, y1) ranges."""
+    return [(c.y0, c.y1) for c in slice_strip_cuts(img, max_height)]

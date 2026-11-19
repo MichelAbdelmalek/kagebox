@@ -52,6 +52,7 @@ ReviewKind = Literal[
     "ocr_low_confidence",
     "page_no_text",
     "bubble_invalid",
+    "slice_hard_cut",
 ]
 REVIEW_KINDS: tuple[ReviewKind, ...] = (
     "panel_full_page",
@@ -61,6 +62,7 @@ REVIEW_KINDS: tuple[ReviewKind, ...] = (
     "ocr_low_confidence",
     "page_no_text",
     "bubble_invalid",
+    "slice_hard_cut",
 )
 
 
