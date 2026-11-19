@@ -28,6 +28,7 @@ from orchestration.flows import run_chapter
 from orchestration.ingest_flow import IngestDeps, IngestSummary, ingest_flow
 from pipeline.common.database import make_engine
 from pipeline.common.dbmodels import (
+    STALE_INGEST_S,
     Base,
     BubbleRow,
     ChapterRow,
@@ -795,6 +796,7 @@ def test_concurrent_ingest_refused_stale_taken_over(
             row = s.get(ChapterRow, cid)
             assert row is not None
             row.status, row.ingest_started_at = "ingesting", started
+            row.ingest_heartbeat_at = None  # no beat yet: staleness falls back to the start
 
     set_running(datetime.now(UTC))
     with pytest.raises(ingest_mod.IngestAlreadyRunning, match="ingest already running"):
@@ -804,9 +806,75 @@ def test_concurrent_ingest_refused_stale_taken_over(
     assert count(env, PageRow, cid) == pages_before
     assert env.ocr.calls == 3  # only the first run read anything
 
-    set_running(datetime.now(UTC) - timedelta(seconds=ingest_mod.STALE_INGEST_S + 60))
+    set_running(datetime.now(UTC) - timedelta(seconds=STALE_INGEST_S + 60))
     assert ingest_flow(cid).pages == 1
     assert chapter(env, cid).status == "ready"
+
+
+def test_stale_is_ten_minutes_without_a_heartbeat() -> None:
+    assert STALE_INGEST_S == 600
+
+
+def test_heartbeat_at_start_and_after_every_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+    beats: list[datetime | None] = []
+    env.ocr.on_call = lambda call: beats.append(chapter(env, cid).ingest_heartbeat_at)
+    ingest_mod.run_ingest(cid, ingest_mod.build_deps(), run_id="run-a")
+    # 3 regions per page: calls 1-3 on page 1, 4-6 on page 2
+    assert beats[0] is not None and beats[0] == beats[2]
+    assert beats[3] is not None and beats[3] > beats[0]  # beat after page 1
+    row = chapter(env, cid)
+    assert row.ingest_heartbeat_at is not None and row.ingest_heartbeat_at >= beats[3]
+
+
+def test_takeover_is_judged_on_the_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    now = datetime.now(UTC)
+    stale = timedelta(seconds=STALE_INGEST_S + 60)
+
+    def set_running(started: datetime, beat: datetime | None) -> None:
+        with Session(env.engine) as s, s.begin():
+            row = s.get(ChapterRow, cid)
+            assert row is not None
+            row.status, row.ingest_run_id = "ingesting", "run-old"
+            row.ingest_started_at, row.ingest_heartbeat_at = started, beat
+
+    set_running(now - timedelta(hours=3), now)  # long run, still beating: refused
+    with pytest.raises(ingest_mod.IngestAlreadyRunning):
+        ingest_flow(cid)
+    assert chapter(env, cid).ingest_run_id == "run-old"
+    set_running(now, now - stale)  # recent start but no beat for > STALE: dead, taken over
+    assert ingest_flow(cid).pages == 1
+    set_running(now - stale, None)  # no beat yet: falls back to the start time
+    assert ingest_flow(cid).pages == 1
+    row = chapter(env, cid)
+    assert row.status == "ready" and row.ingest_run_id != "run-old"
+
+
+def test_run_that_lost_the_chapter_stops_at_the_next_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+
+    def take_over(call: int) -> None:
+        if call == 1:
+            with Session(env.engine) as s, s.begin():
+                row = s.get(ChapterRow, cid)
+                assert row is not None
+                row.ingest_run_id = "run-other"
+
+    env.ocr.on_call = take_over
+    with pytest.raises(ingest_mod.IngestAlreadyRunning):
+        ingest_mod.run_ingest(cid, ingest_mod.build_deps(), run_id="run-a")
+    assert env.ocr.calls == 3  # page 2 was never read
+    assert chapter(env, cid).ingest_heartbeat_at is not None
 
 
 def test_taken_over_run_does_not_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

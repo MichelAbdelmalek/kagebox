@@ -17,7 +17,7 @@ import re
 import stat
 import threading
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import IO, Annotated, Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -45,7 +45,7 @@ from kagebox_api.db import (
 from kagebox_api.deps import DB, AppState, CurrentUser, require_project_role, state
 from kagebox_api.prefect_client import PrefectError, start_ingest
 from kagebox_api.security import sign_media
-from pipeline.common.dbmodels import STALE_INGEST_S
+from pipeline.common.dbmodels import ingest_alive, ingest_stale_before, ingest_takeover_allowed
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import (
     BBox,
@@ -71,6 +71,7 @@ CHUNK = 1024 * 1024
 FORM_SLACK = 64 * 1024  # multipart boundaries, part headers and the two small range fields
 MANHWA_PDF = "manhwa sources must be images or CBZ"  # same message as the ingest flow
 START_FAILED = "could not start ingest; try again"
+INTERRUPTED = "ingest was interrupted"  # same message as the ingest flow
 MAX_CONCURRENT_UPLOADS = 2
 UPLOADS_BUSY = "too many uploads in progress, try again"
 SPOOL_FAILED = "the server could not store the upload; try again later"
@@ -182,6 +183,9 @@ class ReviewItemOut(BaseModel):
 
 def _out(row: ChapterRow) -> ChapterOut:
     has_source = row.source_kind in ("upload", "import")
+    status_, error = row.status, row.error
+    if status_ == "ingesting" and not _busy(row):  # the run died without a word (no heartbeat)
+        status_, error = "failed", INTERRUPTED
     return ChapterOut(
         id=row.id,
         project_id=row.project_id,
@@ -189,8 +193,8 @@ def _out(row: ChapterRow) -> ChapterOut:
         title=row.title,
         language=row.language,
         format=row.format,
-        status=row.status,
-        error=row.error,
+        status=status_,
+        error=error,
         source_kind=cast(Literal["upload", "import"], row.source_kind) if has_source else None,
         page_start=row.page_start if has_source else None,
         page_end=row.page_end if has_source else None,
@@ -224,14 +228,9 @@ def _require_rights(db: Session, user: User, project_id: str) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
 
-def _stale_before() -> datetime:
-    return utcnow() - timedelta(seconds=STALE_INGEST_S)
-
-
 def _busy(row: ChapterRow) -> bool:
-    """'ingesting' and owned by a run that is not stale (same rule as the ingest flow)."""
-    started = row.ingest_started_at
-    return row.status == "ingesting" and started is not None and aware(started) >= _stale_before()
+    """'ingesting' and owned by a live run (recent heartbeat; same rule as the ingest flow)."""
+    return ingest_alive(row, ingest_stale_before())
 
 
 def _prepare(db: Session, user: User, chapter_id: str) -> ChapterRow:
@@ -270,14 +269,7 @@ def _set_source_and_start(
         CursorResult[Any],
         db.execute(
             update(ChapterRow)
-            .where(
-                ChapterRow.id == row.id,
-                or_(
-                    ChapterRow.status != "ingesting",
-                    ChapterRow.ingest_started_at.is_(None),
-                    ChapterRow.ingest_started_at < _stale_before(),
-                ),
-            )
+            .where(ChapterRow.id == row.id, ingest_takeover_allowed(ingest_stale_before()))
             .values(
                 source_kind=kind,
                 source_ref=ref,
@@ -288,6 +280,7 @@ def _set_source_and_start(
                 error=None,
                 # Taking over a stale run: it no longer owns the chapter and writes nothing.
                 ingest_started_at=None,
+                ingest_heartbeat_at=None,
                 ingest_run_id=None,
             )
             .execution_options(synchronize_session=False)

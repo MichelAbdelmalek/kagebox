@@ -852,6 +852,40 @@ def test_stale_ingesting_chapter_accepts_a_new_source(env: Env) -> None:
         assert route.call_count == 2
 
 
+def test_staleness_is_judged_on_the_heartbeat(env: Env) -> None:
+    from datetime import timedelta
+
+    from pipeline.common.dbmodels import STALE_INGEST_S
+
+    pid = project(env)
+    cid = chapter(env, pid)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
+    body = {"name": "v.pdf", "page_start": 1, "page_end": 1}
+    now = datetime.now(UTC)
+    stale = timedelta(seconds=STALE_INGEST_S + 60)
+
+    def set_running(started: datetime, beat: datetime | None) -> None:
+        with env.session() as s:
+            row = s.get(ChapterRow, cid)
+            row.status, row.ingest_run_id, row.error = "ingesting", "old-run", None
+            row.ingest_started_at, row.ingest_heartbeat_at = started, beat
+            s.commit()
+
+    with respx.mock(assert_all_called=False) as mock:
+        route = ok_prefect(mock)
+        set_running(now - timedelta(hours=3), now)  # long but alive
+        assert env.c.post(f"/api/chapters/{cid}/import", json=body).status_code == 409
+        out = env.c.get(f"/api/chapters/{cid}").json()
+        assert (out["status"], out["error"]) == ("ingesting", None)
+        set_running(now, now - stale)  # worker died: no heartbeat for > STALE
+        out = env.c.get(f"/api/chapters/{cid}").json()
+        assert (out["status"], out["error"]) == ("failed", "ingest was interrupted")
+        assert env.c.post(f"/api/chapters/{cid}/import", json=body).status_code == 202
+        row = chapter_row(env, cid)
+        assert (row.status, row.ingest_run_id, row.ingest_heartbeat_at) == ("pending", None, None)
+        assert route.call_count == 1
+
+
 def _cursor(payload: Any) -> str:
     import base64
 

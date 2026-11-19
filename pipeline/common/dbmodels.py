@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    ColumnElement,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    or_,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -81,9 +93,11 @@ class AuditEvent(Base):
     detail: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
 
-# An 'ingesting' chapter whose run started longer ago than this may be taken over (by a new
-# flow run, or by the API accepting a new source). Shared by orchestration and the API.
-STALE_INGEST_S = 7200
+# An 'ingesting' chapter whose owning run has not sent a heartbeat for this long (or, before its
+# first heartbeat, started this long ago) is presumed dead: it may be taken over by a new flow run
+# or by the API accepting a new source, and the API reports it as interrupted. The run beats at
+# start and after every page. Shared by orchestration and the API.
+STALE_INGEST_S = 600
 
 
 class ChapterRow(Base):
@@ -108,6 +122,8 @@ class ChapterRow(Base):
     ingest_started_at: Mapped[datetime | None] = mapped_column(default=None)
     # The owning run (its Prefect flow-run id, or a fresh token for direct calls).
     ingest_run_id: Mapped[str | None] = mapped_column(String(80), default=None)
+    # Last sign of life of the owning run (at start and after every page); staleness uses it.
+    ingest_heartbeat_at: Mapped[datetime | None] = mapped_column(default=None)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
@@ -178,3 +194,19 @@ class JobRow(Base):
 def aware(dt: datetime) -> datetime:
     """SQLite drops tzinfo; treat naive datetimes from the DB as UTC."""
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def ingest_stale_before(now: datetime | None = None) -> datetime:
+    return (now or utcnow()) - timedelta(seconds=STALE_INGEST_S)
+
+
+def ingest_takeover_allowed(stale_before: datetime) -> ColumnElement[bool]:
+    """SQL: the chapter is not held by a live run (not 'ingesting', or no recent heartbeat)."""
+    last = func.coalesce(ChapterRow.ingest_heartbeat_at, ChapterRow.ingest_started_at)
+    return or_(ChapterRow.status != "ingesting", last.is_(None), last < stale_before)
+
+
+def ingest_alive(row: ChapterRow, stale_before: datetime) -> bool:
+    """Python twin of ``not ingest_takeover_allowed``: 'ingesting' with a recent sign of life."""
+    last = row.ingest_heartbeat_at or row.ingest_started_at
+    return row.status == "ingesting" and last is not None and aware(last) >= stale_before

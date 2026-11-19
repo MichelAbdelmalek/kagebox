@@ -2,11 +2,14 @@
 
 Status goes ``pending`` -> ``ingesting`` -> ``ready`` | ``failed``. Taking the chapter is one
 conditional UPDATE: it succeeds only if no other run holds it (``status <> 'ingesting'``) or
-that run started more than ``STALE_INGEST_S`` ago; otherwise ``IngestAlreadyRunning`` is raised
-and the chapter is not touched. ``chapters.ingest_run_id`` (the Prefect flow-run id, or a fresh
-token for a direct call) identifies the owning run: a run that was taken over writes nothing
-and leaves the status alone, and the cancellation / crash hook only fails the chapter when the
-interrupted flow run is its owner.
+that run's last heartbeat (``ingest_heartbeat_at``, else its start) is more than
+``STALE_INGEST_S`` old; otherwise ``IngestAlreadyRunning`` is raised and the chapter is not
+touched. The owning run beats at start, after loading models and after every page; a beat that
+finds the chapter no longer owned stops the run (``IngestAlreadyRunning``).
+``chapters.ingest_run_id`` (the Prefect flow-run id, or a fresh token for a direct call)
+identifies the owning run: a run that was taken over writes nothing and leaves the status alone,
+and the cancellation / crash hook only fails the chapter when the interrupted flow run is its
+owner.
 
 The rights gate runs first, and again inside the final transaction after the chapter row is
 locked, so a record revoked mid-run stores no rows.
@@ -51,7 +54,7 @@ import tempfile
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -61,13 +64,12 @@ from prefect import Flow, flow
 from prefect.client.schemas.objects import FlowRun, State
 from prefect.runtime import flow_run as prefect_flow_run
 from pydantic import BaseModel, ConfigDict, ValidationError
-from sqlalchemy import CursorResult, Engine, delete, or_, select, update
+from sqlalchemy import CursorResult, Engine, delete, select, update
 from sqlalchemy.orm import Session
 
 from orchestration.flows import StageResult, db_rights_loader
 from orchestration.models_fetch import load_models
 from pipeline.common.dbmodels import (
-    STALE_INGEST_S,
     BubbleRow,
     ChapterRow,
     PageRow,
@@ -75,6 +77,8 @@ from pipeline.common.dbmodels import (
     ProjectRow,
     ReviewItemRow,
     RightsRow,
+    ingest_stale_before,
+    ingest_takeover_allowed,
 )
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import RightsDenied, RightsRecord, require_render_allowed
@@ -291,21 +295,21 @@ def current_run_id() -> str:
 def _start(engine: Engine, chapter_id: str, run_id: str) -> _Chapter:
     """Take the chapter for this run with one conditional UPDATE, or refuse."""
     now = datetime.now(UTC)
-    stale = now - timedelta(seconds=STALE_INGEST_S)
     with Session(engine) as s, s.begin():
         res = cast(
             "CursorResult[Any]",
             s.execute(
                 update(ChapterRow)
                 .where(
-                    ChapterRow.id == chapter_id,
-                    or_(
-                        ChapterRow.status != "ingesting",
-                        ChapterRow.ingest_started_at.is_(None),
-                        ChapterRow.ingest_started_at < stale,
-                    ),
+                    ChapterRow.id == chapter_id, ingest_takeover_allowed(ingest_stale_before(now))
                 )
-                .values(status="ingesting", error=None, ingest_started_at=now, ingest_run_id=run_id)
+                .values(
+                    status="ingesting",
+                    error=None,
+                    ingest_started_at=now,
+                    ingest_heartbeat_at=now,
+                    ingest_run_id=run_id,
+                )
                 .execution_options(synchronize_session=False)
             ),
         )
@@ -329,6 +333,26 @@ def _start(engine: Engine, chapter_id: str, run_id: str) -> _Chapter:
             page_end=row.page_end,
             run_id=run_id,
         )
+
+
+def _beat(engine: Engine, ch: _Chapter) -> None:
+    """Heartbeat while this run owns the chapter; a run that lost it stops here."""
+    with Session(engine) as s, s.begin():
+        res = cast(
+            "CursorResult[Any]",
+            s.execute(
+                update(ChapterRow)
+                .where(
+                    ChapterRow.id == ch.id,
+                    ChapterRow.status == "ingesting",
+                    ChapterRow.ingest_run_id == ch.run_id,
+                )
+                .values(ingest_heartbeat_at=datetime.now(UTC))
+                .execution_options(synchronize_session=False)
+            ),
+        )
+        if res.rowcount != 1:
+            raise IngestAlreadyRunning(ALREADY_RUNNING)
 
 
 def _owns(row: ChapterRow, run_id: str) -> bool:
@@ -463,15 +487,18 @@ def _ingest(ch: _Chapter, deps: IngestDeps) -> IngestSummary:
             irregular_fill=irregular,
             now=datetime.now(UTC),
         )
+        _beat(deps.engine, ch)  # models loaded
         for number, img in iter_pages(path, kind, ch.page_start, ch.page_end, fit=fit):
             if not manhwa:
                 position = SourcePosition(number)
                 results.append(process_page(ctx, len(results) + 1, position, img))
+                _beat(deps.engine, ch)
                 continue
             for y0, y1 in slice_strip(np.asarray(img)):
                 piece = img.crop((0, y0, img.width, y1))
                 position = SourcePosition(number, y0, y1)
                 results.append(process_page(ctx, len(results) + 1, position, piece))
+                _beat(deps.engine, ch)
             log.info("page %d done (%d pages so far)", number, len(results))
     flagged = _commit(deps.engine, ch, results)
     return IngestSummary(
