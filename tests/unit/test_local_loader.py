@@ -85,4 +85,66 @@ def test_load_passes_safe_kwargs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     }
     seen.clear()
     local.load(Fake, "toy", weights=False)
-    assert seen == {"path": str(d), "local_files_only": True}
+    assert seen == {"path": str(d), "local_files_only": True, "trust_remote_code": False}
+
+
+RESERVED = [
+    "local_files_only",
+    "trust_remote_code",
+    "use_safetensors",
+    "dtype",
+    "torch_dtype",
+    "subfolder",
+    "state_dict",
+    "gguf_file",
+    "variant",
+    "revision",
+    "cache_dir",
+    "force_download",
+    "token",
+    "pretrained_model_name_or_path",
+]
+
+
+@pytest.mark.parametrize("key", RESERVED)
+@pytest.mark.parametrize("weights", [True, False])
+def test_reserved_extra_kwargs_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str, weights: bool
+) -> None:
+    d = install(tmp_path)
+    monkeypatch.setattr(local, "model_dir", lambda name: d)
+
+    class Fake:
+        @classmethod
+        def from_pretrained(cls, path: str, **kw: Any) -> str:
+            raise AssertionError("must not be reached")
+
+    with pytest.raises(ValueError):
+        local.load(Fake, "toy", weights=weights, **{key: True})
+
+
+def test_unpinned_file_refused(tmp_path: Path) -> None:
+    d = install(tmp_path)
+    (d / "tokenizer_config.json").write_text("{}")
+    with pytest.raises(UnsafeWeights):
+        local.model_dir("toy", tmp_path, raw=raw_cfg())
+    (d / "tokenizer_config.json").unlink()
+    (d / "sub").mkdir()
+    (d / "sub" / "x.json").write_text("{}")
+    with pytest.raises(UnsafeWeights):
+        local.model_dir("toy", tmp_path, raw=raw_cfg())
+
+
+def test_symlink_refused(tmp_path: Path) -> None:
+    d = install(tmp_path)
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    (d / "link").symlink_to(other)
+    with pytest.raises(UnsafeWeights):
+        local.model_dir("toy", tmp_path, raw=raw_cfg())
+    (d / "link").unlink()
+    (other / "config.json").write_bytes(b'{"a": 1}')
+    (d / "config.json").unlink()
+    (d / "config.json").symlink_to(other / "config.json")  # pinned name, but a symlink
+    with pytest.raises(UnsafeWeights):
+        local.model_dir("toy", tmp_path, raw=raw_cfg())
