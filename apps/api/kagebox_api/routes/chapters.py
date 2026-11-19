@@ -297,6 +297,13 @@ def _set_source_and_start(
         run_id = start_ingest(row.id, st.settings.prefect_api_url)
     except PrefectError:
         db.add(JobRow(id=job_id, chapter_id=row.id, flow_run_id=None, status="failed"))
+        # Never leave 'pending' as if a run were queued: say it failed, and why (user-safe).
+        db.execute(
+            update(ChapterRow)
+            .where(ChapterRow.id == row.id, ChapterRow.status == "pending")
+            .values(status="failed", error=START_FAILED)
+            .execution_options(synchronize_session=False)
+        )
         audit(db, user.id, "ingest.start_failed", row.id, job_id=job_id)
         db.commit()
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, START_FAILED) from None

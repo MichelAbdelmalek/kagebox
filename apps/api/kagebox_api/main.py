@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 from kagebox_api.db import Base, Database, make_engine
 from kagebox_api.deps import SAFE_METHODS, AppState
 from kagebox_api.limits import BodyLimit
-from kagebox_api.routes import auth, chapters, media, projects
+from kagebox_api.routes import auth, chapters, jobs, media, projects
 from pipeline.common.settings import Settings, get_settings
 from pipeline.common.storage import ObjectStore, make_store
 
@@ -80,6 +80,7 @@ def create_app(
     api.include_router(auth.router)
     api.include_router(projects.router)
     api.include_router(chapters.router)
+    api.include_router(jobs.router)
     api.include_router(media.router)
     app.include_router(api)
     return app

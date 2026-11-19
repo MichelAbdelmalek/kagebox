@@ -204,6 +204,7 @@ def test_every_new_route_requires_auth(env: Env) -> None:
         ("GET", f"/api/chapters/{cid}/pages"),
         ("GET", "/api/pages/page_x/panels"),
         ("GET", f"/api/projects/{pid}/review-items"),
+        ("GET", "/api/jobs/job_x"),
     ]
     for method, url in calls:
         assert env.c.request(method, url).status_code == 401, url
@@ -369,7 +370,7 @@ def test_start_ingest_called_once(env: Env) -> None:
     assert out["source_kind"] == "import" and "vol1.pdf" not in json.dumps(out)
 
 
-def test_prefect_failure_is_502_and_chapter_stays_pending(env: Env) -> None:
+def test_prefect_failure_is_502_and_chapter_fails(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
     (staged(env, pid) / "v.pdf").write_bytes(PDF)
@@ -390,7 +391,10 @@ def test_prefect_failure_is_502_and_chapter_stays_pending(env: Env) -> None:
         assert r.status_code == 502, r.text
         assert r.json()["detail"] == "could not start ingest; try again"
         assert "secret" not in r.text and "prefect" not in r.text.lower()
-        assert chapter_row(env, cid).status == "pending"
+        row = chapter_row(env, cid)  # never left 'pending' as if a run were queued
+        assert (row.status, row.error) == ("failed", "could not start ingest; try again")
+        out = env.c.get(f"/api/chapters/{cid}").json()
+        assert (out["status"], out["error"]) == ("failed", "could not start ingest; try again")
     with env.session() as s:
         jobs = s.scalars(select(JobRow).where(JobRow.chapter_id == cid)).all()
         assert {j.status for j in jobs} == {"failed"} and all(j.flow_run_id is None for j in jobs)
@@ -417,7 +421,7 @@ def test_prefect_deployment_lookup_failure_is_502(env: Env) -> None:
             r = env.c.post(f"/api/chapters/{cid}/import", json=body)
             assert create.call_count == 0
         assert r.status_code == 502, r.text
-        assert chapter_row(env, cid).status == "pending"
+        assert chapter_row(env, cid).status == "failed"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -884,6 +888,34 @@ def test_staleness_is_judged_on_the_heartbeat(env: Env) -> None:
         row = chapter_row(env, cid)
         assert (row.status, row.ingest_run_id, row.ingest_heartbeat_at) == ("pending", None, None)
         assert route.call_count == 1
+
+
+def test_job_status_readable_by_project_members_only(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
+    with respx.mock() as mock:
+        ok_prefect(mock)
+        r = env.c.post(
+            f"/api/chapters/{cid}/import", json={"name": "v.pdf", "page_start": 1, "page_end": 1}
+        )
+    job_id = r.json()["job_id"]
+    out = env.c.get(f"/api/jobs/{job_id}")
+    assert out.status_code == 200, out.text
+    body = out.json()
+    assert set(body) == {"id", "chapter_id", "status", "created_at", "updated_at"}
+    assert (body["id"], body["chapter_id"], body["status"]) == (job_id, cid, "submitted")
+    login(env.c, "vi")  # viewer of the project
+    assert env.c.get(f"/api/jobs/{job_id}").json()["status"] == "submitted"
+    with env.session() as s:  # the flow moves the job on
+        job = s.get(JobRow, job_id)
+        job.status = "completed"
+        s.commit()
+    assert env.c.get(f"/api/jobs/{job_id}").json()["status"] == "completed"
+    login(env.c, "eve")  # not a member: indistinguishable from a missing job
+    r = env.c.get(f"/api/jobs/{job_id}")
+    assert r.status_code == 404 and r.json()["detail"] == "job not found"
+    assert env.c.get("/api/jobs/job_nope").json()["detail"] == "job not found"
 
 
 def _cursor(payload: Any) -> str:

@@ -22,9 +22,16 @@ never a ``ready`` chapter with partial data. Objects stored by a refused or fail
 in the store (unreferenced; rows never reference a missing object).
 
 ``chapter.error`` holds only a user-safe message: the ``UploadRejected`` / ``RightsDenied``
-message, ``"ingest failed"``, or ``"ingest was interrupted"`` (cancellation, termination or a
-crash: a ``BaseException`` in the run, or Prefect's ``on_cancellation`` / ``on_crashed`` hooks).
-Details go to the log; validation errors are logged by field and type only, never with input.
+message, ``"ingest failed"``, ``"ingest was interrupted"`` (cancellation, termination or a
+crash: a ``BaseException`` in the run, or Prefect's ``on_cancellation`` / ``on_crashed`` hooks),
+or ``"ingest could not start"`` (the run ended before taking the chapter: cancelled while queued,
+``build_deps`` failed, crashed early; set by the hooks, including ``on_failure``, only while the
+chapter is still ``pending`` and its latest job is this run). Details go to the log; validation
+errors are logged by field and type only, never with input.
+
+Jobs: the API records a ``jobs`` row per started run (``flow_run_id``); the run moves it to
+``running`` once it takes the chapter, then ``completed`` / ``failed``, and the hooks set
+``cancelled`` / ``failed`` for runs that end otherwise. A finished job keeps its status.
 
 Sources: ``upload`` reads ``source_ref`` (a ``media`` object reference) from the object store
 into a private temp directory; ``import`` is a bare file name in the project's own directory of
@@ -72,6 +79,7 @@ from orchestration.models_fetch import load_models
 from pipeline.common.dbmodels import (
     BubbleRow,
     ChapterRow,
+    JobRow,
     PageRow,
     PanelRow,
     ProjectRow,
@@ -116,6 +124,8 @@ DIRECTIONS: dict[str, Direction] = {
 
 GENERIC_ERROR = "ingest failed"
 INTERRUPTED = "ingest was interrupted"
+NOT_STARTED = "ingest could not start"
+JOB_OPEN = ("submitted", "running")  # job statuses a run may still move on
 ALREADY_RUNNING = "ingest already running"
 IMPORT_MISSING = "the imported source file is not available"
 UPLOAD_MISSING = "the uploaded source file is not available"
@@ -511,53 +521,136 @@ def _ingest(ch: _Chapter, deps: IngestDeps) -> IngestSummary:
 
 def run_ingest(chapter_id: str, deps: IngestDeps, run_id: str | None = None) -> IngestSummary:
     ch = _start(deps.engine, chapter_id, run_id or current_run_id())  # refused: nothing touched
+    _safe_set_job(deps.engine, ch.run_id, "running")
     try:
         summary = _ingest(ch, deps)
     except IngestAlreadyRunning:
         log.warning("chapter %s was taken over by another run; nothing written", chapter_id)
+        _safe_set_job(deps.engine, ch.run_id, "failed")
         raise
     except (UploadRejected, RightsDenied) as exc:
         log.warning("chapter %s refused: %s", chapter_id, exc)
         _safe_fail(deps.engine, chapter_id, str(exc), ch.run_id)
+        _safe_set_job(deps.engine, ch.run_id, "failed")
         raise
     except ValidationError as exc:  # never log or re-raise it with its (untrusted) input
         errors = safe_errors(exc)
         log.error("chapter %s ingest failed: invalid artifact: %s", chapter_id, errors)
         _safe_fail(deps.engine, chapter_id, GENERIC_ERROR, ch.run_id)
+        _safe_set_job(deps.engine, ch.run_id, "failed")
         raise RuntimeError(f"invalid artifact: {errors}") from None
     except Exception:
         log.exception("chapter %s ingest failed", chapter_id)
         _safe_fail(deps.engine, chapter_id, GENERIC_ERROR, ch.run_id)
+        _safe_set_job(deps.engine, ch.run_id, "failed")
         raise
     except BaseException:  # cancellation, termination signal, KeyboardInterrupt
+        # The job's final status (cancelled / failed) is left to the Prefect hooks.
         log.warning("chapter %s ingest interrupted", chapter_id)
         _safe_fail(deps.engine, chapter_id, INTERRUPTED, ch.run_id)
         raise
+    _safe_set_job(deps.engine, ch.run_id, "completed")
     log.info("chapter %s ready: %s", chapter_id, summary)
     return summary
 
 
-def on_interrupted(flow: Flow[Any, Any], flow_run: FlowRun, state: State[Any] | None) -> None:
-    """Prefect on_cancellation / on_crashed hook: an 'ingesting' chapter becomes failed."""
-    chapter_id = flow_run.parameters.get("chapter_id")
-    if not isinstance(chapter_id, str):
-        return
+# ---------------------------------------------------------------------------------------------
+# jobs and Prefect state hooks
+
+
+def build_engine() -> Engine:
+    """Database only, for the state hooks (tests monkeypatch this). Unlike ``build_deps`` it
+    needs no object-store credentials, so a run whose ``build_deps`` failed is still recorded."""
+    from pipeline.common.database import make_engine  # deferred: needs settings at run time
+    from pipeline.common.settings import get_settings
+
+    return make_engine(get_settings())
+
+
+def _set_job(engine: Engine, run_id: str, status: str) -> None:
+    """Move the API's job for this flow run on; a finished job keeps its final status."""
+    with Session(engine) as s, s.begin():
+        s.execute(
+            update(JobRow)
+            .where(JobRow.flow_run_id == run_id, JobRow.status.in_(JOB_OPEN))
+            .values(status=status, updated_at=datetime.now(UTC))
+            .execution_options(synchronize_session=False)
+        )
+
+
+def _safe_set_job(engine: Engine, run_id: str, status: str) -> None:
     try:
-        engine = build_deps().engine
-        try:
-            _fail(engine, chapter_id, INTERRUPTED, str(flow_run.id))  # only if this run owns it
-        finally:
-            engine.dispose()
+        _set_job(engine, run_id, status)
     except Exception:
-        log.exception("could not mark chapter %s failed after interruption", chapter_id)
+        log.exception("could not mark the job of run %s %s", run_id, status)
+
+
+def _fail_unstarted(engine: Engine, chapter_id: str, run_id: str) -> None:
+    """A run that ended before taking the chapter fails it, if the chapter still waits for
+    exactly this run ('pending', and its latest job is this run): never 'pending' forever."""
+    with Session(engine) as s, s.begin():
+        row = s.get(ChapterRow, chapter_id, with_for_update=True)
+        if row is None or row.status != "pending":
+            return
+        latest = s.scalar(
+            select(JobRow.flow_run_id)
+            .where(JobRow.chapter_id == chapter_id)
+            .order_by(JobRow.created_at.desc(), JobRow.id.desc())
+            .limit(1)
+        )
+        if latest == run_id:
+            row.status, row.error = "failed", NOT_STARTED
+
+
+def _after_run(flow_run: FlowRun, job_status: str, message: str) -> None:
+    """Record how a run ended: its job, and its chapter if the run left it unfinished."""
+    chapter_id = flow_run.parameters.get("chapter_id")
+    run_id = str(flow_run.id)
+    try:
+        engine = build_engine()
+    except Exception:
+        log.exception("could not record the end of run %s", run_id)
+        return
+    steps: list[tuple[str, Callable[[], None]]] = [
+        ("job", lambda: _set_job(engine, run_id, job_status)),
+    ]
+    if isinstance(chapter_id, str):
+        steps += [
+            ("owned chapter", lambda: _fail(engine, chapter_id, message, run_id)),
+            ("pending chapter", lambda: _fail_unstarted(engine, chapter_id, run_id)),
+        ]
+    try:
+        for what, step in steps:
+            try:
+                step()
+            except Exception:
+                log.exception("could not update the %s after run %s ended", what, run_id)
+    finally:
+        engine.dispose()
+
+
+def on_cancelled(flow: Flow[Any, Any], flow_run: FlowRun, state: State[Any] | None) -> None:
+    """Cancelled (also while still queued for the concurrency slot)."""
+    _after_run(flow_run, "cancelled", INTERRUPTED)
+
+
+def on_crashed(flow: Flow[Any, Any], flow_run: FlowRun, state: State[Any] | None) -> None:
+    _after_run(flow_run, "failed", INTERRUPTED)
+
+
+def on_failed(flow: Flow[Any, Any], flow_run: FlowRun, state: State[Any] | None) -> None:
+    """Any failure, including one before the chapter was taken (``build_deps`` raising).
+    ``run_ingest`` has usually recorded the precise message already; this only fills gaps."""
+    _after_run(flow_run, "failed", GENERIC_ERROR)
 
 
 @flow(
     name=FLOW_NAME,
     log_prints=False,
     validate_parameters=True,
-    on_cancellation=[on_interrupted],
-    on_crashed=[on_interrupted],
+    on_cancellation=[on_cancelled],
+    on_crashed=[on_crashed],
+    on_failure=[on_failed],
 )
 def ingest_flow(chapter_id: str) -> IngestSummary:
     """Deployment entry point. Parameters must stay JSON-serializable."""

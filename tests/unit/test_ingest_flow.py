@@ -32,6 +32,7 @@ from pipeline.common.dbmodels import (
     Base,
     BubbleRow,
     ChapterRow,
+    JobRow,
     PageRow,
     PanelRow,
     ProjectRow,
@@ -194,6 +195,7 @@ def make_env(
         ocr_factory=ocr_factory,
     )
     monkeypatch.setattr(ingest_mod, "build_deps", lambda: deps)
+    monkeypatch.setattr(ingest_mod, "build_engine", lambda: engine)
     return env
 
 
@@ -704,8 +706,9 @@ def test_interrupted_run_marks_failed(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def test_flow_hooks_registered() -> None:
-    assert ingest_mod.on_interrupted in ingest_flow.on_crashed_hooks
-    assert ingest_mod.on_interrupted in ingest_flow.on_cancellation_hooks
+    assert ingest_mod.on_crashed in ingest_flow.on_crashed_hooks
+    assert ingest_mod.on_cancelled in ingest_flow.on_cancellation_hooks
+    assert ingest_mod.on_failed in ingest_flow.on_failure_hooks
 
 
 def test_hook_for_other_run_leaves_owner_alone(
@@ -718,7 +721,7 @@ def test_hook_for_other_run_leaves_owner_alone(
 
     def b_interrupted(call: int) -> None:
         if call == 1:
-            ingest_mod.on_interrupted(ingest_flow, other, None)  # type: ignore[arg-type]
+            ingest_mod.on_cancelled(ingest_flow, other, None)  # type: ignore[arg-type]
             assert chapter(env, cid).status == "ingesting"
 
     env.ocr.on_call = b_interrupted
@@ -735,7 +738,7 @@ def test_hook_for_owning_run_marks_failed(tmp_path: Path, monkeypatch: pytest.Mo
 
     def a_crashed(call: int) -> None:
         if call == 1:
-            ingest_mod.on_interrupted(ingest_flow, own, None)  # type: ignore[arg-type]
+            ingest_mod.on_crashed(ingest_flow, own, None)  # type: ignore[arg-type]
 
     env.ocr.on_call = a_crashed
     with pytest.raises(ingest_mod.IngestAlreadyRunning):  # A no longer owns it: writes nothing
@@ -744,8 +747,88 @@ def test_hook_for_owning_run_marks_failed(tmp_path: Path, monkeypatch: pytest.Mo
     assert (row.status, row.error) == ("failed", "ingest was interrupted")
     assert count(env, PageRow, cid) == 0
     # a chapter that is no longer ingesting keeps its message
-    ingest_mod.on_interrupted(ingest_flow, own, None)  # type: ignore[arg-type]
+    ingest_mod.on_crashed(ingest_flow, own, None)  # type: ignore[arg-type]
     assert chapter(env, cid).error == "ingest was interrupted"
+
+
+def add_job(env: Env, chapter_id: str, run_id: str | None, status: str = "submitted") -> str:
+    job_id = new_id("job")
+    with Session(env.engine) as s, s.begin():
+        s.add(JobRow(id=job_id, chapter_id=chapter_id, flow_run_id=run_id, status=status))
+    return job_id
+
+
+def job_status(env: Env, job_id: str) -> str:
+    with Session(env.engine) as s:
+        job = s.get(JobRow, job_id)
+        assert job is not None
+        return job.status
+
+
+def test_job_follows_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    job = add_job(env, cid, "run-a")
+    seen: list[str] = []
+    env.ocr.on_call = lambda call: seen.append(job_status(env, job))
+    ingest_mod.run_ingest(cid, ingest_mod.build_deps(), run_id="run-a")
+    assert seen[0] == "running" and job_status(env, job) == "completed"
+
+    failing = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    job2 = add_job(env, failing, "run-b")
+    env.ocr.on_call, env.ocr.fail_on_call, env.ocr.calls = None, 1, 0
+    with pytest.raises(RuntimeError):
+        ingest_mod.run_ingest(failing, ingest_mod.build_deps(), run_id="run-b")
+    assert job_status(env, job2) == "failed"
+
+
+def test_build_deps_failure_fails_the_pending_chapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The run fails before it takes the chapter: no 'pending' chapter left forever."""
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    jobs: list[str] = []
+
+    def broken_deps() -> IngestDeps:
+        jobs.append(add_job(env, cid, str(prefect_flow_run.id)))  # as the API records it
+        raise RuntimeError("object store credentials missing")
+
+    monkeypatch.setattr(ingest_mod, "build_deps", broken_deps)
+    with pytest.raises(RuntimeError, match="credentials"):
+        ingest_flow(cid)
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "ingest could not start")
+    assert job_status(env, jobs[0]) == "failed"
+
+
+def test_cancelled_while_queued_fails_the_pending_chapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    old = add_job(env, cid, "run-old", status="failed")
+    queued = add_job(env, cid, "run-q")
+    run = SimpleNamespace(id="run-q", parameters={"chapter_id": cid})
+    ingest_mod.on_cancelled(ingest_flow, run, None)  # type: ignore[arg-type]
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "ingest could not start")
+    assert (job_status(env, queued), job_status(env, old)) == ("cancelled", "failed")
+
+
+def test_hook_of_a_superseded_run_leaves_the_pending_chapter_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newer source (newer job) was submitted: the old run's crash is not its business."""
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    old = add_job(env, cid, "run-old")
+    add_job(env, cid, "run-new")
+    run = SimpleNamespace(id="run-old", parameters={"chapter_id": cid})
+    ingest_mod.on_crashed(ingest_flow, run, None)  # type: ignore[arg-type]
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("pending", None)
+    assert job_status(env, old) == "failed"
 
 
 def test_flow_run_id_is_the_owner_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
