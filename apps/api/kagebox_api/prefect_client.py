@@ -18,20 +18,36 @@ class PrefectError(RuntimeError):
 
 
 def start_ingest(chapter_id: str, api_url: str, *, timeout: httpx.Timeout = TIMEOUT) -> str:
-    """Create a run of the chapter-ingest deployment; returns the Prefect flow-run id."""
-    url = f"{api_url.rstrip('/')}/deployments/name/{INGEST_DEPLOYMENT}/create_flow_run"
+    """Create a run of the chapter-ingest deployment; returns the Prefect flow-run id.
+
+    Prefect creates runs by deployment id only (``POST /deployments/{id}/create_flow_run``), so
+    the deployment is looked up by name first (``GET /deployments/name/{flow}/{deployment}``).
+    """
+    base = api_url.rstrip("/")
     try:
         with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-            resp = client.post(url, json={"parameters": {"chapter_id": chapter_id}})
+            found = client.get(f"{base}/deployments/name/{INGEST_DEPLOYMENT}")
+            if found.status_code != 200:
+                log.warning("prefect deployment lookup returned HTTP %d", found.status_code)
+                raise PrefectError("prefect deployment not found")
+            deployment_id = _uuid(found, "deployment lookup")
+            resp = client.post(
+                f"{base}/deployments/{deployment_id}/create_flow_run",
+                json={"parameters": {"chapter_id": chapter_id}},
+            )
     except httpx.HTTPError as exc:
         log.warning("prefect create_flow_run failed: %s", type(exc).__name__)
         raise PrefectError("prefect unreachable") from exc
     if resp.status_code not in (200, 201):
         log.warning("prefect create_flow_run returned HTTP %d", resp.status_code)
         raise PrefectError("prefect refused the run")
+    return _uuid(resp, "create_flow_run")
+
+
+def _uuid(resp: httpx.Response, what: str) -> str:
+    """The ``id`` of a Prefect response as a canonical UUID (never trusted as a path part)."""
     try:
-        run_id = str(uuid.UUID(str(resp.json()["id"])))
+        return str(uuid.UUID(str(resp.json()["id"])))
     except (ValueError, KeyError, TypeError) as exc:
-        log.warning("prefect create_flow_run returned an unexpected body")
+        log.warning("prefect %s returned an unexpected body", what)
         raise PrefectError("unexpected prefect response") from exc
-    return run_id

@@ -41,7 +41,10 @@ from pipeline.common.storage import MemoryObjectStore, make_ref_from_digest
 ORIGIN = "https://testserver"
 PW = "correct horse battery"
 PREFECT = "http://prefect.test/api"
-CREATE_RUN = f"{PREFECT}/deployments/name/chapter-ingest/chapter-ingest/create_flow_run"
+DEPLOYMENT_ID = "2d4d8ff5-9de9-42cc-ac2d-8e3077cfd240"
+# Prefect has no name-based create route: look the deployment up by name, then create by id.
+LOOKUP = f"{PREFECT}/deployments/name/chapter-ingest/chapter-ingest"
+CREATE_RUN = f"{PREFECT}/deployments/{DEPLOYMENT_ID}/create_flow_run"
 RUN_ID = "0b6f4a8e-5c1d-4f3a-9d1e-2a7b8c9d0e1f"
 PDF = b"%PDF-1.7\n" + b"0" * 2048 + b"\n%%EOF\n"
 
@@ -138,7 +141,14 @@ def chapter_row(e: Env, cid: str) -> ChapterRow:
         return row  # type: ignore[no-any-return]
 
 
+def ok_lookup(mock: respx.MockRouter) -> respx.Route:
+    return mock.get(LOOKUP).mock(
+        return_value=httpx.Response(200, json={"id": DEPLOYMENT_ID, "name": "chapter-ingest"})
+    )
+
+
 def ok_prefect(mock: respx.MockRouter) -> respx.Route:
+    ok_lookup(mock)
     return mock.post(CREATE_RUN).mock(
         return_value=httpx.Response(201, json={"id": RUN_ID, "name": "x"})
     )
@@ -326,6 +336,7 @@ def test_prefect_failure_is_502_and_chapter_stays_pending(env: Env) -> None:
     ]
     for resp in responses:
         with respx.mock() as mock:
+            ok_lookup(mock)
             if isinstance(resp, Exception):
                 mock.post(CREATE_RUN).mock(side_effect=resp)
             else:
@@ -338,6 +349,30 @@ def test_prefect_failure_is_502_and_chapter_stays_pending(env: Env) -> None:
     with env.session() as s:
         jobs = s.scalars(select(JobRow).where(JobRow.chapter_id == cid)).all()
         assert {j.status for j in jobs} == {"failed"} and all(j.flow_run_id is None for j in jobs)
+
+
+def test_prefect_deployment_lookup_failure_is_502(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    (env.imports / "v.pdf").write_bytes(PDF)
+    body = {"name": "v.pdf", "page_start": 1, "page_end": 2}
+    for resp in (
+        httpx.Response(404, json={"detail": "Deployment not found"}),
+        httpx.Response(200, json={"id": "../../flow_runs"}),
+        httpx.ConnectError("refused"),
+    ):
+        with respx.mock(assert_all_called=False) as mock:
+            if isinstance(resp, Exception):
+                mock.get(LOOKUP).mock(side_effect=resp)
+            else:
+                mock.get(LOOKUP).mock(return_value=resp)
+            create = mock.post(url__regex=r".*/create_flow_run$").mock(
+                return_value=httpx.Response(201, json={"id": RUN_ID})
+            )
+            r = env.c.post(f"/api/chapters/{cid}/import", json=body)
+            assert create.call_count == 0
+        assert r.status_code == 502, r.text
+        assert chapter_row(env, cid).status == "pending"
 
 
 # ---------------------------------------------------------------------------------------------
