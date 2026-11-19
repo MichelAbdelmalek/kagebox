@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     media_url_ttl_seconds: int = 300
     session_ttl_hours: int = 12
     max_upload_bytes: int = 200 * 1024 * 1024
+    imports_dir: str = "/imports"  # read-only mount of server-side sources (bare file names)
     cookie_secure: bool = True
 
     @model_validator(mode="after")

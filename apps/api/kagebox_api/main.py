@@ -11,7 +11,7 @@ from kagebox_api.db import Base, Database, make_engine
 from kagebox_api.deps import SAFE_METHODS, AppState
 from kagebox_api.routes import auth, media, projects
 from pipeline.common.settings import Settings, get_settings
-from pipeline.common.storage import MemoryObjectStore, ObjectStore, S3ObjectStore
+from pipeline.common.storage import ObjectStore, make_store
 
 # (method, path) pairs reachable without a session. A test asserts nothing else is.
 PUBLIC_ROUTES = frozenset({("GET", "/api/health"), ("POST", "/api/auth/login")})
@@ -24,15 +24,6 @@ SECURITY_HEADERS = {
     "Cross-Origin-Resource-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
-
-
-def _store(settings: Settings) -> ObjectStore:
-    if settings.profile == "test":
-        return MemoryObjectStore()
-    ak, sk = settings.secret("s3_access_key"), settings.secret("s3_secret_key")
-    if ak is None or sk is None:
-        raise RuntimeError("object store credentials are not configured")
-    return S3ObjectStore(settings.s3_endpoint, ak.get_secret_value(), sk.get_secret_value())
 
 
 def create_app(
@@ -55,7 +46,7 @@ def create_app(
         openapi_url="/api/openapi.json",
     )
     app.state.kagebox = AppState(
-        settings, db, store or _store(settings), key.get_secret_value().encode()
+        settings, db, store or make_store(settings), key.get_secret_value().encode()
     )
 
     @app.middleware("http")

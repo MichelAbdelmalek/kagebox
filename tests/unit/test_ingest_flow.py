@@ -1,0 +1,561 @@
+"""The chapter-ingest flow: SQLite, in-memory object store, fake detector and OCR (no models)."""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import zipfile
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pytest
+from PIL import Image, ImageDraw
+from prefect import flow
+from prefect.testing.utilities import prefect_test_harness
+from sqlalchemy import Engine, func, select
+from sqlalchemy.orm import Session
+
+import orchestration.ingest_flow as ingest_mod
+from orchestration.flows import run_chapter
+from orchestration.ingest_flow import IngestDeps, IngestSummary, ingest_flow
+from pipeline.common.database import make_engine
+from pipeline.common.dbmodels import (
+    Base,
+    BubbleRow,
+    ChapterRow,
+    PageRow,
+    PanelRow,
+    ProjectRow,
+    ReviewItemRow,
+    RightsRow,
+    User,
+)
+from pipeline.common.ids import new_id
+from pipeline.common.schemas import BBox, Bubble, Page, Panel, RightsDenied, RightsRecord
+from pipeline.common.settings import Settings
+from pipeline.common.storage import MemoryObjectStore
+from pipeline.common.uploads import UploadRejected
+from pipeline.ingest.bubbles import Region
+from pipeline.ingest.panels import slice_strip
+
+EVIDENCE = "evidence/sha256/" + "a" * 64 + ".pdf"
+W, H = 600, 800
+# Two framed panels stacked vertically; the gutter between them is y 380..420.
+PANEL_BOXES = [(20, 20, 580, 380), (20, 420, 580, 780)]
+IN_TOP = Region(
+    BBox(x=100, y=100, w=80, h=60), "speech", 0.9, "bubble", BBox(x=110, y=110, w=60, h=40)
+)
+IN_BOTTOM = Region(BBox(x=300, y=500, w=90, h=50), "caption", 0.8, "text_free", None)
+IN_TOP_RIGHT = Region(BBox(x=400, y=100, w=60, h=40), "speech", 0.9, "bubble", None)
+IN_GUTTER = Region(BBox(x=200, y=388, w=50, h=20), "speech", 0.7, "bubble", None)
+
+
+# ---------------------------------------------------------------------------------------------
+# fixtures and fakes
+
+
+def page_png(
+    boxes: list[tuple[int, int, int, int]] = PANEL_BOXES, size: tuple[int, int] = (W, H)
+) -> bytes:
+    img = Image.new("RGB", size, "white")
+    draw = ImageDraw.Draw(img)
+    for box in boxes:
+        draw.rectangle(box, outline="black", width=4)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def make_cbz(pages: list[bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for n, data in enumerate(pages, 1):
+            zf.writestr(f"{n:03d}.png", data)
+    return buf.getvalue()
+
+
+class FakeDetector:
+    def __init__(self, regions: list[Region]) -> None:
+        self.regions = regions
+
+    def detect(self, img: Image.Image, threshold: float = 0.5) -> list[Region]:
+        return [r for r in self.regions if r.score >= threshold]
+
+
+@dataclass
+class FakeOcr:
+    engine: str = "manga-ocr"
+    results: list[tuple[str, float]] = field(default_factory=list)  # consumed in order
+    default: tuple[str, float] = ("テスト", 0.97)
+    fail_on_call: int | None = None
+    calls: int = 0
+
+    def read(self, crop: Image.Image) -> tuple[str, float]:
+        self.calls += 1
+        if self.fail_on_call is not None and self.calls == self.fail_on_call:
+            raise RuntimeError("model exploded: /secret/path details")
+        return self.results.pop(0) if self.results else self.default
+
+
+@dataclass
+class Env:
+    engine: Engine
+    store: MemoryObjectStore
+    imports: Path
+    project_id: str
+    detector: FakeDetector
+    ocr: FakeOcr
+    ocr_languages: list[str] = field(default_factory=list)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def harness() -> Iterator[None]:
+    with prefect_test_harness(server_startup_timeout=120):
+        yield
+
+
+def rights(project_id: str, **over: Any) -> RightsRecord:
+    base: dict[str, Any] = {
+        "id": new_id("rights"),
+        "project_id": project_id,
+        "basis": "public_domain",
+        "justification": "PD",
+        "created_by": "user_a",
+        "status": "approved",
+        "evidence_doc_ref": EVIDENCE,
+        "approved_by": "user_b",
+        "approved_at": datetime.now(UTC),
+    }
+    base.update(over)
+    return RightsRecord(**base)
+
+
+def make_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fmt: str = "manga_rtl", **rec: Any
+) -> Env:
+    engine = make_engine(Settings(database_url=f"sqlite:///{tmp_path}/t.db"))
+    Base.metadata.create_all(engine)
+    imports = tmp_path / "imports"
+    imports.mkdir()
+    user_id, project_id = new_id("user"), new_id("proj")
+    record = rights(project_id, **rec)
+    with Session(engine) as s, s.begin():
+        s.add(User(id=user_id, email="a@b.c", password_hash="x"))
+        s.flush()
+        s.add(ProjectRow(id=project_id, title="T", format=fmt, created_by=user_id))
+        s.flush()
+        s.add(
+            RightsRow(
+                id=record.id,
+                project_id=project_id,
+                status=record.status,
+                record=record.model_dump(mode="json"),
+            )
+        )
+    env = Env(
+        engine=engine,
+        store=MemoryObjectStore(),
+        imports=imports,
+        project_id=project_id,
+        detector=FakeDetector([IN_TOP, IN_TOP_RIGHT, IN_BOTTOM, IN_GUTTER]),
+        ocr=FakeOcr(),
+    )
+
+    def ocr_factory(language: str) -> FakeOcr:
+        env.ocr_languages.append(language)
+        return env.ocr
+
+    deps = IngestDeps(
+        engine=engine,
+        store=env.store,
+        imports_dir=imports,
+        detector_factory=lambda: env.detector,
+        ocr_factory=ocr_factory,
+    )
+    monkeypatch.setattr(ingest_mod, "build_deps", lambda: deps)
+    return env
+
+
+def add_chapter(
+    env: Env,
+    data: bytes,
+    *,
+    name: str = "ch.cbz",
+    kind: str = "import",
+    page_start: int = 1,
+    page_end: int = 2,
+    fmt: str = "manga_rtl",
+    sha: str | None = None,
+) -> str:
+    if kind == "import":
+        (env.imports / name).write_bytes(data)
+        ref = name
+    else:
+        ref = env.store.put("media", data, "cbz", "application/zip")
+    chapter_id = new_id("chap")
+    with Session(env.engine) as s, s.begin():
+        s.add(
+            ChapterRow(
+                id=chapter_id,
+                project_id=env.project_id,
+                number=1,
+                language="ja",
+                format=fmt,
+                source_kind=kind,
+                source_ref=ref,
+                source_sha256=sha or hashlib.sha256(data).hexdigest(),
+                page_start=page_start,
+                page_end=page_end,
+                status="pending",
+            )
+        )
+    return chapter_id
+
+
+def chapter(env: Env, chapter_id: str) -> ChapterRow:
+    with Session(env.engine) as s:
+        row = s.get(ChapterRow, chapter_id)
+        assert row is not None
+        return row
+
+
+def count(env: Env, model: Any, chapter_id: str) -> int:
+    with Session(env.engine) as s:
+        return int(
+            s.scalar(select(func.count()).select_from(model).where(model.chapter_id == chapter_id))
+            or 0
+        )
+
+
+def reviews(env: Env, chapter_id: str) -> list[ReviewItemRow]:
+    with Session(env.engine) as s:
+        return list(s.scalars(select(ReviewItemRow).where(ReviewItemRow.chapter_id == chapter_id)))
+
+
+def kinds(env: Env, chapter_id: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in reviews(env, chapter_id):
+        out[r.kind] = out.get(r.kind, 0) + 1
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# the six brief tests
+
+
+def test_ingest_creates_pages_panels_bubbles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    src = make_cbz([page_png(), page_png()])
+    cid = add_chapter(env, src)
+
+    summary = ingest_flow(cid)
+
+    assert summary == IngestSummary(pages=2, panels=4, bubbles=6, flagged=2)
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("ready", None)
+    assert env.ocr_languages == ["ja"]  # one OCR instance per run, for the chapter's language
+    src_hash = hashlib.sha256(src).hexdigest()
+    with Session(env.engine) as s:
+        pages = list(
+            s.scalars(select(PageRow).where(PageRow.chapter_id == cid).order_by(PageRow.index))
+        )
+        assert [p.index for p in pages] == [1, 2]
+        for prow in pages:
+            page = Page.model_validate_json(json.dumps(prow.artifact))
+            assert (page.width, page.height, page.chapter_id) == (W, H, cid)
+            assert page.provenance.stage == "ingest"
+            assert page.provenance.tool == "kagebox-ingest"
+            assert page.provenance.input_hashes == [src_hash]
+            img = Image.open(io.BytesIO(env.store.get(page.image_ref)))
+            assert img.size == (W, H)
+
+            panels = list(
+                s.scalars(
+                    select(PanelRow)
+                    .where(PanelRow.page_id == prow.id)
+                    .order_by(PanelRow.reading_order)
+                )
+            )
+            assert [p.reading_order for p in panels] == [1, 2]
+            parsed = [Panel.model_validate_json(json.dumps(p.artifact)) for p in panels]
+            assert parsed[0].bbox.y < parsed[1].bbox.y  # top panel first
+            assert parsed[0].provenance.input_hashes[0] == src_hash
+            assert len(parsed[0].provenance.input_hashes) == 2  # source + page image
+            crop = Image.open(io.BytesIO(env.store.get(parsed[0].crop_ref)))
+            assert crop.size == (parsed[0].bbox.w, parsed[0].bbox.h)
+
+            top = list(
+                s.scalars(
+                    select(BubbleRow)
+                    .where(BubbleRow.panel_id == panels[0].id)
+                    .order_by(BubbleRow.id)
+                )
+            )
+            bubbles = [Bubble.model_validate_json(json.dumps(b.artifact)) for b in top]
+            # manga reads right to left: the right-hand balloon first; id order = reading order
+            assert [b.bbox for b in bubbles] == [IN_TOP_RIGHT.bbox, IN_TOP.bbox]
+            b = bubbles[1]
+            assert (b.kind, b.text, b.lang, b.ocr_engine, b.speaker.value) == (
+                "speech",
+                "テスト",
+                "ja",
+                "manga-ocr",
+                None,
+            )
+            assert b.provenance.tool == "manga-ocr"
+            assert b.provenance.model_revision == "aa6573bd10b0d446cbf622e29c3e084914df9741"
+            assert b.provenance.license == "CC-BY-SA-4.0"
+            assert not top[1].needs_review
+            bottom = s.scalars(select(BubbleRow).where(BubbleRow.panel_id == panels[1].id)).one()
+            assert bottom.artifact["kind"] == "caption"
+    # the gutter region becomes a review item on its page, never a bubble (ruling R1)
+    items = reviews(env, cid)
+    assert {r.kind for r in items} == {"region_outside_panels"}
+    assert {r.artifact_id for r in items} == {p.id for p in pages}
+    assert all("x=200" in r.reason and r.status == "open" for r in items)
+
+
+def test_rights_not_approved_refuses_and_marks_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch, status="pending", approved_by=None, approved_at=None)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+
+    with pytest.raises(RightsDenied):
+        ingest_flow(cid)
+
+    row = chapter(env, cid)
+    assert row.status == "failed"
+    assert row.error == "rights record is pending, not approved"
+    assert env.ocr.calls == 0
+    assert count(env, PageRow, cid) == 0
+
+
+def test_low_confidence_creates_review_item(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    env.detector.regions = [IN_TOP]
+    env.ocr.results = [("かすれ", 0.42)]
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+
+    summary = ingest_flow(cid)
+
+    assert summary.flagged == 1
+    [item] = reviews(env, cid)
+    with Session(env.engine) as s:
+        bubble = s.scalars(select(BubbleRow).where(BubbleRow.chapter_id == cid)).one()
+    assert (item.kind, item.artifact_id, item.project_id) == (
+        "ocr_low_confidence",
+        bubble.id,
+        env.project_id,
+    )
+    assert "0.42" in item.reason
+    assert bubble.needs_review is True
+    assert "needs_review" not in bubble.artifact
+
+
+def test_rerun_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+
+    first = ingest_flow(cid)
+    with Session(env.engine) as s:
+        old_pages = set(s.scalars(select(PageRow.id).where(PageRow.chapter_id == cid)))
+    second = ingest_flow(cid)
+
+    assert first == second
+    assert count(env, PageRow, cid) == 2
+    assert count(env, PanelRow, cid) == 4
+    assert count(env, BubbleRow, cid) == 6
+    assert len(reviews(env, cid)) == 2
+    with Session(env.engine) as s:
+        assert not old_pages & set(s.scalars(select(PageRow.id).where(PageRow.chapter_id == cid)))
+    assert chapter(env, cid).status == "ready"
+
+
+def test_failure_leaves_no_partial_ready_chapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+    env.ocr.fail_on_call = 4  # page 2's first bubble: page 1 was fully processed
+
+    with pytest.raises(RuntimeError):
+        ingest_flow(cid)
+
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "ingest failed")  # no details, no traceback
+    for model in (PageRow, PanelRow, BubbleRow):
+        assert count(env, model, cid) == 0
+    assert reviews(env, cid) == []
+
+    # a good run, then a failing re-run: the old complete set survives, status is failed
+    env.ocr.fail_on_call, env.ocr.calls = None, 0
+    ingest_flow(cid)
+    env.ocr.fail_on_call, env.ocr.calls = 2, 0
+    with pytest.raises(RuntimeError):
+        ingest_flow(cid)
+    assert chapter(env, cid).status == "failed"
+    assert (count(env, PageRow, cid), count(env, BubbleRow, cid)) == (2, 6)
+
+
+def test_manhwa_strip_sliced_into_pages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch, fmt="manhwa_vertical")
+    env.detector.regions = []
+    tall = (400, 7000)
+    boxes = [(10, y, 390, y + 1500) for y in (50, 1800, 3550, 5300)]
+    strip = page_png(boxes, size=tall)
+    cid = add_chapter(env, make_cbz([strip]), page_end=1, fmt="manhwa_vertical")
+
+    summary = ingest_flow(cid)
+
+    expected = slice_strip(np.asarray(Image.open(io.BytesIO(strip)).convert("RGB")))
+    assert len(expected) >= 3
+    assert summary.pages == len(expected)
+    with Session(env.engine) as s:
+        pages = [
+            Page.model_validate_json(json.dumps(p.artifact))
+            for p in s.scalars(
+                select(PageRow).where(PageRow.chapter_id == cid).order_by(PageRow.index)
+            )
+        ]
+    assert [p.index for p in pages] == list(range(1, len(expected) + 1))
+    assert [p.height for p in pages] == [y1 - y0 for y0, y1 in expected]
+    assert all(p.width == 400 for p in pages)
+    assert chapter(env, cid).status == "ready"
+
+    # a manhwa PDF is refused before anything is rendered (ruling T2)
+    pdf = add_chapter(
+        env, b"%PDF-1.7\n" + b"0" * 64, name="strip.pdf", page_end=1, fmt="manhwa_vertical"
+    )
+    with pytest.raises(UploadRejected):
+        ingest_flow(pdf)
+    row = chapter(env, pdf)
+    assert (row.status, row.error) == ("failed", "manhwa sources must be images or CBZ")
+
+
+# ---------------------------------------------------------------------------------------------
+# sources, review kinds and wiring
+
+
+def test_upload_source_from_object_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]), kind="upload")
+    assert ingest_flow(cid).pages == 2
+
+
+def test_single_image_upload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    data = page_png()
+    ref = env.store.put("media", data, "png", "image/png")
+    cid = add_chapter(env, make_cbz([data]), kind="upload", page_end=1)
+    with Session(env.engine) as s, s.begin():
+        row = s.get(ChapterRow, cid)
+        assert row is not None
+        row.source_ref, row.source_sha256 = ref, hashlib.sha256(data).hexdigest()
+    assert ingest_flow(cid).pages == 1
+
+
+@pytest.mark.parametrize(
+    "name", ["../ch.cbz", "/etc/passwd", "a/b.cbz", "..", ".", "", "a\\b.cbz", "x\x00y"]
+)
+def test_import_name_revalidated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    with Session(env.engine) as s, s.begin():
+        row = s.get(ChapterRow, cid)
+        assert row is not None
+        row.source_ref = name
+    with pytest.raises(UploadRejected):
+        ingest_flow(cid)
+    assert chapter(env, cid).error == "the imported source file is not available"
+
+
+def test_import_symlink_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    (env.imports / "ch.cbz").rename(env.imports / "real.cbz")
+    (env.imports / "ch.cbz").symlink_to(env.imports / "real.cbz")
+    with pytest.raises(UploadRejected):
+        ingest_flow(cid)
+    assert chapter(env, cid).status == "failed"
+
+
+def test_source_hash_mismatch_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1, sha="b" * 64)
+    with pytest.raises(UploadRejected):
+        ingest_flow(cid)
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "the source file changed since it was added")
+    assert env.ocr.calls == 0
+
+
+def test_panel_and_text_review_kinds(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    env.detector.regions = [IN_TOP]
+    env.ocr.default = ("", 0.0)
+    blank = page_png([])  # no frames: one whole-page panel
+    cid = add_chapter(env, make_cbz([blank]), page_end=1)
+
+    ingest_flow(cid)
+
+    assert kinds(env, cid) == {"panel_full_page": 1, "ocr_low_confidence": 1, "page_no_text": 1}
+
+
+def test_irregular_panel_threshold_from_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    env.detector.regions = []
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    monkeypatch.setattr(ingest_mod, "load_thresholds", lambda: {"panel_irregular_fill": 1.01})
+    ingest_flow(cid)
+    assert kinds(env, cid) == {"panel_irregular": 2}
+
+
+def test_thresholds_yaml_has_panel_irregular_fill() -> None:
+    assert ingest_mod.load_thresholds()["panel_irregular_fill"] == 0.85
+
+
+def test_chapter_pipeline_ingest_stage_runs_ingest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    record = rights(env.project_id)
+
+    @flow
+    def pipeline() -> list[dict[str, str]]:
+        runners = {"ingest": ingest_mod.ingest_stage}
+        return run_chapter(lambda _: record, env.project_id, cid, "gpu", runners=runners)
+
+    out = pipeline()
+    assert [r["status"] for r in out[1:]] == ["not_implemented"] * 7
+    assert out[0] == {
+        "stage": "ingest",
+        "chapter_id": cid,
+        "status": "ready",
+        "pages": "1",
+        "panels": "2",
+        "bubbles": "3",
+        "flagged": "1",
+    }
+    assert chapter(env, cid).status == "ready"
+
+
+def test_deployment_parameters_validate() -> None:
+    assert ingest_flow.name == "chapter-ingest"
+    assert ingest_flow.validate_parameters({"chapter_id": "chap_1"}) == {"chapter_id": "chap_1"}
+    with pytest.raises(Exception, match="chapter_id"):
+        ingest_flow.validate_parameters({})

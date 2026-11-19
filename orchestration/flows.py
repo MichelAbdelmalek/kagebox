@@ -1,14 +1,15 @@
-"""Prefect flows. Phase 0: the chapter pipeline skeleton with the rights gate in front.
+"""Prefect flows: the chapter pipeline with the rights gate in front of every stage.
 
 Every stage re-checks rights itself, so a record revoked mid-run stops the next stage.
-Stage bodies arrive in Phase 1; until then each stage reports ``not_implemented``.
+Stages with a runner (ingest: ``orchestration.ingest_flow``) do real work; the others report
+``not_implemented`` until their Phase 1 milestone lands.
 """
 
 # No `from __future__ import annotations`: Prefect builds a Pydantic model from the flow
 # signature at run time and needs real (not string) annotations.
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -56,6 +57,7 @@ def check_rights(load: RightsLoader, project_id: str, stage: Stage, profile: str
 
 
 StageResult = dict[str, str]
+StageRunner = Callable[[str], StageResult]  # chapter_id -> result
 
 
 @task(retries=0)
@@ -70,11 +72,23 @@ Profile = Literal["cloud", "gpu"]
 
 
 def run_chapter(
-    load: RightsLoader, project_id: str, chapter_id: str, profile: Profile
+    load: RightsLoader,
+    project_id: str,
+    chapter_id: str,
+    profile: Profile,
+    runners: Mapping[Stage, StageRunner] | None = None,
 ) -> list[StageResult]:
-    """The pipeline body, with the rights source injected (tests pass a fake loader)."""
+    """The pipeline body, with the rights source and stage runners injected."""
     check_rights(load, project_id, "ingest", profile)  # fail fast before any work
-    return [run_stage(load, project_id, chapter_id, s, profile) for s in STAGES]
+    out: list[StageResult] = []
+    for stage in STAGES:
+        runner = (runners or {}).get(stage)
+        if runner is None:
+            out.append(run_stage(load, project_id, chapter_id, stage, profile))
+        else:
+            check_rights(load, project_id, stage, profile)
+            out.append(runner(chapter_id))
+    return out
 
 
 @flow(name="chapter-pipeline", log_prints=False, validate_parameters=True)
@@ -82,9 +96,14 @@ def chapter_pipeline(
     project_id: str, chapter_id: str, profile: Profile = "cloud"
 ) -> list[StageResult]:
     """Deployment entry point. Parameters must stay JSON-serializable."""
+    from orchestration.ingest_flow import ingest_stage  # deferred: it imports this module
     from pipeline.common.database import make_engine  # deferred: needs settings at run time
     from pipeline.common.settings import get_settings
 
     return run_chapter(
-        db_rights_loader(make_engine(get_settings())), project_id, chapter_id, profile
+        db_rights_loader(make_engine(get_settings())),
+        project_id,
+        chapter_id,
+        profile,
+        runners={"ingest": ingest_stage},
     )

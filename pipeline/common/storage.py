@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from pipeline.common.settings import Settings
 
 _REF = re.compile(
     r"^(?P<bucket>[a-z0-9-]{3,63})/sha256/(?P<hex>[0-9a-f]{64})(?P<ext>\.[a-z0-9]{1,8})?$"
@@ -72,3 +75,13 @@ class S3ObjectStore:
         bucket, key = parse_ref(ref)
         body: bytes = self._s3.get_object(Bucket=bucket, Key=key)["Body"].read()
         return body
+
+
+def make_store(settings: Settings) -> ObjectStore:
+    """The object store for this process: memory in the test profile, else S3 with file secrets."""
+    if settings.profile == "test":
+        return MemoryObjectStore()
+    ak, sk = settings.secret("s3_access_key"), settings.secret("s3_secret_key")
+    if ak is None or sk is None:
+        raise RuntimeError("object store credentials are not configured")
+    return S3ObjectStore(settings.s3_endpoint, ak.get_secret_value(), sk.get_secret_value())
