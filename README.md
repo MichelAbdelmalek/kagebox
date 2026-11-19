@@ -74,6 +74,8 @@ Rights approval needs two people: a member submits a rights record, an admin app
 
 For Phase 1 generation, put your Together AI key in `deploy/secrets/together_api_key.txt`.
 
+Chapter sources up to 200 MB are uploaded over HTTP (`POST /api/chapters/{id}/upload`). Larger ones are imported server-side: create the import directory once with `mkdir -p data/imports` (gitignored), put the file there (a flat directory; regular files only, symlinks are ignored) and call `POST /api/chapters/{id}/import` with `{"name": "<file name>", "page_start": 1, "page_end": N}`. The directory is mounted read-only at `/imports` into `api` and `worker-cpu`; the API only matches the bare name against a listing of it.
+
 ### Make targets
 
 | Target | What it does |

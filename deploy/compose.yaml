@@ -75,7 +75,10 @@ services:
     environment:
       <<: *python-env
       KAGEBOX_ALLOWED_ORIGIN: https://${KAGEBOX_HOST:-localhost}:${KAGEBOX_PORT:-8443}
+      KAGEBOX_PREFECT_API_URL: http://prefect-server:4200/api  # start ingest runs (internal)
     secrets: [db_password, s3_access_key, s3_secret_key, media_signing_key, session_secret]
+    volumes:
+      - ../data/imports:/imports:ro  # server-side imports by bare file name (mkdir -p data/imports)
     networks: [front, back]
     depends_on:
       migrate: {condition: service_completed_successfully}
@@ -133,6 +136,7 @@ services:
               together_api_key]
     volumes:
       - models:/models:ro
+      - ../data/imports:/imports:ro  # same flat directory the api lists for imports
     networks: [back, egress]
     depends_on:
       prefect-server: {condition: service_healthy}

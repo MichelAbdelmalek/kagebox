@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     session_ttl_hours: int = 12
     max_upload_bytes: int = 200 * 1024 * 1024
     imports_dir: str = "/imports"  # read-only mount of server-side sources (bare file names)
+    prefect_api_url: str = "http://prefect-server:4200/api"  # internal network only
     cookie_secure: bool = True
 
     @model_validator(mode="after")

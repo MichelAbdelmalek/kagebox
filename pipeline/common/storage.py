@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import TYPE_CHECKING, Protocol
+from typing import IO, TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from pipeline.common.settings import Settings
@@ -25,6 +25,14 @@ def make_ref(bucket: str, data: bytes, ext: str) -> str:
     return f"{bucket}/sha256/{hashlib.sha256(data).hexdigest()}.{ext}"
 
 
+def make_ref_from_digest(bucket: str, sha256_hex: str, ext: str) -> str:
+    """The reference for content whose sha256 the caller already computed (streamed uploads)."""
+    ref = f"{bucket}/sha256/{sha256_hex}.{ext}"
+    if bucket not in BUCKETS or not _EXT.match(ext) or not _REF.match(ref):
+        raise ValueError("bad object reference parts")
+    return ref
+
+
 def parse_ref(ref: str) -> tuple[str, str]:
     m = _REF.match(ref)
     if not m:
@@ -34,6 +42,12 @@ def parse_ref(ref: str) -> tuple[str, str]:
 
 class ObjectStore(Protocol):
     def put(self, bucket: str, data: bytes, ext: str, content_type: str) -> str: ...
+    def put_fileobj(
+        self, bucket: str, fileobj: IO[bytes], sha256_hex: str, ext: str, content_type: str
+    ) -> str:
+        """Store a large file without holding it in memory. The caller hashed ``fileobj``."""
+        ...
+
     def get(self, ref: str) -> bytes: ...
 
 
@@ -45,6 +59,14 @@ class MemoryObjectStore:
         ref = make_ref(bucket, data, ext)
         self._data[ref] = data
         return ref
+
+    def put_fileobj(
+        self, bucket: str, fileobj: IO[bytes], sha256_hex: str, ext: str, content_type: str
+    ) -> str:
+        data = fileobj.read()
+        if hashlib.sha256(data).hexdigest() != sha256_hex:
+            raise ValueError("content does not match its digest")
+        return self.put(bucket, data, ext, content_type)
 
     def get(self, ref: str) -> bytes:
         parse_ref(ref)
@@ -69,6 +91,15 @@ class S3ObjectStore:
         ref = make_ref(bucket, data, ext)
         _, key = parse_ref(ref)
         self._s3.put_object(Bucket=bucket, Key=key, Body=data, ContentType=content_type)
+        return ref
+
+    def put_fileobj(
+        self, bucket: str, fileobj: IO[bytes], sha256_hex: str, ext: str, content_type: str
+    ) -> str:
+        ref = make_ref_from_digest(bucket, sha256_hex, ext)
+        _, key = parse_ref(ref)
+        # Streams (multipart above boto3's threshold); readers re-hash against the key.
+        self._s3.upload_fileobj(fileobj, bucket, key, ExtraArgs={"ContentType": content_type})
         return ref
 
     def get(self, ref: str) -> bytes:
