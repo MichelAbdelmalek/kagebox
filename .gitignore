@@ -1,9 +1,7 @@
 .env
 .env.*
 !.env.example
-models/
-# tests/models holds marker-`models` test code, never weights
-!tests/models/
+/models/
 data/
 *.safetensors
 node_modules/

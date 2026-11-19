@@ -5,6 +5,18 @@
 a label not listed there is skipped and logged, never guessed. Boxes are clamped to the image
 and rounded to integer pixels; boxes that collapse to zero width or height are dropped.
 
+The model reports a balloon twice: the outer ``bubble`` and the ``text_bubble`` inside it. Each
+``text_bubble`` is paired with the ``bubble`` holding the largest share of it (at least
+``PAIR_MIN_INSIDE`` of the text box; greedy by that share, each box paired at most once) and the
+pair becomes ONE speech Region: ``bbox`` = balloon, ``text_bbox`` = text, score = the max of the
+two. An unpaired ``text_bubble`` is a speech Region whose ``text_bbox`` is its own box; an
+unpaired ``bubble`` has ``text_bbox = None``; ``text_free`` is a caption with ``text_bbox`` = its
+own box. OCR reads ``text_bbox`` when present, else ``bbox``; assignment and order use ``bbox``,
+so a pair never splits across panels.
+
+``sfx`` is a valid Bubble kind but this model has no SFX label, so it never produces one: SFX
+lettering is either missed or reported as one of the three labels above. Nothing is guessed.
+
 ``assign`` gives each region to the panel it overlaps most (ties: the smaller, more specific
 panel, since merged or nested panel boxes overlap). No overlap means ``None``; the caller sends
 those to review (ruling R1). ``order_in_panel`` is Task 4's XY-cut on the region boxes.
@@ -27,13 +39,22 @@ log = logging.getLogger(__name__)
 MODEL_NAME = "manga-bubble-detector"
 Kind = Literal["speech", "sfx", "caption"]
 KINDS: Mapping[str, Kind] = {"bubble": "speech", "text_bubble": "speech", "text_free": "caption"}
+PAIR_MIN_INSIDE = 0.6  # share of a text_bubble box that must lie inside its bubble
 
 
 @dataclass(frozen=True)
 class Region:
-    bbox: BBox
+    bbox: BBox  # the balloon (or the text box when no balloon was found); used for assignment
     kind: Kind
     score: float
+    label: str  # the model's source label ("bubble" for a paired balloon)
+    text_bbox: BBox | None  # where the text is, for OCR; None means use bbox
+
+
+def _overlap(a: BBox, b: BBox) -> int:
+    w = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+    h = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+    return w * h if w > 0 and h > 0 else 0
 
 
 def _clamped(box: Sequence[float], width: int, height: int) -> BBox | None:
@@ -54,17 +75,47 @@ def regions_from_detections(
 ) -> list[Region]:
     """Detector output (x0, y0, x1, y1 boxes in pixels) to Regions. ``size`` is (width, height)."""
     width, height = size
-    out: list[Region] = []
+    raw: list[tuple[str, BBox, float]] = []
     for box, score, label in zip(boxes, scores, labels, strict=True):
         name = id2label.get(int(label))
-        kind = KINDS.get(name) if name is not None else None
-        if kind is None:
+        if name is None or name not in KINDS:
             log.warning("skipped detection with unmapped label %r (id %d)", name, int(label))
             continue
         bbox = _clamped(box, width, height)
-        if bbox is None:
-            continue
-        out.append(Region(bbox=bbox, kind=kind, score=float(score)))
+        if bbox is not None:
+            raw.append((name, bbox, float(score)))
+    return _pair(raw)
+
+
+def _pair(raw: Sequence[tuple[str, BBox, float]]) -> list[Region]:
+    balloons = [i for i, (name, _, _) in enumerate(raw) if name == "bubble"]
+    texts = [i for i, (name, _, _) in enumerate(raw) if name == "text_bubble"]
+    candidates: list[tuple[float, int, int]] = []
+    for t in texts:
+        tbox = raw[t][1]
+        for b in balloons:
+            share = _overlap(tbox, raw[b][1]) / (tbox.w * tbox.h)
+            if share >= PAIR_MIN_INSIDE:
+                candidates.append((share, t, b))
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    text_of: dict[int, int] = {}
+    used: set[int] = set()
+    for _, t, b in candidates:
+        if t not in used and b not in used:
+            text_of[b] = t
+            used.update((t, b))
+
+    out: list[Region] = []
+    for i, (name, bbox, score) in enumerate(raw):
+        if name == "bubble":
+            inner = text_of.get(i)
+            if inner is None:
+                out.append(Region(bbox, "speech", score, "bubble", None))
+            else:
+                tbox, tscore = raw[inner][1], raw[inner][2]
+                out.append(Region(bbox, "speech", max(score, tscore), "bubble", tbox))
+        elif i not in used:  # text_bubble left alone, or text_free
+            out.append(Region(bbox, KINDS[name], score, name, bbox))
     return out
 
 
@@ -106,12 +157,6 @@ class BubbleDetector:
             id2label=id2label,
             size=(rgb.width, rgb.height),
         )
-
-
-def _overlap(a: BBox, b: BBox) -> int:
-    w = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
-    h = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
-    return w * h if w > 0 and h > 0 else 0
 
 
 def assign(regions: Sequence[Region], panels: list[BBox]) -> list[tuple[Region, int | None]]:

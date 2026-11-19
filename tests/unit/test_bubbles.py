@@ -13,7 +13,22 @@ ID2LABEL = {0: "bubble", 1: "text_bubble", 2: "text_free"}
 
 
 def r(x: int, y: int, w: int, h: int, kind: str = "speech") -> Region:
-    return Region(bbox=BBox(x=x, y=y, w=w, h=h), kind=kind, score=0.9)  # type: ignore[arg-type]
+    label = "text_free" if kind == "caption" else "bubble"
+    return Region(bbox=BBox(x=x, y=y, w=w, h=h), kind=kind, score=0.9, label=label, text_bbox=None)  # type: ignore[arg-type]
+
+
+def detect(
+    boxes: list[tuple[float, float, float, float]],
+    labels: list[int],
+    scores: list[float] | None = None,
+) -> list[Region]:
+    return regions_from_detections(
+        boxes=boxes,
+        scores=scores or [0.9] * len(boxes),
+        labels=labels,
+        id2label=ID2LABEL,
+        size=(1000, 1000),
+    )
 
 
 class FakeDetector:
@@ -81,16 +96,77 @@ def test_order_uses_task4_xy_cut(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_labels_map_to_kinds() -> None:
-    got = regions_from_detections(
-        boxes=[(10.0, 10.0, 50.0, 50.0), (60.0, 10.0, 90.0, 50.0), (10.0, 60.0, 20.0, 95.0)],
-        scores=[0.9, 0.8, 0.7],
-        labels=[0, 1, 2],
-        id2label=ID2LABEL,
-        size=(100, 100),
+    # three separate boxes: nothing pairs
+    got = detect(
+        [(10.0, 10.0, 50.0, 50.0), (60.0, 10.0, 90.0, 50.0), (10.0, 60.0, 20.0, 95.0)],
+        [0, 1, 2],
+        [0.9, 0.8, 0.7],
     )
-    assert [g.kind for g in got] == ["speech", "speech", "caption"]
-    assert got[0].bbox == BBox(x=10, y=10, w=40, h=40)
-    assert got[1].score == pytest.approx(0.8)
+    by_label = {g.label: g for g in got}
+    assert sorted(by_label) == ["bubble", "text_bubble", "text_free"]
+    assert by_label["bubble"].kind == "speech"
+    assert by_label["bubble"].bbox == BBox(x=10, y=10, w=40, h=40)
+    assert by_label["bubble"].text_bbox is None  # unpaired balloon: OCR falls back to bbox
+    assert by_label["text_bubble"].kind == "speech"
+    assert by_label["text_bubble"].text_bbox == by_label["text_bubble"].bbox
+    assert by_label["text_bubble"].score == pytest.approx(0.8)
+    assert by_label["text_free"].kind == "caption"
+    assert by_label["text_free"].text_bbox == by_label["text_free"].bbox
+
+
+def test_nested_pair_becomes_one_region() -> None:
+    got = detect([(100.0, 100.0, 400.0, 500.0), (150.0, 150.0, 350.0, 450.0)], [0, 1], [0.7, 0.95])
+    assert len(got) == 1
+    [reg] = got
+    assert reg.kind == "speech" and reg.label == "bubble"
+    assert reg.bbox == BBox(x=100, y=100, w=300, h=400)
+    assert reg.text_bbox == BBox(x=150, y=150, w=200, h=300)
+    assert reg.score == pytest.approx(0.95)
+
+
+def test_pair_straddling_panel_border_assigned_once() -> None:
+    # balloon breaks out of the left panel; its text box sits fully inside the left panel
+    got = detect([(300.0, 100.0, 560.0, 400.0), (330.0, 150.0, 480.0, 350.0)], [0, 1])
+    pairs = assign(got, [BBox(x=0, y=0, w=500, h=1000), BBox(x=500, y=0, w=500, h=1000)])
+    assert len(pairs) == 1
+    assert pairs[0][1] == 0
+
+
+def test_side_by_side_balloons_do_not_cross_pair() -> None:
+    got = detect(
+        [
+            (100.0, 100.0, 300.0, 400.0),  # left balloon
+            (310.0, 100.0, 510.0, 400.0),  # right balloon
+            (330.0, 150.0, 480.0, 350.0),  # right text (listed first on purpose)
+            (130.0, 150.0, 280.0, 350.0),  # left text
+        ],
+        [0, 0, 1, 1],
+    )
+    assert len(got) == 2
+    pairs = {(g.bbox.x, g.text_bbox.x if g.text_bbox else None) for g in got}
+    assert pairs == {(100, 130), (310, 330)}
+
+
+def test_text_mostly_outside_balloon_not_paired() -> None:
+    # only half of the text box lies inside the balloon (< PAIR_MIN_INSIDE)
+    got = detect([(100.0, 100.0, 300.0, 300.0), (200.0, 150.0, 400.0, 250.0)], [0, 1])
+    assert sorted((g.label, g.text_bbox is None) for g in got) == [
+        ("bubble", True),
+        ("text_bubble", False),
+    ]
+
+
+def test_each_bubble_pairs_at_most_once() -> None:
+    # two text boxes inside one balloon: the better-covered one pairs, the other stays alone
+    got = detect(
+        [(100.0, 100.0, 400.0, 400.0), (150.0, 150.0, 250.0, 250.0), (380.0, 150.0, 480.0, 250.0)],
+        [0, 1, 1],
+    )
+    assert len(got) == 2
+    paired = [g for g in got if g.label == "bubble"]
+    assert paired[0].text_bbox == BBox(x=150, y=150, w=100, h=100)
+    alone = [g for g in got if g.label == "text_bubble"]
+    assert alone[0].text_bbox == alone[0].bbox == BBox(x=380, y=150, w=100, h=100)
 
 
 def test_unknown_label_skipped_and_logged(caplog: pytest.LogCaptureFixture) -> None:
