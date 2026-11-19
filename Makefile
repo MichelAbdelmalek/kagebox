@@ -11,7 +11,7 @@ GITLEAKS_IMAGE := zricethezav/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f6
 UV := docker run --rm -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox-uvcache:/root/.cache/uv -w /app -e UV_LINK_MODE=copy $(UV_IMAGE) uv
 PNPM := docker run --rm -v "$(CURDIR)/apps/web":/app -v "$(CURDIR)/docs":/docs:ro -v kagebox-web-nm:/app/node_modules -v kagebox-pnpm:/root/.local/share/pnpm -w /app -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 -e npm_config_store_dir=/root/.local/share/pnpm/store -e CI=true $(NODE_IMAGE) sh -c
 
-.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models worker-image
+.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models test-models worker-image
 
 help:
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -51,6 +51,10 @@ test-py:
 
 test-web:
 	$(PNPM) 'corepack enable && pnpm install --frozen-lockfile --reporter=silent && pnpm -s tokens:check && pnpm -s typecheck && pnpm -s lint && pnpm -s test'
+
+test-models: ## offline: tests that load the real pinned weights (models volume read-only, no network)
+	$(UV) sync -q --locked --all-extras --group dev
+	docker run --rm --network none -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox_models:/models:ro -w /app -e UV_OFFLINE=1 -e HF_HUB_OFFLINE=1 -e KAGEBOX_MODELS_DIR=/models $(UV_IMAGE) sh -c 'uv run --offline pytest -m models -q -o addopts="-ra --strict-markers"; rc=$$?; [ $$rc -eq 5 ] && rc=0; exit $$rc'
 
 lint: ## ruff, mypy, bandit
 	$(UV) run ruff check .

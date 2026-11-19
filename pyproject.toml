@@ -117,9 +117,10 @@ pythonpath = [".", "apps/api"]
 markers = [
   "live: calls real external services (Together AI); skipped unless KAGEBOX_LIVE_TESTS=1",
   "integration: needs the compose stack (postgres, object store)",
+  "models: loads real pinned weights from the models volume; run via make test-models",
 ]
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-ra --strict-markers -m 'not live and not integration'"
+addopts = "-ra --strict-markers -m 'not live and not integration and not models'"
 
 [tool.bandit]
 exclude_dirs = ["tests", "apps/web", ".venv"]

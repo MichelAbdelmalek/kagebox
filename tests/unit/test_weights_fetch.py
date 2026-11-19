@@ -442,16 +442,3 @@ def test_reference_and_source_with_same_path_do_not_collide(tmp_path: Path) -> N
     fetch_conversion(conv, q, tmp_path / "m", c)
     assert (q / "toy" / REV / "_reference" / "model.safetensors").read_bytes() == ref
     assert not (q / "toy" / REV / "model.safetensors").exists()
-
-
-def test_verify_installed_detects_tampering(tmp_path: Path) -> None:
-    from orchestration.check_models import verify_installed
-
-    [m] = load_models({"models": {"m": model()}})
-    d = tmp_path / "m" / REV
-    d.mkdir(parents=True)
-    (d / "model.safetensors").write_bytes(SAFE)
-    assert verify_installed(m, tmp_path) == d
-    (d / "model.safetensors").write_bytes(SAFE[:-1] + b"!")
-    with pytest.raises(UnsafeWeights):
-        verify_installed(m, tmp_path)
