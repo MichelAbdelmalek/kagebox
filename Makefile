@@ -11,7 +11,7 @@ GITLEAKS_IMAGE := zricethezav/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f6
 UV := docker run --rm -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox-uvcache:/root/.cache/uv -w /app -e UV_LINK_MODE=copy $(UV_IMAGE) uv
 PNPM := docker run --rm -v "$(CURDIR)/apps/web":/app -v "$(CURDIR)/docs":/docs:ro -v kagebox-web-nm:/app/node_modules -v kagebox-pnpm:/root/.local/share/pnpm -w /app -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 -e npm_config_store_dir=/root/.local/share/pnpm/store -e CI=true $(NODE_IMAGE) sh -c
 
-.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models test-models worker-image
+.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models test-models worker-image ingest-sample
 
 help:
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -77,6 +77,12 @@ scan-images: ## trivy scan of the built images (exported tarballs; the Docker so
 	  docker save -o .scan/$$i.tar kagebox/$$i:dev && \
 	  docker run --rm -v "$(CURDIR)/.scan":/scan:ro -v kagebox-trivy:/root/.cache $(TRIVY_IMAGE) image --input /scan/$$i.tar --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 || exit 1; done
 	rm -rf .scan
+
+ingest-sample: ## real-data ingest of the sample chapter via the API (stack running), report in data/reports/
+	mkdir -p data/imports data/reports
+	# Hard link (never a symlink: imports refuse them; never a copy of 354 MB).
+	test -f data/imports/001bj.pdf || ln data/fixtures/blackjack-v1/work/001bj.pdf data/imports/001bj.pdf
+	sh tests/e2e/ingest_sample.sh
 
 pin-models: ## regenerate pinned files/hashes in configs/models.yaml from models.sources.yaml
 	$(UV) run python deploy/scripts/pin_models.py configs

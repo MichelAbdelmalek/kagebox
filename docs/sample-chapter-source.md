@@ -36,14 +36,48 @@ Rights record in Kagebox: basis `licensed`, licensor 有限会社佐藤漫画製
 | Licence verified (research + two independent skeptics) | Done |
 | Volume 1 downloaded from densho810.com/free/ (2026-11-19, with the owner's approval) | Done |
 | Archives inspected offline, without extracting: one PDF each; no unsafe paths, symlinks, encryption or zip-bomb ratios | Done |
-| Chapter 1 page range and count | Milestone 1.1 (needs the sandboxed PDF renderer) |
-| Rights record created in Kagebox | Milestone 1.1, with the ingest upload |
+| Chapter 1 page range and count: PDF pages 3–58, 56 pages (第1話 研修医の夜; colour pages 3–6, spread 4–5) | Done (2026-11-19) |
+| Rights record created in Kagebox (member submits, admin approves; evidence = PDF wrapping the terms snapshot) | Done (2026-11-19, `make ingest-sample`) |
+| Chapter 1 ingested through the API, contact sheets reviewed | Done (2026-11-19); see "Ingest results" |
 
 | File (in `data/fixtures/blackjack-v1/`, gitignored) | Size | sha256 |
 |---|---|---|
 | `001bj.zip` (Japanese; contains `001bj.pdf`, 354,097,132 bytes) | 343,497,422 | `ec7bbb4ce4f719536a2d58f29eb2c665d19b0769303efe009b4d98cccad699e1` |
 | `enbj001.zip` (English; contains `enbj001.pdf`, 419,481,819 bytes) | 403,640,188 | `150e3a2e8d2e71f8f43baf780753463093383bda19b09fbd9b825077da8d13ed` |
 | `terms/densho810-free-2026-11-19.html` (terms snapshot, rights evidence) | 32,843 | `2bb1dc9f1a06de8ca66705af93b772f00633cd85c644bd7835025008d43b6da1` |
+| `work/001bj.pdf` (extracted from `001bj.zip`; hard-linked as `data/imports/001bj.pdf`) | 354,097,132 | `a2ad133db82a21cefce1acccb5548de10d2d74118c1519d86ede8566b02ca8b4` |
+
+## Ingest results
+
+Run on 2026-11-19 with `make up-cloud` then `make ingest-sample` (cloud profile, CPU worker, 4 GB limit; no OOM). The import is `001bj.pdf`, pages 3–58, language `ja`, project format `manga_rtl`. The report and contact sheets go to `data/reports/` (gitignored, never committed).
+
+**Rights evidence.** The rights endpoint accepts only PDF or images, so `tests/e2e/evidence_pdf.py` wraps the HTML snapshot in a one-page PDF and attaches the snapshot unchanged as an embedded file. The justification also states the snapshot's sha256. `allows_cloud_processing` stays false: ingest runs locally.
+
+| Metric | Value |
+|---|---|
+| Pages | 56 (status `ready`) |
+| Panels | 255 (4.6 per page) |
+| Bubbles (speech + caption) | 297 |
+| Bubbles below OCR confidence 0.90 (`needs_review`) | 42 (14.1 %) |
+| Mean OCR confidence | 0.929 (min 0.19; 226 of 297 at 0.95 or above) |
+| Review items | 157: 107 `panel_irregular`, 42 `ocr_low_confidence`, 4 `panel_full_page`, 4 `region_outside_panels` |
+| Pages with at least one review item | 51 of 56 (91 %) |
+| Wall time (import accepted → `ready`) | 273 s (about 4.9 s per page) |
+
+**What works.** Dialogue OCR on clean balloons is close to exact. All six balloons on page 7 are read correctly with confidence of 0.97 or more. Right-to-left panel order is correct on page 7 and on the normal pages checked. Full-page art gives one panel: page 4 (the first half of the spread; fill 0.93, so not flagged) and pages 34–37 (flagged `panel_full_page` for confirmation). Balloons and captions are boxed and ordered right to left within each panel.
+
+**Known gaps (sent to review, not fixed here):**
+
+- **Page 5 (second half of the colour spread)** is one painting, but the detector splits it into 4 panels (fill 0.51–0.80, all flagged `panel_irregular`). This breaks the expectation that a spread page gives one panel.
+- **Page 6** (colour, black paper, 4 panels) gives 5 panels: one spurious box sits inside the tall right panel (fill 0.32, flagged). The order of the real panels is correct.
+- **Diagonal gutters merge panels.** On page 20, four diagonal panels become one box (fill 0.74, flagged). Its balloons are still boxed and read.
+- **Borderless panels** are missed: on page 23 the explanatory graphic has no frame, so its 4 text regions are `region_outside_panels`.
+- **`panel_irregular` is noisy.** 107 of 251 component panels are flagged, many of them correct. Panels that bleed off the page edge or have white interiors measure a low fill even when they are right: on page 7, three correct panels measure 0.26, 0.66 and 0.82.
+- **SFX are not a kind.** The detector has no SFX label, so hand-lettered SFX are missed or come out as low-confidence `speech` (page 20). A wall clock was also read as a balloon (low confidence, flagged).
+- **Stylised text reads poorly.** Bold outlined narration over art (page 34), signage (page 6) and a sound effect drawn as a balloon (page 20) come out wrong. All of these fall below 0.90 and are flagged.
+- **Speaker linking** waits for milestone 1.3. `Bubble.speaker` stays null.
+
+**`panel_irregular_fill` calibration (ruling T1): kept at 0.85.** Counts of component panels below each threshold: 0.60 → 49, 0.65 → 63, 0.70 → 71, 0.75 → 84, 0.80 → 94, 0.85 → 107. No threshold separates correct panels from real errors. Correct bleed panels on page 7 measure 0.26, 0.66 and 0.82. The real merge on page 20 measures 0.74, and the false split of page 5 measures 0.51–0.80. Lowering the threshold would hide those real errors, so the evidence does not support a change.
 
 ## Studied, not used
 

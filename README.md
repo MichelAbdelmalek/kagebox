@@ -57,6 +57,7 @@ Only Caddy publishes a port, bound to `127.0.0.1`. Postgres, Qdrant, the object 
 Requirements: Docker Desktop (or Docker Engine with Compose v2) and `make`. **Nothing else is installed on the host**; Python, Node and every scanner run in pinned containers.
 
 ```bash
+mkdir -p data/imports   # server-side import directory (gitignored), mounted read-only
 make up-cloud
 ```
 
