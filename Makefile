@@ -80,8 +80,8 @@ scan-images: ## trivy scan of the built images (exported tarballs; the Docker so
 
 ingest-sample: ## real-data ingest of the sample chapter via the API (stack running), report in data/reports/
 	mkdir -p data/imports data/reports
-	# Hard link (never a symlink: imports refuse them; never a copy of 354 MB).
-	test -f data/imports/001bj.pdf || ln data/fixtures/blackjack-v1/work/001bj.pdf data/imports/001bj.pdf
+	# The script hard-links the source into data/imports/<project_id>/ once it knows the project.
+	test -f data/fixtures/blackjack-v1/work/001bj.pdf
 	sh tests/e2e/ingest_sample.sh
 
 pin-models: ## regenerate pinned files/hashes in configs/models.yaml from models.sources.yaml

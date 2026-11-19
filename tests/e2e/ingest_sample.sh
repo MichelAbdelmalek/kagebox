@@ -1,8 +1,9 @@
 #!/bin/sh
 # Real-data ingest of the sample chapter (docs/sample-chapter-source.md) through the API, over
 # HTTPS through Caddy, then the offline report into data/reports/. Needs the running stack
-# (make up-cloud), the Phase 0 test users (see phase0_smoke.sh) and the source hard-linked into
-# data/imports/ (make ingest-sample does that). Passwords and cookies stay in a private temp dir
+# (make up-cloud) and the Phase 0 test users (see phase0_smoke.sh). Imports are scoped per project:
+# the source is hard-linked (never copied, never symlinked: imports refuse symlinks) into
+# data/imports/<project_id>/ once the project is known. Passwords and cookies stay in a private temp dir
 # and are never printed. TLS is verified against Caddy's local root CA (copied out of the caddy
 # container), never skipped. Set INGEST_CHAPTER_ID=chap_... to re-ingest an existing chapter
 # (the flow replaces its results) instead of creating a new project, rights record and chapter.
@@ -11,6 +12,7 @@ set -eu
 B="https://${KAGEBOX_HOST:-localhost}:${KAGEBOX_PORT:-8443}"
 S=deploy/secrets
 SRC_NAME=001bj.pdf
+SRC=data/fixtures/blackjack-v1/work/$SRC_NAME
 FIRST=3
 LAST=58
 SNAPSHOT=data/fixtures/blackjack-v1/terms/densho810-free-2026-11-19.html
@@ -50,7 +52,13 @@ expect() { # name expected actual
   echo "ok    $1"
 }
 
-[ -f "data/imports/$SRC_NAME" ] || die "data/imports/$SRC_NAME missing (run make ingest-sample)"
+[ -f "$SRC" ] || die "$SRC missing (see docs/sample-chapter-source.md)"
+stage() { # project id -> hard link of the source in that project's import directory
+  case "$1" in proj_*[!0-9a-z_]*|proj_) die "unexpected project id" ;; proj_*) ;; *) die "unexpected project id" ;; esac
+  mkdir -p "data/imports/$1"
+  [ -f "data/imports/$1/$SRC_NAME" ] || ln "$SRC" "data/imports/$1/$SRC_NAME"
+  echo "ok    source hard-linked into data/imports/$1/"
+}
 got=$(shasum -a 256 "$SNAPSHOT" 2>/dev/null || sha256sum "$SNAPSHOT")
 [ "${got%% *}" = "$SNAPSHOT_SHA" ] || die "terms snapshot sha256 does not match the docs"
 
@@ -61,6 +69,7 @@ stamp=$(date -u +%Y%m%dT%H%M%SZ)
 if [ -n "${INGEST_CHAPTER_ID:-}" ]; then
   C=$INGEST_CHAPTER_ID
   expect "existing chapter" 200 "$(req member GET "/chapters/$C")"
+  P=$(json '["project_id"]')
 else
   python3 -I -c 'import json,sys; json.dump({"title": sys.argv[1], "format": "manga_rtl"}, open(sys.argv[2], "w"))' \
     "Give My Regards to Black Jack vol. 1 (ingest sample $stamp)" "$D/project.json"
@@ -85,6 +94,7 @@ else
     -H 'content-type: application/json' -d '{"number":1,"language":"ja"}')"
   C=$(json '["id"]')
 fi
+stage "$P"
 start=$(date +%s)
 python3 -I -c 'import json,sys; json.dump({"name": sys.argv[1], "page_start": int(sys.argv[2]), "page_end": int(sys.argv[3])}, open(sys.argv[4], "w"))' \
   "$SRC_NAME" "$FIRST" "$LAST" "$D/import.json"

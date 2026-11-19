@@ -45,7 +45,7 @@ Rights record in Kagebox: basis `licensed`, licensor 有限会社佐藤漫画製
 | `001bj.zip` (Japanese; contains `001bj.pdf`, 354,097,132 bytes) | 343,497,422 | `ec7bbb4ce4f719536a2d58f29eb2c665d19b0769303efe009b4d98cccad699e1` |
 | `enbj001.zip` (English; contains `enbj001.pdf`, 419,481,819 bytes) | 403,640,188 | `150e3a2e8d2e71f8f43baf780753463093383bda19b09fbd9b825077da8d13ed` |
 | `terms/densho810-free-2026-11-19.html` (terms snapshot, rights evidence) | 32,843 | `2bb1dc9f1a06de8ca66705af93b772f00633cd85c644bd7835025008d43b6da1` |
-| `work/001bj.pdf` (extracted from `001bj.zip`; hard-linked as `data/imports/001bj.pdf`) | 354,097,132 | `a2ad133db82a21cefce1acccb5548de10d2d74118c1519d86ede8566b02ca8b4` |
+| `work/001bj.pdf` (extracted from `001bj.zip`; hard-linked as `data/imports/<project_id>/001bj.pdf` by `make ingest-sample`) | 354,097,132 | `a2ad133db82a21cefce1acccb5548de10d2d74118c1519d86ede8566b02ca8b4` |
 
 ## Ingest results
 

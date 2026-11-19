@@ -127,6 +127,13 @@ def project(e: Env, fmt: str = "manga_rtl", approve: bool = True) -> str:
     return pid
 
 
+def staged(e: Env, pid: str) -> Path:
+    """The project's own import directory (imports are scoped per project)."""
+    d = e.imports / pid
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def chapter(e: Env, pid: str, number: int = 1) -> str:
     r = e.c.post(f"/api/projects/{pid}/chapters", json={"number": number, "language": "ja"})
     assert r.status_code == 201, r.text
@@ -209,7 +216,7 @@ def test_every_new_route_requires_auth(env: Env) -> None:
 def test_import_name_with_path_refused(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "x.pdf").write_bytes(PDF)
+    (staged(env, pid) / "x.pdf").write_bytes(PDF)
     with respx.mock(assert_all_called=False) as mock:
         route = ok_prefect(mock)
         for name in ("../x.pdf", "/etc/passwd", "a/b.pdf", "..", ".", "a\\b.pdf", "x\x00.pdf", ""):
@@ -224,15 +231,17 @@ def test_import_name_with_path_refused(env: Env) -> None:
 def test_import_unknown_file_404(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "real.pdf").write_bytes(PDF)
-    (env.imports / "dir.pdf").mkdir()
-    os.symlink(env.imports / "real.pdf", env.imports / "link.pdf")
+    own = staged(env, pid)
+    (own / "real.pdf").write_bytes(PDF)
+    (own / "dir.pdf").mkdir()
+    os.symlink(own / "real.pdf", own / "link.pdf")
     outside = env.imports.parent / "outside.pdf"
     outside.write_bytes(PDF)
-    os.symlink(outside, env.imports / "escape.pdf")
+    os.symlink(outside, own / "escape.pdf")
+    (env.imports / "flat.pdf").write_bytes(PDF)  # the old flat layout is not listed
     with respx.mock(assert_all_called=False) as mock:
         route = ok_prefect(mock)
-        for name in ("nope.pdf", "dir.pdf", "link.pdf", "escape.pdf", "REAL.pdf"):
+        for name in ("nope.pdf", "dir.pdf", "link.pdf", "escape.pdf", "REAL.pdf", "flat.pdf"):
             r = env.c.post(
                 f"/api/chapters/{cid}/import", json={"name": name, "page_start": 1, "page_end": 1}
             )
@@ -241,10 +250,46 @@ def test_import_unknown_file_404(env: Env) -> None:
         assert route.call_count == 0
 
 
+def test_import_is_scoped_to_the_chapters_project(env: Env) -> None:
+    """A file staged for project A cannot be imported (or probed) through project B."""
+    pid_a = project(env)
+    (staged(env, pid_a) / "a-vol2.pdf").write_bytes(PDF)
+    pid_b = project(env)  # same editor, its own approved rights record
+    cid_b = chapter(env, pid_b)
+    staged(env, pid_b)
+    body = {"name": "a-vol2.pdf", "page_start": 1, "page_end": 1}
+    with respx.mock(assert_all_called=False) as mock:
+        route = ok_prefect(mock)
+        r = env.c.post(f"/api/chapters/{cid_b}/import", json=body)
+        assert r.status_code == 404, r.text
+        assert r.json()["detail"] == "import not found"
+        # project B without an imports directory at all: the same 404
+        cid_c = chapter(env, project(env))
+        assert env.c.post(f"/api/chapters/{cid_c}/import", json=body).status_code == 404
+        assert route.call_count == 0
+    assert chapter_row(env, cid_b).source_kind == "none"
+
+
+def test_import_project_dir_must_be_a_real_directory(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    elsewhere = env.imports.parent / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "v.pdf").write_bytes(PDF)
+    os.symlink(elsewhere, env.imports / pid)  # a symlinked project directory is not followed
+    with respx.mock(assert_all_called=False) as mock:
+        route = ok_prefect(mock)
+        r = env.c.post(
+            f"/api/chapters/{cid}/import", json={"name": "v.pdf", "page_start": 1, "page_end": 1}
+        )
+        assert r.status_code == 404, r.text
+        assert route.call_count == 0
+
+
 def test_bad_page_range_422(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "x.pdf").write_bytes(PDF)
+    (staged(env, pid) / "x.pdf").write_bytes(PDF)
     bad: list[dict[str, Any]] = [
         {"page_start": 5, "page_end": 3},  # reversed
         {"page_start": 0, "page_end": 2},  # out of bounds
@@ -300,7 +345,7 @@ def test_bad_page_range_422(env: Env) -> None:
 def test_start_ingest_called_once(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "vol1.pdf").write_bytes(PDF)
+    (staged(env, pid) / "vol1.pdf").write_bytes(PDF)
     with respx.mock(assert_all_called=True) as mock:
         route = ok_prefect(mock)
         r = env.c.post(
@@ -327,7 +372,7 @@ def test_start_ingest_called_once(env: Env) -> None:
 def test_prefect_failure_is_502_and_chapter_stays_pending(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "v.pdf").write_bytes(PDF)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
     body = {"name": "v.pdf", "page_start": 1, "page_end": 2}
     responses: list[Any] = [
         httpx.Response(500, text="Traceback: secret internals"),
@@ -354,7 +399,7 @@ def test_prefect_failure_is_502_and_chapter_stays_pending(env: Env) -> None:
 def test_prefect_deployment_lookup_failure_is_502(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "v.pdf").write_bytes(PDF)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
     body = {"name": "v.pdf", "page_start": 1, "page_end": 2}
     for resp in (
         httpx.Response(404, json={"detail": "Deployment not found"}),
@@ -442,7 +487,7 @@ def test_upload_sniffs_content_and_refuses_manhwa_pdf(env: Env) -> None:
 
         mpid = project(env, fmt="manhwa_vertical")
         mcid = chapter(env, mpid)
-        (env.imports / "m.pdf").write_bytes(PDF)
+        (staged(env, mpid) / "m.pdf").write_bytes(PDF)
         r = env.c.post(
             f"/api/chapters/{mcid}/upload",
             data={"page_start": "1", "page_end": "1"},
@@ -486,7 +531,7 @@ def test_upload_over_cap_is_413(tmp_path: Path) -> None:
 def test_refused_while_ingesting(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "v.pdf").write_bytes(PDF)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
     with env.session() as s:
         row = s.get(ChapterRow, cid)
         row.status, row.ingest_started_at = "ingesting", datetime.now(UTC)
@@ -762,7 +807,7 @@ def test_no_db_transaction_held_while_reading_source(
     monkeypatch.setattr(routes, "_hash_stream", hash_stream)
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "v.pdf").write_bytes(PDF)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
     with respx.mock() as mock:
         ok_prefect(mock)
         assert upload_png(env, cid).status_code == 202
@@ -782,7 +827,7 @@ def test_stale_ingesting_chapter_accepts_a_new_source(env: Env) -> None:
 
     pid = project(env)
     cid = chapter(env, pid)
-    (env.imports / "v.pdf").write_bytes(PDF)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
     body = {"name": "v.pdf", "page_start": 1, "page_end": 1}
 
     def set_running(age_s: int) -> None:

@@ -80,7 +80,7 @@ services:
       TMPDIR: /spool
     secrets: [db_password, s3_access_key, s3_secret_key, media_signing_key, session_secret]
     volumes:
-      - ../data/imports:/imports:ro  # server-side imports by bare file name (mkdir -p data/imports)
+      - ../data/imports:/imports:ro  # server-side imports: data/imports/<project_id>/<file name>
       - api-spool:/spool  # at most MAX_CONCURRENT_UPLOADS x 200 MB in flight
     networks: [front, back]
     depends_on:
@@ -140,7 +140,7 @@ services:
               together_api_key]
     volumes:
       - models:/models:ro
-      - ../data/imports:/imports:ro  # same flat directory the api lists for imports
+      - ../data/imports:/imports:ro  # same per-project directories the api lists for imports
     networks: [back, egress]
     depends_on:
       prefect-server: {condition: service_healthy}

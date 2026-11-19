@@ -24,10 +24,10 @@ crash: a ``BaseException`` in the run, or Prefect's ``on_cancellation`` / ``on_c
 Details go to the log; validation errors are logged by field and type only, never with input.
 
 Sources: ``upload`` reads ``source_ref`` (a ``media`` object reference) from the object store
-into a private temp directory; ``import`` is a bare file name in the read-only imports dir,
-re-validated here (no separators, not ``.``/``..``, a regular file, not a symlink). Either way
-the bytes are re-hashed against ``source_sha256`` before use. A single image becomes a
-one-page image folder.
+into a private temp directory; ``import`` is a bare file name in the project's own directory of
+the read-only imports dir (``<imports>/<project_id>/``), re-validated here (no separators, not
+``.``/``..``, a real directory and a regular file, no symlinks). Either way the bytes are
+re-hashed against ``source_sha256`` before use. A single image becomes a one-page image folder.
 
 ``Page.index`` is the 1-based reading position in the chapter; ``Page.source_page`` the page
 number in the source file. ``manhwa_vertical`` projects read pages at full height and cut each
@@ -45,6 +45,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import stat
 import tempfile
 import uuid
@@ -117,6 +118,7 @@ UPLOAD_MISSING = "the uploaded source file is not available"
 SOURCE_CHANGED = "the source file changed since it was added"
 MANHWA_PDF = "manhwa sources must be images or CBZ"
 _CHUNK = 1024 * 1024
+_PROJECT_ID = re.compile(r"^proj_[0-9a-z_]{1,64}$")  # pipeline.common.ids.ProjectId
 
 
 class IngestAlreadyRunning(RuntimeError):
@@ -199,16 +201,23 @@ def kagebox_info() -> ModelInfo:
 # source file
 
 
-def _import_path(root: Path, name: str) -> Path:
+def _import_path(root: Path, project_id: str, name: str) -> Path:
+    """``<root>/<project_id>/<name>``: the project's own imports directory only.
+
+    The project id comes from the database and is re-checked against the id pattern; the
+    directory must be a real directory and the file a regular file (``lstat``: symlinks are
+    neither followed nor accepted at either level).
+    """
     bad = not name or name in (".", "..") or any(c in name for c in "/\\\x00")
-    if bad:
+    if bad or not _PROJECT_ID.match(project_id):
         raise UploadRejected(IMPORT_MISSING)
-    path = root / name
+    folder = root / project_id
+    path = folder / name
     try:
-        st = os.lstat(path)
+        folder_st, st = os.lstat(folder), os.lstat(path)
     except OSError:
         raise UploadRejected(IMPORT_MISSING) from None
-    if not stat.S_ISREG(st.st_mode):  # lstat: a symlink is not a regular file
+    if not stat.S_ISDIR(folder_st.st_mode) or not stat.S_ISREG(st.st_mode):
         raise UploadRejected(IMPORT_MISSING)
     return path
 
@@ -238,7 +247,7 @@ def open_source(ch: _Chapter, deps: IngestDeps) -> Iterator[tuple[Path, SourceKi
     """The verified source as (path, kind); temp files are removed on exit."""
     with tempfile.TemporaryDirectory(prefix="kagebox-ingest-") as tmp:
         if ch.source_kind == "import":
-            path = _import_path(deps.imports_dir, ch.source_ref)
+            path = _import_path(deps.imports_dir, ch.project_id, ch.source_ref)
             if _hash_import(path) != ch.source_sha256:
                 raise UploadRejected(SOURCE_CHANGED)
         elif ch.source_kind == "upload":

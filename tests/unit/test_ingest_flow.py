@@ -208,7 +208,9 @@ def add_chapter(
     sha: str | None = None,
 ) -> str:
     if kind == "import":
-        (env.imports / name).write_bytes(data)
+        folder = env.imports / env.project_id  # imports are scoped per project
+        folder.mkdir(exist_ok=True)
+        (folder / name).write_bytes(data)
         ref = name
     else:
         ref = env.store.put("media", data, "cbz", "application/zip")
@@ -514,11 +516,39 @@ def test_import_name_revalidated(
 def test_import_symlink_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     env = make_env(tmp_path, monkeypatch)
     cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
-    (env.imports / "ch.cbz").rename(env.imports / "real.cbz")
-    (env.imports / "ch.cbz").symlink_to(env.imports / "real.cbz")
+    own = env.imports / env.project_id
+    (own / "ch.cbz").rename(own / "real.cbz")
+    (own / "ch.cbz").symlink_to(own / "real.cbz")
     with pytest.raises(UploadRejected):
         ingest_flow(cid)
     assert chapter(env, cid).status == "failed"
+
+
+@pytest.mark.parametrize("where", ["flat", "other_project", "symlinked_dir"])
+def test_import_only_from_the_projects_own_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    data = make_cbz([page_png()])
+    cid = add_chapter(env, data, page_end=1)
+    own = env.imports / env.project_id
+    (own / "ch.cbz").unlink()
+    own.rmdir()
+    if where == "flat":
+        (env.imports / "ch.cbz").write_bytes(data)
+    elif where == "other_project":
+        other = env.imports / new_id("proj")
+        other.mkdir()
+        (other / "ch.cbz").write_bytes(data)
+    else:
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "ch.cbz").write_bytes(data)
+        own.symlink_to(elsewhere)
+    with pytest.raises(UploadRejected):
+        ingest_flow(cid)
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "the imported source file is not available")
 
 
 def test_source_hash_mismatch_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

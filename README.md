@@ -57,7 +57,7 @@ Only Caddy publishes a port, bound to `127.0.0.1`. Postgres, Qdrant, the object 
 Requirements: Docker Desktop (or Docker Engine with Compose v2) and `make`. **Nothing else is installed on the host**; Python, Node and every scanner run in pinned containers.
 
 ```bash
-mkdir -p data/imports   # server-side import directory (gitignored), mounted read-only
+mkdir -p data/imports   # server-side imports, one subdirectory per project (gitignored), mounted read-only
 make up-cloud
 ```
 
@@ -75,7 +75,7 @@ Rights approval needs two people: a member submits a rights record, an admin app
 
 For Phase 1 generation, put your Together AI key in `deploy/secrets/together_api_key.txt`.
 
-Chapter sources up to 200 MB are uploaded over HTTP (`POST /api/chapters/{id}/upload`). Larger ones are imported server-side: create the import directory once with `mkdir -p data/imports` (gitignored), put the file there (a flat directory; regular files only, symlinks are ignored) and call `POST /api/chapters/{id}/import` with `{"name": "<file name>", "page_start": 1, "page_end": N}`. The directory is mounted read-only at `/imports` into `api` and `worker-cpu`; the API only matches the bare name against a listing of it.
+Chapter sources up to 200 MB are uploaded over HTTP (`POST /api/chapters/{id}/upload`). Larger ones are imported server-side. Imports are scoped per project: put the file in `data/imports/<project_id>/` (gitignored; create the directory; regular files only, symlinks are ignored, a hard link is fine) and call `POST /api/chapters/{id}/import` with `{"name": "<file name>", "page_start": 1, "page_end": N}`. The API and the worker look only in the directory of the chapter's own project, so a source staged for one project can neither be imported nor probed through another (whose rights record does not cover it). `data/imports` is mounted read-only at `/imports` into `api` and `worker-cpu`; the API only matches the bare name against a listing of the project's directory.
 
 ### Make targets
 

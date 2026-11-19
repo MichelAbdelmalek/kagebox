@@ -1,9 +1,9 @@
 """Chapters: create, add a source (upload or server-side import), start ingest, read results.
 
 Everything a user sends is untrusted: uploads are capped while streaming and sniffed by content;
-import names are only ever compared against a listing of the imports directory, never joined
-into a path. Responses carry signed, user-bound media URLs, never object keys or file paths.
-OCR text is returned as JSON data only.
+import names are only ever compared against a listing of the project's own imports directory
+(``<imports>/<project_id>/``), never joined into a path. Responses carry signed, user-bound
+media URLs, never object keys or file paths. OCR text is returned as JSON data only.
 """
 
 from __future__ import annotations
@@ -75,6 +75,7 @@ MAX_CONCURRENT_UPLOADS = 2
 UPLOADS_BUSY = "too many uploads in progress, try again"
 SPOOL_FAILED = "the server could not store the upload; try again later"
 _DIGITS = re.compile(r"^[0-9]{1,6}$")
+PROJECT_ID = re.compile(r"^proj_[0-9a-z_]{1,64}$")  # pipeline.common.ids.ProjectId
 
 
 # ---------------------------------------------------------------------------------------------
@@ -553,24 +554,37 @@ def _audit_spool_failure(db: Session, user: User, chapter_id: str, exc: OSError)
     db.commit()
 
 
-def _open_import(root: str, name: str) -> int | None:
-    """An O_RDONLY fd for the listed regular file named exactly ``name``, else None.
-
-    The user's string is only compared with names from the listing; the path opened is the
-    listing's own entry, never built from user input. Symlinks are not followed.
-    """
+def _listed(root: str, name: str, *, want_dir: bool) -> str | None:
+    """The path of the listing entry of ``root`` named exactly ``name``, if it has the wanted
+    type. Symlinks are never followed; the path is the listing's own, not built from input."""
     try:
         with os.scandir(root) as it:
-            match = next(
-                (e for e in it if e.name == name and e.is_file(follow_symlinks=False)), None
-            )
+            for e in it:
+                if e.name != name:
+                    continue
+                kind_ok = e.is_dir if want_dir else e.is_file
+                return e.path if kind_ok(follow_symlinks=False) else None
     except OSError:
         log.warning("imports directory is not readable")
+    return None
+
+
+def _open_import(root: str, project_id: str, name: str) -> int | None:
+    """An O_RDONLY fd for the regular file ``name`` in the project's own imports directory
+    (``<root>/<project_id>/``), else None.
+
+    Imports are scoped per project, so an editor of one project can neither use nor probe a
+    source staged for another. ``project_id`` is server-generated and re-checked against the
+    id pattern; the user's ``name`` is only compared with names from the listing.
+    """
+    if not PROJECT_ID.match(project_id):
         return None
-    if match is None:
+    folder = _listed(root, project_id, want_dir=True)
+    path = None if folder is None else _listed(folder, name, want_dir=False)
+    if path is None:
         return None
     try:
-        fd = os.open(match.path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return None
     if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -587,10 +601,11 @@ def _open_import(root: str, name: str) -> int | None:
 def import_source(
     chapter_id: str, body: ImportIn, request: Request, user: CurrentUser, db: DB
 ) -> JobAccepted:
-    """Use a file from the read-only imports directory (for sources over the upload limit)."""
+    """Use a file from the project's read-only imports directory (sources over the upload
+    limit), ``<imports>/<project_id>/<name>``."""
     st = state(request)
     row = _prepare(db, user, chapter_id)
-    fd = _open_import(st.settings.imports_dir, body.name)
+    fd = _open_import(st.settings.imports_dir, row.project_id, body.name)
     if fd is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "import not found")
     with os.fdopen(fd, "rb") as f:
