@@ -49,35 +49,52 @@ Rights record in Kagebox: basis `licensed`, licensor 有限会社佐藤漫画製
 
 ## Ingest results
 
-Run on 2026-11-19 with `make up-cloud` then `make ingest-sample` (cloud profile, CPU worker, 4 GB limit; no OOM). The import is `001bj.pdf`, pages 3–58, language `ja`, project format `manga_rtl`. The report and contact sheets go to `data/reports/` (gitignored, never committed).
+First run on 2026-11-19 with `make up-cloud` then `make ingest-sample` (cloud profile, CPU worker, 4 GB limit; no OOM). The import is `001bj.pdf`, pages 3–58, language `ja`, project format `manga_rtl`. The chapter was re-ingested in place after the panel-merge fix (ruling P4, commit `e36a68b`) with `INGEST_CHAPTER_ID=… make ingest-sample`. The report and contact sheets go to `data/reports/` (gitignored, never committed).
 
 **Rights evidence.** The rights endpoint accepts only PDF or images, so `tests/e2e/evidence_pdf.py` wraps the HTML snapshot in a one-page PDF and attaches the snapshot unchanged as an embedded file. The justification also states the snapshot's sha256. `allows_cloud_processing` stays false: ingest runs locally.
 
-| Metric | Value |
-|---|---|
-| Pages | 56 (status `ready`) |
-| Panels | 255 (4.6 per page) |
-| Bubbles (speech + caption) | 297 |
-| Bubbles below OCR confidence 0.90 (`needs_review`) | 42 (14.1 %) |
-| Mean OCR confidence | 0.929 (min 0.19; 226 of 297 at 0.95 or above) |
-| Review items | 157: 107 `panel_irregular`, 42 `ocr_low_confidence`, 4 `panel_full_page`, 4 `region_outside_panels` |
-| Pages with at least one review item | 51 of 56 (91 %) |
-| Wall time (import accepted → `ready`) | 273 s (about 4.9 s per page) |
+| Metric | First run | After the P4 merge (current) |
+|---|---|---|
+| Pages | 56 (`ready`) | 56 (`ready`) |
+| Panels | 255 | 238 (4.3 per page) |
+| Bubbles (speech + caption) | 297 | 297 |
+| Bubbles below OCR confidence 0.90 (`needs_review`) | 42 (14.1 %) | 42 (14.1 %) |
+| Mean OCR confidence | 0.929 (min 0.19) | 0.929 (min 0.19; 226 of 297 at 0.95 or above) |
+| Review items | 157: 107 `panel_irregular`, 42 `ocr_low_confidence`, 4 `panel_full_page`, 4 `region_outside_panels` | 157: 95 `panel_irregular`, 42 `ocr_low_confidence`, 12 `panel_merged`, 4 `panel_full_page`, 4 `region_outside_panels` |
+| Pages with at least one review item | 51 of 56 (91 %) | 51 of 56 (91 %) |
+| Wall time (import accepted → `ready`) | 273 s | 492 s (stack had just restarted; first run is the steady-state figure, about 4.9 s per page) |
 
-**What works.** Dialogue OCR on clean balloons is close to exact. All six balloons on page 7 are read correctly with confidence of 0.97 or more. Right-to-left panel order is correct on page 7 and on the normal pages checked. Full-page art gives one panel: page 4 (the first half of the spread; fill 0.93, so not flagged) and pages 34–37 (flagged `panel_full_page` for confirmation). Balloons and captions are boxed and ordered right to left within each panel.
+**What works.** Dialogue OCR on clean balloons is close to exact. All six balloons on page 7 are read correctly with confidence of 0.97 or more. Right-to-left panel order is correct on page 7 and on the normal pages checked. Full-page art gives one panel: page 4 (the first half of the spread; fill 0.93, so not flagged), page 5 (the second half, see below) and pages 34–37 (flagged `panel_full_page` for confirmation). Balloons and captions are boxed and ordered right to left within each panel.
+
+**Panel merge (ruling P4).** Candidates whose boxes overlap by more than 10 % of the smaller box are merged into one panel, and every merged panel gets a `panel_merged` review item whatever its fill. A merge of real panels can fill its union box well, so the fill test alone would let it through silently. Effect on this chapter:
+
+- **Page 5** (one painting on black paper) went from 4 fragments to **1 panel** (`panel_merged`).
+- **Page 6** (colour, black paper, 4 panels) went from 5 to **4 panels**: the spurious nested box is gone, and the order is still correct.
+- **Page 20:** the nested box is gone. The diagonal-gutter merge (4 panels in one box) now measures fill 0.88, so `panel_irregular` no longer fires, but `panel_merged` flags it.
+- **Over-merges, all flagged `panel_merged`:**
+  - page 18: about 6 panels with slanted gutters become 1;
+  - page 41: the top panels and a clock strip become one panel;
+  - page 49: the bottom 4 panels become 1.
+  Smaller merges on pages 10, 17, 40, 43 and 47 are flagged the same way.
+- An L-shaped panel's box always contains a panel in its notch, so P4 merges that pair too (flagged).
 
 **Known gaps (sent to review, not fixed here):**
 
-- **Page 5 (second half of the colour spread)** is one painting, but the detector splits it into 4 panels (fill 0.51–0.80, all flagged `panel_irregular`). This breaks the expectation that a spread page gives one panel.
-- **Page 6** (colour, black paper, 4 panels) gives 5 panels: one spurious box sits inside the tall right panel (fill 0.32, flagged). The order of the real panels is correct.
-- **Diagonal gutters merge panels.** On page 20, four diagonal panels become one box (fill 0.74, flagged). Its balloons are still boxed and read.
+- **Slanted and diagonal gutters** still merge panels (pages 18, 20, 41, 49). The classical detector does not separate them; every case is flagged `panel_merged`.
 - **Borderless panels** are missed: on page 23 the explanatory graphic has no frame, so its 4 text regions are `region_outside_panels`.
-- **`panel_irregular` is noisy.** 107 of 251 component panels are flagged, many of them correct. Panels that bleed off the page edge or have white interiors measure a low fill even when they are right: on page 7, three correct panels measure 0.26, 0.66 and 0.82.
+- **`panel_irregular` is noisy.** 95 of 234 component panels are flagged, many of them correct. Panels that bleed off the page edge or have white interiors measure a low fill even when they are right: on page 7, three correct panels measure 0.26, 0.66 and 0.82.
 - **SFX are not a kind.** The detector has no SFX label, so hand-lettered SFX are missed or come out as low-confidence `speech` (page 20). A wall clock was also read as a balloon (low confidence, flagged).
 - **Stylised text reads poorly.** Bold outlined narration over art (page 34), signage (page 6) and a sound effect drawn as a balloon (page 20) come out wrong. All of these fall below 0.90 and are flagged.
 - **Speaker linking** waits for milestone 1.3. `Bubble.speaker` stays null.
 
-**`panel_irregular_fill` calibration (ruling T1): kept at 0.85.** Counts of component panels below each threshold: 0.60 → 49, 0.65 → 63, 0.70 → 71, 0.75 → 84, 0.80 → 94, 0.85 → 107. No threshold separates correct panels from real errors. Correct bleed panels on page 7 measure 0.26, 0.66 and 0.82. The real merge on page 20 measures 0.74, and the false split of page 5 measures 0.51–0.80. Lowering the threshold would hide those real errors, so the evidence does not support a change.
+**`panel_irregular_fill` calibration (ruling T1): kept at 0.85.** Counts of component panels below each threshold (first run → after P4):
+
+| Threshold | 0.60 | 0.65 | 0.70 | 0.75 | 0.80 | 0.85 |
+|---|---|---|---|---|---|---|
+| First run | 49 | 63 | 71 | 84 | 94 | 107 |
+| After P4 | 42 | 54 | 61 | 72 | 82 | 95 |
+
+No threshold separates correct panels from real errors. Correct bleed panels on page 7 measure 0.26, 0.66 and 0.82, while real errors measured 0.51–0.80 before the merge. Lowering the threshold would hide real errors, so the evidence does not support a change.
 
 ## Studied, not used
 
