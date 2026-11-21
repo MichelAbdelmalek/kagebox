@@ -21,7 +21,7 @@ Date: 2026-11-19. Method: one research agent per candidate, two independent skep
 | Watermark | facebook/audioseal @ `3c19eba5` | Use, after conversion | MIT (weights included). All weights are `.pth` pickles, and the library loads them with `weights_only=False` → convert and bypass its loader. |
 | Speech check | openai/whisper-large-v3-turbo safetensors via transformers | Use | MIT. No format exception. Slower on CPU than faster-whisper, whose CTranslate2 `model.bin` is not a pickle but would need an exception. |
 | Score draft | ACE-Step 1.5 | Deferred to the gpu profile | MIT, but its loader hard-codes `trust_remote_code` and ships a small pickle. Per D2 the cloud profile skips the score, so this audit happens when a GPU host exists. |
-| Scene understanding | Together: Qwen/Qwen3.5-9B (Apache-2.0) vs nvidia/NVIDIA-Nemotron-3.5-Super-VL (OpenMDW-1.1) | Bake-off in 1.2 | Both serve JSON-schema output. Qwen is cheaper per output token and plainly licensed. OpenMDW's licence ends if you sue over patents *or copyright*. |
+| Scene understanding | Local, `worker-cpu`: Qwen3-VL-2B-Instruct, Qwen3.5-2B, Qwen3.5-0.8B (all Apache-2.0); the earlier Together candidates (Qwen3.5-9B, Nemotron-3.5-Super-VL) are dropped | Bake-off in 1.2, then pin | Decision (2026-11-21): local VLM. Pages never leave the machine, so rights records need no cloud consent for this stage. Weights must be safetensors, pinned by revision and sha256 like every other model. |
 | Director | Together: openai/gpt-oss-120b (Apache-2.0) | Use | Structured outputs supported. Fallback: deepseek-ai/DeepSeek-V4.1-Flash (MIT). |
 | Sample chapter | Planet Comics #41, "The Lost World" (Fiction House, on sale 1945-12-28); Comic Book Plus dlid 69256 | Use, pending a manual check | US public domain by non-renewal. Before use: check the 1972–73 Catalog of Copyright Entries renewal volumes directly, then download (24 MB zip) and pin its sha256. Public domain in the US only. |
 
@@ -51,3 +51,7 @@ The owner delegated these to engineering and noted the project is **not commerci
 ## Not yet measured
 
 CPU time and memory per model on arm64, and the combined RAM of all models against Docker Desktop's VM limit. Whether CosyVoice2 works on torch ≥ 2.6. Watermark survival after mixing with the score and AAC encoding. These are covered by the 1.1–1.7 milestone tests.
+
+## Decision (2026-11-21): local VLM
+
+Scene understanding runs a small open-weight vision model locally on `worker-cpu` instead of Together. Reasons: no page image leaves the machine (no cloud-processing consent needed for this stage), no per-token cost, and the loader already enforces safetensors, pinned revisions and checksums. Candidates are Qwen3-VL-2B-Instruct, Qwen3.5-2B and Qwen3.5-0.8B (all Apache-2.0), run in bf16 on CPU (no fp32 for the 2B models). `stages.understand` stays `proposed` with `model: null` until the bake-off pins one. Output is validated against the strict reading schema with retries; output that still fails becomes a ReviewItem. Together remains the provider for the director stage only.

@@ -3,18 +3,20 @@
 #
 # Policy (pipeline/providers/weights.py): every file is pinned by commit SHA + sha256 + size;
 # pickle formats are never accepted; .safetensors is the default weights format and any other
-# non-pickle format needs a reviewed format_exception. The stages section lists hosted (Together)
-# models; a stage is used only when its status is approved.
+# non-pickle format needs a reviewed format_exception. The stages section lists the model for each
+# stage: hosted (Together) for director, local for understand (a pinned entry in the models
+# section once chosen). A stage is used only when its status is approved.
 # Audit and decisions: docs/plans/phase-1-model-audit.md. Licenses: LICENSES.md.
 
 version: 1
 stages:
   understand:
-    provider: together
+    provider: local
     model: null
     candidates:
-    - Qwen/Qwen3.5-9B
-    - nvidia/NVIDIA-Nemotron-3.5-Super-VL
+    - qwen3-vl-2b-instruct
+    - qwen3-5-2b
+    - qwen3-5-0-8b
     status: proposed
   director:
     provider: together
