@@ -342,6 +342,31 @@ services:
       - models:/models:ro
     mem_limit: 8g
 
+  # One-shot bake-off of the candidate vision models (milestone 1.2): `make bakeoff-understand`.
+  # Internal network only (the object store and database, no internet), weights read-only.
+  understand-bakeoff:
+    profiles: [bakeoff]
+    <<: *hardening
+    image: kagebox/worker:dev
+    pull_policy: never
+    restart: "no"
+    command: ["python", "-m", "orchestration.understand_bakeoff"]
+    environment:
+      <<: *python-env
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      KAGEBOX_MODELS_DIR: /models
+    secrets: [db_password, s3_access_key, s3_secret_key]
+    volumes:
+      - ../configs:/app/configs:ro
+      - models:/models:ro
+      - ../data/reports:/reports
+    networks: [back]
+    depends_on:
+      postgres: {condition: service_healthy}
+      objects-init: {condition: service_completed_successfully}
+    mem_limit: 10g
+
 networks:
   edge: {}
   front: {internal: true}

@@ -11,7 +11,7 @@ GITLEAKS_IMAGE := zricethezav/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f6
 UV := docker run --rm -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox-uvcache:/root/.cache/uv -w /app -e UV_LINK_MODE=copy $(UV_IMAGE) uv
 PNPM := docker run --rm -v "$(CURDIR)/apps/web":/app -v "$(CURDIR)/docs":/docs:ro -v kagebox-web-nm:/app/node_modules -v kagebox-pnpm:/root/.local/share/pnpm -w /app -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 -e npm_config_store_dir=/root/.local/share/pnpm/store -e CI=true $(NODE_IMAGE) sh -c
 
-.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models test-models worker-image ingest-sample
+.PHONY: bakeoff-understand help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models test-models worker-image ingest-sample
 
 help:
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -99,3 +99,7 @@ check-models: worker-image ## offline: verify hashes, load every approved model,
 convert-models: worker-image ## offline: pickle -> safetensors in a sandbox, then promote pinned outputs
 	$(COMPOSE) --profile fetch run --rm models-convert
 	$(COMPOSE) --profile fetch run --rm models-promote
+
+bakeoff-understand: worker-image ## local vision bake-off (needs Docker memory >= 11 GB; ARGS="--chapter <id> ..." )
+	mkdir -p data/reports
+	$(COMPOSE) --profile bakeoff run --rm understand-bakeoff python -m orchestration.understand_bakeoff $(ARGS)
