@@ -85,6 +85,7 @@ def model_dir(name: str, root: Path = MODELS_DIR, *, raw: dict[str, Any] | None 
 
 
 ALLOWED_DTYPES = (torch.bfloat16, torch.float32)
+ALLOWED_ATTN = (None, "eager")
 
 
 def load(
@@ -93,13 +94,18 @@ def load(
     *,
     weights: bool = True,
     dtype: torch.dtype = torch.float32,
+    attn: str | None = None,
     **extra: Any,
 ) -> Any:
     """`cls.from_pretrained` on the verified local directory. weights=False for processors and
     tokenizers (no tensors). float32 on CPU by default (some configs, Whisper, declare float16);
-    `dtype` opts in to bfloat16 and accepts nothing else. It applies only when weights=True."""
+    `dtype` opts in to bfloat16 and accepts nothing else. It applies only when weights=True.
+    `attn="eager"` opts in to plain-matmul attention (bf16 SDPA on CPU is two orders of
+    magnitude slower); no other value is accepted."""
     if not any(dtype is d for d in ALLOWED_DTYPES):
         raise ValueError(f"load({name}): dtype must be torch.bfloat16 or torch.float32")
+    if attn not in ALLOWED_ATTN:
+        raise ValueError(f"load({name}): attn must be 'eager' or omitted")
     bad = sorted(set(extra) - ALLOWED_EXTRA)
     if bad:
         raise ValueError(f"load({name}): refused kwargs {bad}; allowed: {sorted(ALLOWED_EXTRA)}")
@@ -107,4 +113,6 @@ def load(
     kwargs: dict[str, Any] = {**extra, "local_files_only": True, "trust_remote_code": False}
     if weights:
         kwargs.update(use_safetensors=True, dtype=dtype)
+        if attn is not None:
+            kwargs["attn_implementation"] = attn
     return cls.from_pretrained(str(d), **kwargs)

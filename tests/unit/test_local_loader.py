@@ -94,6 +94,7 @@ RESERVED = [
     "use_safetensors",
     "dtype",
     "torch_dtype",
+    "attn_implementation",
     "subfolder",
     "state_dict",
     "gguf_file",
@@ -179,4 +180,32 @@ def test_load_refuses_other_dtypes(
     seen: dict[str, Any] = {}
     with pytest.raises(ValueError):
         local.load(_fake_cls(seen), "toy", dtype=bad)
+    assert seen == {}
+
+
+def test_load_attn_eager_passed_only_with_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    d = install(tmp_path)
+    monkeypatch.setattr(local, "model_dir", lambda name: d)
+    seen: dict[str, Any] = {}
+    local.load(_fake_cls(seen), "toy", attn="eager")
+    assert seen["attn_implementation"] == "eager"
+    seen.clear()
+    local.load(_fake_cls(seen), "toy")
+    assert "attn_implementation" not in seen  # default leaves the library's choice alone
+    seen.clear()
+    local.load(_fake_cls(seen), "toy", weights=False, attn="eager")
+    assert "attn_implementation" not in seen
+
+
+@pytest.mark.parametrize("bad", ["flash_attention_2", "sdpa", "", None.__class__])
+def test_load_refuses_other_attention_implementations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: Any
+) -> None:
+    d = install(tmp_path)
+    monkeypatch.setattr(local, "model_dir", lambda name: d)
+    seen: dict[str, Any] = {}
+    with pytest.raises(ValueError):
+        local.load(_fake_cls(seen), "toy", attn=bad)
     assert seen == {}

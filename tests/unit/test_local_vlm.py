@@ -204,7 +204,7 @@ def test_model_loaded_once_per_instance() -> None:
         assert prov.vlm_structured(SPEC, "i", "c", [png(8, 8)], Out).answer == "ok"
     assert [c[0] for c in loader.calls] == ["AutoProcessor", "AutoModelForImageTextToText"]
     assert loader.calls[0][1] == {"name": "toy-vlm", "weights": False}
-    assert loader.calls[1][1] == {"name": "toy-vlm", "dtype": torch.bfloat16}
+    assert loader.calls[1][1] == {"name": "toy-vlm", "dtype": torch.bfloat16, "attn": "eager"}
 
 
 def test_dtype_float32_setting_is_passed() -> None:

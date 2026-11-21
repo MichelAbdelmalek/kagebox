@@ -54,7 +54,10 @@ class LocalVlmProvider:
 
             processor = self._loader(AutoProcessor, spec.model, weights=False)
             model = self._loader(
-                AutoModelForImageTextToText, spec.model, dtype=_DTYPES[self._s.dtype]
+                AutoModelForImageTextToText,
+                spec.model,
+                dtype=_DTYPES[self._s.dtype],
+                attn="eager",  # SDPA in bf16 on CPU is ~100x slower
             )
             if not self._threads_set:
                 torch.set_num_threads(self._s.threads)
