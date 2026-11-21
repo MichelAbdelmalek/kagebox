@@ -23,6 +23,7 @@ FORMATS = {
     ".safetensors": "safetensors",
     ".json": "json",
     ".txt": "text",
+    ".jinja": "text",
     ".model": "sentencepiece",
     ".yaml": "yaml",
     ".yml": "yaml",
