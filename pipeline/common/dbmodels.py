@@ -17,8 +17,11 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
     or_,
+    select,
+    update,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 
 def utcnow() -> datetime:
@@ -179,6 +182,37 @@ class ReviewItemRow(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class SceneRow(Base):
+    """One SceneJSON per panel (the understand stage's output); replaced on a re-run."""
+
+    __tablename__ = "scenes"
+    id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    panel_id: Mapped[str] = mapped_column(ForeignKey("panels.id", ondelete="CASCADE"), unique=True)
+    chapter_id: Mapped[str] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), index=True
+    )
+    params_hash: Mapped[str] = mapped_column(String(64))
+    artifact: Mapped[dict[str, Any]]  # Scene JSON
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class StageRunRow(Base):
+    """Per-(chapter, stage) run lock: owner, heartbeat and outcome of the latest run."""
+
+    __tablename__ = "stage_runs"
+    chapter_id: Mapped[str] = mapped_column(
+        ForeignKey("chapters.id", ondelete="CASCADE"), primary_key=True
+    )
+    stage: Mapped[str] = mapped_column(String(16), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16))  # pending | running | done | failed
+    run_id: Mapped[str | None] = mapped_column(String(80), default=None)
+    started_at: Mapped[datetime | None] = mapped_column(default=None)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(default=None)
+    error: Mapped[str | None] = mapped_column(Text, default=None)
+    counts: Mapped[dict[str, Any] | None] = mapped_column(default=None)
+
+
 class JobRow(Base):
     __tablename__ = "jobs"
     id: Mapped[str] = mapped_column(String(80), primary_key=True)
@@ -187,6 +221,8 @@ class JobRow(Base):
     )
     flow_run_id: Mapped[str | None] = mapped_column(String(80), default=None)
     status: Mapped[str] = mapped_column(String(16))
+    # The pipeline stage the run belongs to (ingest, understand, ...).
+    stage: Mapped[str] = mapped_column(String(16), default="ingest", server_default="ingest")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow, onupdate=utcnow)
 
@@ -210,3 +246,46 @@ def ingest_alive(row: ChapterRow, stale_before: datetime) -> bool:
     """Python twin of ``not ingest_takeover_allowed``: 'ingesting' with a recent sign of life."""
     last = row.ingest_heartbeat_at or row.ingest_started_at
     return row.status == "ingesting" and last is not None and aware(last) >= stale_before
+
+
+def stage_takeover_allowed(stale_before: datetime) -> ColumnElement[bool]:
+    """SQL: the stage run is not held by a live run (not 'running', or no recent heartbeat)."""
+    last = func.coalesce(StageRunRow.heartbeat_at, StageRunRow.started_at)
+    return or_(StageRunRow.status != "running", last.is_(None), last < stale_before)
+
+
+def stage_alive(row: StageRunRow, stale_before: datetime) -> bool:
+    """Python twin of ``not stage_takeover_allowed``: 'running' with a recent sign of life."""
+    last = row.heartbeat_at or row.started_at
+    return row.status == "running" and last is not None and aware(last) >= stale_before
+
+
+def claim_stage(session: Session, chapter_id: str, stage: str, run_id: str, now: datetime) -> bool:
+    """Take the (chapter, stage) lock for ``run_id``; True only if this run now owns it.
+
+    Inserts a 'pending' row when none exists (a concurrent insert losing the race is ignored),
+    then one conditional UPDATE to 'running' guarded by ``stage_takeover_allowed``. The caller
+    commits. A live run elsewhere (same rule and window as the ingest lock) refuses the claim.
+    """
+    key = (StageRunRow.chapter_id == chapter_id) & (StageRunRow.stage == stage)
+    if session.scalar(select(StageRunRow.stage).where(key)) is None:
+        try:
+            with session.begin_nested():
+                session.add(StageRunRow(chapter_id=chapter_id, stage=stage, status="pending"))
+        except IntegrityError:
+            pass  # another run inserted it first; the guarded UPDATE decides
+    result = session.execute(
+        update(StageRunRow)
+        .where(key, stage_takeover_allowed(ingest_stale_before(now)))
+        .values(
+            status="running",
+            run_id=run_id,
+            started_at=now,
+            heartbeat_at=now,
+            finished_at=None,
+            error=None,
+            counts=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    return bool(getattr(result, "rowcount", 0) == 1)

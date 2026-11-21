@@ -903,7 +903,8 @@ def test_job_status_readable_by_project_members_only(env: Env) -> None:
     out = env.c.get(f"/api/jobs/{job_id}")
     assert out.status_code == 200, out.text
     body = out.json()
-    assert set(body) == {"id", "chapter_id", "status", "created_at", "updated_at"}
+    assert set(body) == {"id", "chapter_id", "status", "stage", "created_at", "updated_at"}
+    assert body["stage"] == "ingest"
     assert (body["id"], body["chapter_id"], body["status"]) == (job_id, cid, "submitted")
     login(env.c, "vi")  # viewer of the project
     assert env.c.get(f"/api/jobs/{job_id}").json()["status"] == "submitted"
