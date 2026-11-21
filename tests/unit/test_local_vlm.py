@@ -222,7 +222,39 @@ def test_load_failure_raises_model_load_failed_with_safe_message() -> None:
         prov.vlm_structured(SPEC, "i", "c", [png(8, 8)], Out)
     assert str(ei.value) == "the vision model could not be loaded"
     assert SENTINEL_IN not in repr(ei.value) and ei.value.__cause__ is None
-    assert ei.value.__suppress_context__
+    assert ei.value.__context__ is None
+
+
+def test_load_failure_log_has_only_the_class_name(caplog: pytest.LogCaptureFixture) -> None:
+    def boom(cls: Any, name: str, **kw: Any) -> Any:
+        raise OSError(f"/secret/path {SENTINEL_IN}")
+
+    prov = LocalVlmProvider(settings(), loader=boom)
+    with caplog.at_level(logging.DEBUG), pytest.raises(ModelLoadFailed):
+        prov.vlm_structured(SPEC, "i", "c", [png(8, 8)], Out)
+    assert "OSError" in caplog.text
+    assert SENTINEL_IN not in caplog.text and "/secret" not in caplog.text
+
+
+def test_huge_canvas_png_refused_before_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    prov, *_ = make()
+    huge = png(20_000, 20_000)  # 400 MP header, tiny file
+    assert len(huge) < 5_000_000
+    loads: list[int] = []
+    orig = Image.Image.load
+    monkeypatch.setattr(Image.Image, "load", lambda self: loads.append(1) or orig(self))
+    with pytest.raises(ValueError) as ei:
+        prov.vlm_structured(SPEC, "i", "c", [huge], Out)
+    assert loads == []
+    assert ei.value.__context__ is None and ei.value.__cause__ is None
+
+
+def test_non_png_image_refused() -> None:
+    prov, *_ = make()
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(buf, format="JPEG")
+    with pytest.raises(ValueError):
+        prov.vlm_structured(SPEC, "i", "c", [buf.getvalue()], Out)
 
 
 def test_ocr_text_is_fenced_and_delimiters_neutralised() -> None:
@@ -316,6 +348,7 @@ def test_undecodable_image_is_a_clean_failure() -> None:
     with pytest.raises(ValueError) as ei:
         prov.vlm_structured(SPEC, "i", "c", [b"not an image"], Out)
     assert "not an image" not in str(ei.value)
+    assert ei.value.__context__ is None
 
 
 def test_no_prompt_or_output_in_logs_or_exceptions(caplog: pytest.LogCaptureFixture) -> None:

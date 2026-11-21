@@ -6,7 +6,6 @@ and neither prompts nor model output are ever logged or put in an exception.
 
 from __future__ import annotations
 
-import io
 import logging
 import math
 from collections.abc import Callable
@@ -15,6 +14,7 @@ from typing import Any
 import torch
 from PIL import Image
 
+from pipeline.common.uploads import UploadRejected, open_image_checked
 from pipeline.providers import local
 from pipeline.providers.base import M, ModelLoadFailed, ModelSpec, fence_untrusted
 from pipeline.providers.structured import structured_from_text
@@ -25,6 +25,8 @@ __all__ = ["REPAIR_LINE", "LocalVlmProvider"]
 log = logging.getLogger(__name__)
 
 REPAIR_LINE = "Reply with one JSON object only, matching the example."
+
+_CROP_FORMATS = ("PNG",)  # what ingest writes for panel crops
 
 _DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 
@@ -46,6 +48,7 @@ class LocalVlmProvider:
         cached = self._loaded.get(spec.model)
         if cached is not None:
             return cached
+        failure: str | None = None
         try:
             from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -57,20 +60,27 @@ class LocalVlmProvider:
                 torch.set_num_threads(self._s.threads)
                 self._threads_set = True
         except Exception as e:  # incl. MemoryError, UnsafeWeights, ModelNotApproved
-            log.error("model load failed: %s", type(e).__name__)
-            raise ModelLoadFailed() from None
+            failure = type(e).__name__
+        if failure is not None:
+            log.error("model load failed: %s", failure)
+            raise ModelLoadFailed()
         self._loaded[spec.model] = (processor, model)
         return processor, model
 
     # -- images -------------------------------------------------------------------------
 
     def _prepare_image(self, data: bytes) -> Image.Image:
+        img: Image.Image | None = None
+        failure: str | None = None
         try:
-            with Image.open(io.BytesIO(data)) as im:
-                im.load()
+            with open_image_checked(data, _CROP_FORMATS) as im:
                 img = im.convert("RGB")
+        except UploadRejected as e:
+            failure = str(e)  # fixed messages only
         except Exception as e:
-            raise ValueError(f"image could not be decoded ({type(e).__name__})") from None
+            failure = type(e).__name__
+        if img is None:
+            raise ValueError(f"image refused: {failure}")
         w, h = img.size
         if w * h > self._s.max_pixels:
             scale = math.sqrt(self._s.max_pixels / (w * h))

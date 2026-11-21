@@ -70,6 +70,11 @@ def _open_checked(data: bytes, formats: tuple[str, ...]) -> Image.Image:
     return im
 
 
+def open_image_checked(data: bytes, formats: tuple[str, ...]) -> Image.Image:
+    """Public form of the strict guard: allowed formats only, header size refused before decode."""
+    return _open_checked(data, formats)
+
+
 def decode_image(data: bytes, allowed: dict[str, str], max_bytes: int) -> Image.Image:
     """Sniff, size-check and decode once; returns the decoded image (metadata is not kept)."""
     sniffed = sniff(data, allowed, max_bytes)
