@@ -84,14 +84,27 @@ def model_dir(name: str, root: Path = MODELS_DIR, *, raw: dict[str, Any] | None 
     raise ModelNotApproved(f"{name}: not in models.yaml")
 
 
-def load(cls: Any, name: str, *, weights: bool = True, **extra: Any) -> Any:
+ALLOWED_DTYPES = (torch.bfloat16, torch.float32)
+
+
+def load(
+    cls: Any,
+    name: str,
+    *,
+    weights: bool = True,
+    dtype: torch.dtype = torch.float32,
+    **extra: Any,
+) -> Any:
     """`cls.from_pretrained` on the verified local directory. weights=False for processors and
-    tokenizers (no tensors). float32 on CPU: some configs (Whisper) declare float16."""
+    tokenizers (no tensors). float32 on CPU by default (some configs, Whisper, declare float16);
+    `dtype` opts in to bfloat16 and accepts nothing else. It applies only when weights=True."""
+    if not any(dtype is d for d in ALLOWED_DTYPES):
+        raise ValueError(f"load({name}): dtype must be torch.bfloat16 or torch.float32")
     bad = sorted(set(extra) - ALLOWED_EXTRA)
     if bad:
         raise ValueError(f"load({name}): refused kwargs {bad}; allowed: {sorted(ALLOWED_EXTRA)}")
     d = model_dir(name)
     kwargs: dict[str, Any] = {**extra, "local_files_only": True, "trust_remote_code": False}
     if weights:
-        kwargs.update(use_safetensors=True, dtype=torch.float32)
+        kwargs.update(use_safetensors=True, dtype=dtype)
     return cls.from_pretrained(str(d), **kwargs)

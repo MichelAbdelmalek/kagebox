@@ -148,3 +148,35 @@ def test_symlink_refused(tmp_path: Path) -> None:
     (d / "config.json").symlink_to(other / "config.json")  # pinned name, but a symlink
     with pytest.raises(UnsafeWeights):
         local.model_dir("toy", tmp_path, raw=raw_cfg())
+
+
+def _fake_cls(seen: dict[str, Any]) -> Any:
+    class Fake:
+        @classmethod
+        def from_pretrained(cls, path: str, **kw: Any) -> str:
+            seen.update(kw)
+            return "loaded"
+
+    return Fake
+
+
+def test_load_dtype_bfloat16_passed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    d = install(tmp_path)
+    monkeypatch.setattr(local, "model_dir", lambda name: d)
+    seen: dict[str, Any] = {}
+    local.load(_fake_cls(seen), "toy", dtype=torch.bfloat16)
+    assert seen["dtype"] is torch.bfloat16
+    assert seen["trust_remote_code"] is False and seen["local_files_only"] is True
+    assert seen["use_safetensors"] is True
+
+
+@pytest.mark.parametrize("bad", [torch.float16, torch.int8, "bfloat16"])
+def test_load_refuses_other_dtypes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: Any
+) -> None:
+    d = install(tmp_path)
+    monkeypatch.setattr(local, "model_dir", lambda name: d)
+    seen: dict[str, Any] = {}
+    with pytest.raises(ValueError):
+        local.load(_fake_cls(seen), "toy", dtype=bad)
+    assert seen == {}

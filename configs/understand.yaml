@@ -1,0 +1,11 @@
+# Scene understanding (milestone 1.2): local vision model on worker-cpu. Validated by
+# pipeline/understand/settings.py. max_attempts * max_time_s must stay under 540 s (the stale
+# limit minus a minute), so a slow panel never looks dead.
+prompt_version: v1
+threads: 6
+dtype: bfloat16
+max_pixels: 602112 # 768 * 28 * 28
+max_new_tokens: 512
+max_attempts: 3
+max_time_s: 150 # per generate call
+max_minutes_per_chapter: 420

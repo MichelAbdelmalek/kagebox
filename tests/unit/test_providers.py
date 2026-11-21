@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -96,3 +97,52 @@ def test_trust_remote_code_denied_by_default(tmp_path: Path) -> None:
     assert trust_remote_code("a/b", "r1", tmp_path)
     with pytest.raises(UnsafeWeights):
         trust_remote_code("a/b", "r2", tmp_path)
+
+
+def test_provider_for_dispatch_and_unknown_refused() -> None:
+    from pipeline.providers.base import provider_for
+
+    local_spec = ModelSpec("understand", "local", "m", "r", "Apache-2.0", "https://x")
+    marks: list[str] = []
+
+    def mk(tag: str) -> Any:
+        def factory() -> Any:
+            marks.append(tag)
+            return tag
+
+        return factory
+
+    assert provider_for(local_spec, local=mk("L"), together=mk("T")) == "L"
+    assert provider_for(SPEC, local=mk("L"), together=mk("T")) == "T"
+    assert marks == ["L", "T"]  # only the matching factory runs
+    odd = ModelSpec("x", "openai", "m", "r", "MIT", "https://x")
+    with pytest.raises(ValueError):
+        provider_for(odd, local=mk("L"), together=mk("T"))
+    assert marks == ["L", "T"]
+
+
+def test_replay_hit_and_miss(tmp_path: Path) -> None:
+    import hashlib
+
+    from pipeline.providers.replay import ReplayMiss, ReplayProvider, record_case
+
+    sha = lambda b: hashlib.sha256(b).hexdigest()  # noqa: E731
+    img = b"\x89PNG-fake-image"
+    record_case(tmp_path, "case-1", sha(b"rules"), sha(img), ["not json", '{"answer": "hi"}'])
+    data = json.loads((tmp_path / "case-1.json").read_text())
+    assert set(data) == {"case", "prompt_sha256", "image_sha256", "params_hash", "outputs"}
+    rp = ReplayProvider(tmp_path)
+    assert rp.vlm_structured(SPEC, "rules", "ocr text", [img], Out).answer == "hi"
+    with pytest.raises(ReplayMiss):
+        rp.vlm_structured(SPEC, "other rules", "ocr text", [img], Out)
+    with pytest.raises(ReplayMiss):
+        rp.vlm_structured(SPEC, "rules", "ocr text", [b"other"], Out)
+    with pytest.raises(ReplayMiss):
+        rp.llm_structured(SPEC, "rules", "ocr text", Out)
+    for bad in ["../evil", "a/b", "", "x" * 100]:
+        with pytest.raises(ValueError):
+            record_case(tmp_path, bad, "a", "b", ["{}"])
+    # Exhausted fixtures fail like a model that never produced valid output.
+    record_case(tmp_path, "case-2", sha(b"r2"), sha(img), ["nope"])
+    with pytest.raises(StructuredOutputFailed):
+        ReplayProvider(tmp_path).vlm_structured(SPEC, "r2", "c", [img], Out)
