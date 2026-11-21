@@ -15,10 +15,10 @@ Built on Phase 0: the schemas, rights gate, provider interface, upload validatio
 | 1.2 | **Understand** | SceneJSON per panel from a local vision model on `worker-cpu` (bf16 on CPU), with schema-validated output and retries. Every field cites its panel or stays null. Bad output after retries becomes a ReviewItem. No page leaves the machine. | Recorded-fixture contract tests; prompt-injection fixture in OCR text does not change output fields. |
 | 1.3 | **Series bible** | Character crops → SigLIP embeddings (CPU) → HDBSCAN clusters → Qdrant collections (characters, locations, dialogue, voice profiles). Approve / reject crops, merge / split clusters. `get_context(shot)` returns exact refs. Speaker linking (bubble → character, cited by panel) lands here, from milestone 1.1. | Clustering on fixture crops; `get_context` never returns refs from another project. |
 | 1.4 | **Director** | Together LLM turns panels into Shots (camera move, duration, transition). A validator rejects any shot or line not traceable to panels in the scene. Source panels are keyframes. | Property test: every Shot has ≥ 1 source panel from its scene; untraceable output → review. |
-| 1.5 | **2.5D render** | SAM 2.1 masks seeded from character boxes; depth order from Depth Anything V2 Small; LaMa inpaints behind characters. Numpy multiplane compositor + FFmpeg for pan / tilt / zoom / parallax. Palette extracted into StyleProfile. | Deterministic render of a fixture shot (frame hash); FFmpeg always called with argument lists, never a shell. |
-| 1.6 | **Voices, casting, score** | Voice / Casting API with per-language versions, undo and audit log. Consent upload encrypted at the application level (AES-GCM, key from a Docker secret) in the `consent` bucket, every read logged. TTS per VoiceLine with the cast voice and SceneJSON emotion (CosyVoice2; Chatterbox fallback). Watermark always applied (AudioSeal) and verified. Sample previews cached, served by signed links. `recast_flow` re-voices one character's lines only. Score draft from a mood cue sheet (see D2). | Consent-locked voice refused by API *and* worker; recast touches only that character's lines; watermark detected after mux. |
+| 1.5 | **2.5D render** | SAM 2.1 masks seeded from character boxes; depth order from Depth Anything V2 Small; LaMa inpaints behind characters. Numpy multiplane compositor + FFmpeg for pan / tilt / zoom / parallax. Palette extracted into StyleProfile. Memory rules I2 (below). | Deterministic render of a fixture shot (frame hash); FFmpeg always called with argument lists, never a shell; I2 peak-memory test. |
+| 1.6 | **Voices, casting, score** | Voice / Casting API with per-language versions, undo and audit log. Consent upload encrypted at the application level (AES-GCM, key from a Docker secret) in the `consent` bucket, every read logged. TTS per VoiceLine with the cast voice and SceneJSON emotion (CosyVoice2; Chatterbox fallback). Watermark always applied (AudioSeal) and verified. Sample previews cached, served by signed links. `recast_flow` re-voices one character's lines only. Score draft from a mood cue sheet (see D2). Any non-generated audio needs an I3 acquisition record. | Consent-locked voice refused by API *and* worker; recast touches only that character's lines; watermark detected after mux; I3 audio without an acquisition record or with a disallowed licence is refused. |
 | 1.7 | **Validate** | Whisper round-trip WER per line (faster-whisper, CPU int8), identity similarity vs bible per character threshold, traceability, watermark presence → ValidationReport → ReviewItems. | A check that cannot run counts as failed, never passed (already enforced by the schema). |
-| 1.8 | **Assemble** | FFmpeg mux to MP4 (video, dialogue, score) plus a provenance bundle listing every model, revision and license used. OTIO export stays in Phase 4. | Output plays; bundle covers every artifact in the MP4. |
+| 1.8 | **Assemble** | FFmpeg mux to MP4 (video, dialogue, score) plus a provenance bundle listing every model, revision and license used, and every I3 attribution. OTIO export stays in Phase 4. | Output plays; bundle covers every artifact in the MP4, including every CC-BY attribution. |
 | 1.9 | **UI** | Projects with live pipeline status; **Panel reader** (02); **Series bible** (03); **Voice casting** (05); a minimal Review queue list (no design file exists). Noto Sans JP/KR self-hosted for CJK text. | Vitest per component; Playwright + axe (WCAG 2.2 AA), keyboard-only paths, 375 px viewport. |
 | 1.10 | **End-to-end** | Sample chapter run with Together mocked by recorded fixtures in CI, plus an opt-in live run. Source and public-domain justification in `docs/sample-chapter-source.md`. | `make e2e` green. |
 
@@ -69,3 +69,36 @@ Accepted for milestone 1.1 (single operator, local stack); to be fixed before an
 
 - **PDF render child isolation.** Untrusted PDFs are rendered in a child process of `worker-cpu` (`pipeline/ingest/sources.py`) limited by rlimits, a scrubbed environment and a new session only. It runs as the same uid in the same container, so a pdfium memory-safety exploit could read every secret mounted into `worker-cpu` (the database password and the object-store keys) and reach Postgres, MinIO and the internet through the `back` and `egress` networks. Milestone 1.1 mounts only the secrets worker code reads (the media signing key, session secret and Together key were removed; `tests/unit/test_compose.py` enforces it). Follow-up: render PDFs in a dedicated container (or `bwrap`/`nsjail` with `--unshare-net`) on an internal-only network, under its own uid, with no secrets and a minimal read-only bind set, and consider moving ingest off the egress-attached worker. Cost if left: a pdfium RCE could read the DB password and object-store keys.
 - **Cancelling an ingest run.** `chapter-ingest` has a 3 h `timeout_seconds` and runs heartbeat the chapter, so a hung or dead run is ended or taken over; there is still no product route to cancel a queued or running ingest (the Prefect UI is not published). Follow-up: an owner-only `POST /chapters/{id}/ingest/cancel` that sets the owning flow run to Cancelling.
+
+## Ideas adopted from stickman-video-director (reviewed 2026-11-21)
+
+Read-only review of the public repo `kaomei/stickman-video-director`; nothing from it is run, installed or copied.
+
+**I1 — Trial before spend.**
+- *Take:* staged approval with a bounded, cheap trial and a projected total before any long or paid run.
+- *Why:* the local `understand` run takes hours on CPU, and Phase 2 generative shots cost GPU time or Together credits; a wrong setting should cost minutes, not a night.
+- *Lands:* milestone 1.2 (Task 6 `limit_panels`, Task 9 confirmation in `make understand-sample`) and Phase 2 (carry-over below).
+- *Acceptance:* a trial on the first N panels records measured seconds/panel and a projected total in the stage run, never marks the stage `done`, and the full run starts only after an explicit confirmation.
+- *Not adopted:* browser automation of a logged-in account, closed video services as defaults.
+- *Source:* `skills/directing-stickman-videos/references/mode-execution-boundaries.md#a-unified-workflow` (storyboard, prompts, representative low-resolution test, production settings with a total budget cap, continuous production); CHANGELOG 2026-11-17.
+
+**I2 — Memory discipline for local rendering.**
+- *Take:* load artwork only for the active shot; write generated audio in chunks; hash large media in chunks; stream media checks instead of reading whole files.
+- *Why:* `worker-cpu` has 8 GB (`mem_limit: 8g`) and SAM, LaMa and depth models already compete for it.
+- *Lands:* milestone 1.5 (binding constraints), and every place we hash large media (ingest, render, audio, assembly).
+- *Acceptance:* a 1.5 test renders a fixture shot of at least 60 s in a child process and asserts peak RSS stays under a configured ceiling below 8 GB and does not grow with shot length; a test hashes a file larger than the read chunk and checks the result equals the whole-file sha256 while reading at most one chunk at a time.
+- *Source:* CHANGELOG entry 2026-11-18, "Code Engine rendering performance".
+
+**I3 — Per-asset provenance for non-generated audio.**
+- *Take:* every sound we did not generate carries an acquisition record: source URL, licence text snapshot with its sha256, author, attribution string, acquisition date. Licence allowlist: CC0 / public domain preferred; CC-BY only with its attribution carried into the provenance bundle; anything else refused.
+- *Why:* rule 5 provenance already covers models; this extends it to audio assets. The reviewed library shows the attribution burden (about 221 CC-BY credits vs 47 CC0), so CC0 is the default choice.
+- *Lands:* milestones 1.6 (voices, score) and 1.8 (assembly bundle lists every attribution); Phase 3 foley.
+- *Acceptance:* importing an asset with no acquisition record, a missing or mismatched licence-snapshot hash, or a licence outside the allowlist is refused by the server; an assembled MP4 using a CC-BY asset has its attribution string in the bundle.
+- *Not adopted:* prompt-only enforcement (the server enforces the allowlist).
+- *Source:* `skills/directing-stickman-videos/assets/b-audio-library/` (`CREDITS.md`, `catalog.json`, `evidence/<source>/acquisition.json` with saved source pages), `references/music-sourcing-and-license.md`, `references/b-audio-library.md`.
+
+**Not adopted at all:** generating new art (designs are the spec; source panels are keyframes), closed video services as defaults, browser automation of a logged-in account, prompt-only enforcement of rules.
+
+### Phase 2 carry-over: trial-before-spend gate
+
+Before a batch of generative shots: render one to three representative shots at the lowest resolution, show them with their style and identity scores, then confirm final resolution and a maximum total budget (GPU minutes or Together credits, retries included, trial spend stated). The run stops before exceeding the cap, and a scope or budget change needs a new confirmation. Enforced server-side, recorded in the stage run.

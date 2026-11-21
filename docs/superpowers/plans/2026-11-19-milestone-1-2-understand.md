@@ -193,9 +193,10 @@
   - `panel_ocr_text(bubbles: list[Bubble]) -> str` (bubble texts in reading order, newline-joined).
   - `scene_params(settings, spec, prompt_sha) -> dict` and `input_hashes(crop: bytes, ocr_text: str) -> list[str]`.
   - `UnderstandDeps(engine, store, settings, provider_factory: Callable[[ModelSpec], ModelProvider])`, `build_deps()`, `build_engine()`.
-  - `UnderstandSummary(panels, scenes, cached, failed, flagged)`.
+  - `UnderstandSummary(panels, scenes, cached, failed, flagged, trial: bool, seconds_per_panel: float | None, projected_total_s: float | None)`.
+  - `MAX_TRIAL_PANELS = 50`; `project_total_s(load_s: float, seconds_per_panel: float, uncached_panels: int) -> float`.
   - `UnderstandAlreadyRunning(RuntimeError)` (user-safe message, like `IngestAlreadyRunning`).
-  - `run_understand(chapter_id, deps, run_id=None) -> UnderstandSummary`; `understand_flow(chapter_id: str)` (`FLOW_NAME = "chapter-understand"`, hooks `on_cancellation` / `on_crashed` / `on_failure`, `timeout_seconds=FLOW_TIMEOUT_S`); `understand_stage(chapter_id) -> StageResult`.
+  - `run_understand(chapter_id, deps, run_id=None, limit_panels: int | None = None) -> UnderstandSummary`; `understand_flow(chapter_id: str, limit_panels: int | None = None)` (`FLOW_NAME = "chapter-understand"`, hooks `on_cancellation` / `on_crashed` / `on_failure`, `timeout_seconds=FLOW_TIMEOUT_S`); `understand_stage(chapter_id) -> StageResult`.
   - User-safe errors: `"understand failed"`, `"understand was interrupted"`, `"understand timed out"`, `"understand could not start"`, `"understand already running"`, `"the vision model could not be loaded"`, `"chapter is not ready"`, `"the chapter changed during understanding"`, `"understand stopped at its time budget; run it again to continue"`.
 
 Behaviour:
@@ -205,7 +206,8 @@ Behaviour:
 4. Per panel, call `vlm_structured(spec, prompt, ocr_text, [crop], PanelReading)`, then `to_scene`. Write in **one transaction per panel**: lock the stage row and check this run still owns it; re-check rights; check the panel still exists and the chapter is `ready` (otherwise stop with "the chapter changed during understanding"); upsert the `SceneRow`; delete that panel's understand review items; add the new ones (`scene_unsupported_quote` per issue, with the field name in the reason); heartbeat.
 5. `StructuredOutputFailed`: no scene is stored; add a `scene_failed` review item (artifact_id = panel id) in its own transaction; continue.
 6. Stop with the budget message once `max_minutes_per_chapter` has passed (checked between panels).
-7. End `done` with `counts`, or `failed` with a user-safe error. Hooks write only while this run owns the stage row (cancel and crash set "interrupted"; failure fills gaps; a run that never claimed the stage fails a `pending` row only when its latest `understand` job is this run). Exceptions mirror `run_ingest`: `ValidationError` → `safe_errors`; `ScopeCancelled` → timed out; `BaseException` → interrupted.
+7. **Trial (`limit_panels` set, 1..`MAX_TRIAL_PANELS`, else refused before claiming):** process only the first `limit_panels` panels in order; measure seconds per *model-called* panel (model load timed separately, cached panels excluded). The stage ends `pending`, never `done`, with `finished_at` set and `counts = {trial: true, limit_panels, measured_panels, load_s, seconds_per_panel, uncached_remaining, projected_total_s, over_budget}`, where `projected_total_s = project_total_s(load_s, seconds_per_panel, uncached_remaining)` and `over_budget` = projection above `max_minutes_per_chapter`. Trial scenes are normal cached scenes; the full run reuses them.
+8. End `done` with `counts`, or `failed` with a user-safe error. Hooks write only while this run owns the stage row (cancel and crash set "interrupted"; failure fills gaps; a run that never claimed the stage fails a `pending` row only when its latest `understand` job is this run). Exceptions mirror `run_ingest`: `ValidationError` → `safe_errors`; `ScopeCancelled` → timed out; `BaseException` → interrupted.
 
 - [ ] Step 1: Failing tests:
   - `test_scenes_created_for_every_panel_with_provenance` (provider `local`, revision, licence, params hash, two input hashes)
@@ -219,6 +221,10 @@ Behaviour:
   - `test_prompt_or_settings_change_invalidates_cache`
   - `test_rerun_replaces_panel_review_items_without_duplicates`
   - `test_budget_stops_with_resumable_message`
+  - `test_trial_limits_panels_records_projection_and_never_done` (stage `pending`, `counts.trial` true, projection = load + s/panel × uncached remaining)
+  - `test_trial_limit_out_of_range_refused_before_claim`
+  - `test_full_run_after_trial_reuses_trial_scenes`
+  - `test_project_total_s`
   - `test_live_run_refused_stale_taken_over_and_old_owner_writes_nothing`
   - `test_hooks_only_touch_owned_stage` (cancel, crash, unstarted)
   - `test_timed_out_run_marks_failed` (a real short timeout, as in the ingest test)
@@ -235,8 +241,8 @@ Behaviour:
 - Test: `tests/unit/test_chapters_api.py` (extend)
 
 **Interfaces — Produces:**
-- `start_deployment(deployment: str, parameters: dict[str, str], api_url: str, *, timeout=TIMEOUT) -> str`; `UNDERSTAND_DEPLOYMENT = "chapter-understand/chapter-understand"`.
-- `POST /api/chapters/{cid}/understand`: editor role; chapter `ready` (else 409 "chapter is not ready"); rights via `_require_rights`; a conditional upsert of the stage row to `pending`, guarded by `stage_takeover_allowed` (a live run gives 409 "understanding is already running"); then start the deployment and add `JobRow(stage="understand")`. Returns 202 `{job_id}`. If Prefect fails: job `failed`, stage `failed` with the start-failed message, 502. Audited (`understand.start`).
+- `start_deployment(deployment: str, parameters: dict[str, str | int], api_url: str, *, timeout=TIMEOUT) -> str`; `UNDERSTAND_DEPLOYMENT = "chapter-understand/chapter-understand"`.
+- `POST /api/chapters/{cid}/understand`: editor role; chapter `ready` (else 409 "chapter is not ready"); rights via `_require_rights`; a conditional upsert of the stage row to `pending`, guarded by `stage_takeover_allowed` (a live run gives 409 "understanding is already running"); then start the deployment and add `JobRow(stage="understand")`. Optional body `{"limit_panels": 1..MAX_TRIAL_PANELS}` (422 otherwise) is passed as a flow parameter for a trial; the audit entry records it. Returns 202 `{job_id}`. If Prefect fails: job `failed`, stage `failed` with the start-failed message, 502. Audited (`understand.start`).
 - `POST /api/chapters/{cid}/upload` and `/import`: also 409 "chapter is being understood" while the understand stage is alive.
 - `GET /api/chapters/{cid}/stages` (viewer): `[{stage, status, started_at, heartbeat_at, finished_at, error, counts, interrupted}]`, where `interrupted` = `running` but not `stage_alive`.
 - `GET /api/pages/{page_id}/panels`: each `PanelOut` gains `scene: SceneOut | None` (setting, action, shot_hint, time_of_day, weather as `{value, panel_ids}`; figures; `unknown_fields`).
@@ -249,6 +255,7 @@ Behaviour:
   - `test_stages_endpoint_member_only` (non-members get 404)
   - `test_panels_include_scene_and_unknown_fields`
   - `test_start_deployment_posts_parameters` (respx; `start_ingest` behaviour unchanged)
+  - `test_understand_limit_panels_validated_and_passed_to_prefect`
   - the existing route-table auth test still passes
 - [ ] Step 2: Fail. Step 3: Implement. Step 4: `make test-py`, `make lint` pass.
 - [ ] Step 5: Commit `feat(api): start understanding and read scenes`.
@@ -276,15 +283,16 @@ Behaviour:
 
 **Files:**
 - Create: `orchestration/understand_report.py`, `tests/unit/test_understand_report.py`, `tests/e2e/understand_sample.sh`
-- Modify: `Makefile` (`understand-sample`, reusing the chapter from `ingest-sample` and its TLS and secret handling), `docs/sample-chapter-source.md` ("Understand results"), `docs/plans/phase-1.md` (1.2 status)
+- Modify: `Makefile` (`understand-sample`, reusing the chapter from `ingest-sample` and its TLS and secret handling; trial gate below), `docs/sample-chapter-source.md` ("Understand results"), `docs/plans/phase-1.md` (1.2 status)
 
 **Interfaces — Produces:** `build_report(engine, store, chapter_id, out: Path) -> dict`, run offline. It writes `report.json` (per-field null rates, figures per panel, review counts by kind, cached and failed counts, wall time from the stage row) and a contact sheet with each panel crop beside its scene fields. Field text goes to `report.json` only, because the worker has no Japanese font.
 
 - [ ] Step 1: Failing test `test_report_counts_null_rates_and_review_kinds`; implement; `make test-py` passes. Commit `feat(understand): run report`.
-- [ ] Step 2: `make up-cloud`, then `make understand-sample` on the ready chapter (238 panels). Expect stage `done`, about 238 scenes, and review items by kind.
+- [ ] Step 2: **Trial gate.** `make up-cloud`, then `make understand-sample` (default `TRIAL_PANELS=10`): it starts a trial (`limit_panels`), waits, and prints measured seconds/panel, model load time, projected total and `over_budget` from `GET /stages`, then stops. Without `CONFIRM=yes` it never starts the full run. **STOP: report the projection to the owner.**
+- [ ] Step 2b: After the owner confirms, `make understand-sample CONFIRM=yes` runs the full chapter (238 panels; the trial panels come from cache). Expect stage `done`, about 238 scenes, and review items by kind. Record trial projection vs actual wall time.
 - [ ] Step 3: Read the contact sheet for PDF pages 5, 7, 20 and 34; judge setting, action, shot hint and figures. Record false claims as findings, not code changes, unless a Review Focus expectation breaks.
 - [ ] Step 4: Run again: fully cached (0 model loads, 0 model calls).
-- [ ] Step 5: Record null rates, review counts, seconds per panel and wall time in `docs/sample-chapter-source.md`.
+- [ ] Step 5: Record null rates, review counts, seconds per panel, wall time and the trial projection error in `docs/sample-chapter-source.md`.
 - [ ] Step 6: `make test`, `make lint`, `make scan`, `make scan-images`, `make check-models` all clean. Commit `test(understand): real-data run on sample chapter`.
 
 ---
@@ -303,7 +311,7 @@ Starts after Task 4's 2B bake-off has run. Does not block Tasks 5–9. Nothing i
 - **Models:** Opus 5.5 plans, runs the security-sensitive task reviews, the Task 10 vetting and the final whole-milestone review. Sonnet 5.5 implements every task, and fix rounds resume the same implementer. Set `model` explicitly on every dispatched agent. An implementer still stuck after three fix rounds is escalated to Opus.
 - **Review depth: Lean.** **Tasks 2, 6, 7 and the Task 10 vetting** get an Opus task reviewer (security-sensitive). All other tasks get one Sonnet reviewer. There are no skeptic panels, parallel security lenses or separate Postgres verifier unless a review raises a real doubt. Scoped re-reviews of Important fixes run on Sonnet. At the end, one Opus review of the whole milestone, plus one fix wave if needed.
 - **Order:** 1 → 2 → 3 → 4 (STOP) → 5 → 6 → 7 → 8 → 9. Tasks 5–7 need only Tasks 1–2 (fake provider), so they may proceed while the owner decides at Task 4. Tasks 1, 2 and 5 need no network and no model download.
-- **Owner checkpoints:** raise Docker Desktop memory to about 11–12 GB before Task 4 runs real inference; approve the model at Task 4 Step 6; approve or reject the dependency at Task 10 Step 2.
+- **Owner checkpoints:** raise Docker Desktop memory to about 11–12 GB before Task 4 runs real inference; approve the model at Task 4 Step 6; confirm the full run after the Task 9 trial; approve or reject the dependency at Task 10 Step 2.
 - **Tooling:** everything in Docker (`make test-py`, `make lint`, the uv container; migrations generated in the uv container). Never install anything on the host. Do not commit outside each task's commit step.
 
 ## Decisions taken in this plan
@@ -316,3 +324,25 @@ Starts after Task 4's 2B bake-off has run. Does not block Tasks 5–9. Nothing i
 - **One heavy flow at a time** (`serve limit=1`): ingest (about 4 GB) plus understand (about 5–6 GB) would not fit in 8 GB. A long understanding run queues later ingests.
 - **A generic `stage_runs` lock** starts here for milestones 1.3–1.8; ingest keeps its own columns. `jobs.stage` separates ingest and understand jobs.
 - **Re-ingesting a chapter clears its scenes** (cascade), its understand review items and its non-ingest stage rows. The API refuses re-ingest while understanding runs.
+
+## Deferred minors to fix in the final wave
+
+- `pipeline/understand/contract.py`: a quote must contain at least 2 alphanumeric characters after normalisation, so a punctuation-only quote like "..." is not evidence (test; apply the same rule in `orchestration/understand_bakeoff.py`, which duplicates the check).
+- `normalise`: unify dash and long-vowel variants (ー, －, ‐, –, —, 〜/～); document that matching is case-sensitive.
+- `normalise` edge-case tests: empty string, combining marks, whitespace-only.
+- Comment in the contract that a claim's value is not tied to its quote (the quote proves the text exists, not the value's interpretation).
+- `_neutralise` (`pipeline/providers/base.py`) strips runs of 3+ `<`/`>` from OCR text: state it in the contract docstring and in Global Constraints.
+- `pipeline/providers/replay.py`: verify `fixture_key` on load (recompute, refuse mismatch) and add a helper for the fenced-content hash.
+- `LICENSES.md` still says scene understanding is a bake-off of Qwen3.5-9B vs Nemotron 3.5 Super VL: update to the local 2B candidates and the Task 4 decision.
+- `tests/unit/test_pin_models.py`: use `pytest.raises` and top-level imports.
+- `orchestration/check_models.py`: the `vlm` check passes `enable_thinking=False` to the chat template, as `pipeline/providers/local_vlm.py` does.
+
+## Next steps (ordered)
+
+1. Task 5 (in progress) → Sonnet review.
+2. Task 4 real bake-off: waits on the owner raising Docker Desktop memory to about 12 GB; then Sonnet review of the harness; then **owner model approval checkpoint** (Task 4 Steps 6–8: pin `stages.understand`, record fixtures).
+3. Task 6 → Opus review (security-sensitive); Task 7 → Opus review (security-sensitive); Task 8 → Sonnet review; Task 9 with the trial gate → Sonnet review, owner confirms the full run.
+4. Optional Task 10, only after the owner approves the dependency (Task 10 Step 2).
+5. Final Opus review of the whole milestone, then one fix wave including the deferred minors above, then merge and push.
+
+Models: Opus plans, runs the security reviews (Tasks 2, 6, 7, Task 10 vetting) and the final review; Sonnet implements every task and reviews the rest. Review depth: **Lean** (see Execution notes).
