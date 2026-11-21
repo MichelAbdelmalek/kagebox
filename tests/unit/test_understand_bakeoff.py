@@ -13,6 +13,7 @@ from orchestration.understand_bakeoff import (
     field_changes,
     fp32_exceeds_memory,
     metrics,
+    process_panels,
     record_cases,
 )
 from orchestration.understand_synthetic import synthetic_cases
@@ -128,3 +129,15 @@ def test_fp32_skip_rule() -> None:
     limit = 10 * 1024**3
     assert fp32_exceeds_memory(4_255_140_312, limit)  # 2B model in bf16 on disk -> ~8.5 GB fp32
     assert not fp32_exceeds_memory(1_750_000_000, limit)  # 0.8B
+
+
+def test_process_panels_reports_progress_without_text() -> None:
+    panels = [BakePanel(f"p{i}", b"x", "secret ocr") for i in range(3)]
+    seen: list[tuple[int, int, bool]] = []
+    out = process_panels(
+        lambda p: reading(),
+        panels,
+        on_done=lambda i, n, r: seen.append((i, n, r.reading is not None)),
+    )
+    assert len(out) == 3
+    assert seen == [(1, 3, True), (2, 3, True), (3, 3, True)]

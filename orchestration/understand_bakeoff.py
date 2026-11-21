@@ -194,10 +194,12 @@ def _spec_and_weights(model: str) -> tuple[ModelSpec, int]:
 
 
 def process_panels(
-    call: Callable[[BakePanel], PanelReading], panels: list[BakePanel]
+    call: Callable[[BakePanel], PanelReading],
+    panels: list[BakePanel],
+    on_done: Callable[[int, int, PanelResult], None] | None = None,
 ) -> list[PanelResult]:
     out: list[PanelResult] = []
-    for p in panels:
+    for i, p in enumerate(panels, 1):
         start = time.perf_counter()
         try:
             reading: PanelReading | None = call(p)
@@ -206,6 +208,8 @@ def process_panels(
         out.append(
             PanelResult(p.panel_id, p.case, reading, p.ocr_text, time.perf_counter() - start)
         )
+        if on_done is not None:
+            on_done(i, len(panels), out[-1])
     return out
 
 
@@ -222,13 +226,20 @@ def _make_call(
 def _child(model: str, dtype: str, panels: list[BakePanel], out_file: str) -> None:
     from pipeline.understand.settings import load_settings, prompt_text
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")  # spawned: no parent config
     settings = load_settings()
     instructions, _ = prompt_text(settings)
     status = "ok"
     results: list[PanelResult] = []
     try:
         call = _make_call(model, dtype, settings, instructions)
-        results = process_panels(call, panels)
+        results = process_panels(
+            call,
+            panels,
+            on_done=lambda i, n, r: log.info(
+                "  panel %d/%d %.1fs valid=%s", i, n, r.seconds, r.reading is not None
+            ),
+        )
     except Exception as e:  # model load failure etc.; the class name only, never a message
         status = f"failed: {type(e).__name__}"
     rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KiB on Linux
