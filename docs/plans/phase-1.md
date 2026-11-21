@@ -15,10 +15,10 @@ Built on Phase 0: the schemas, rights gate, provider interface, upload validatio
 | 1.2 | **Understand** | SceneJSON per panel from a local vision model on `worker-cpu` (bf16 on CPU), with schema-validated output and retries. Every field cites its panel or stays null. Bad output after retries becomes a ReviewItem. No page leaves the machine. | Recorded-fixture contract tests; prompt-injection fixture in OCR text does not change output fields. |
 | 1.3 | **Series bible** | Character crops → SigLIP embeddings (CPU) → HDBSCAN clusters → Qdrant collections (characters, locations, dialogue, voice profiles). Approve / reject crops, merge / split clusters. `get_context(shot)` returns exact refs. Speaker linking (bubble → character, cited by panel) lands here, from milestone 1.1. | Clustering on fixture crops; `get_context` never returns refs from another project. |
 | 1.4 | **Director** | Together LLM turns panels into Shots (camera move, duration, transition). A validator rejects any shot or line not traceable to panels in the scene. Source panels are keyframes. | Property test: every Shot has ≥ 1 source panel from its scene; untraceable output → review. |
-| 1.5 | **2.5D render** | SAM 2.1 masks seeded from character boxes; depth order from Depth Anything V2 Small; LaMa inpaints behind characters. Numpy multiplane compositor + FFmpeg for pan / tilt / zoom / parallax. Palette extracted into StyleProfile. Memory rules I2 (below). | Deterministic render of a fixture shot (frame hash); FFmpeg always called with argument lists, never a shell; I2 peak-memory test. |
+| 1.5 | **2.5D render** | SAM 2.1 masks seeded from character boxes; depth order from Depth Anything V2 Small; LaMa inpaints behind characters. Numpy multiplane compositor + FFmpeg for pan / tilt / zoom / parallax. Palette extracted into StyleProfile. Memory rules I2 (below). Compositor confirmed by the cinematic-skill study (below) before Task 1. | Deterministic render of a fixture shot (frame hash); FFmpeg always called with argument lists, never a shell; I2 peak-memory test. |
 | 1.6 | **Voices, casting, score** | Voice / Casting API with per-language versions, undo and audit log. Consent upload encrypted at the application level (AES-GCM, key from a Docker secret) in the `consent` bucket, every read logged. TTS per VoiceLine with the cast voice and SceneJSON emotion (CosyVoice2; Chatterbox fallback). Watermark always applied (AudioSeal) and verified. Sample previews cached, served by signed links. `recast_flow` re-voices one character's lines only. Score draft from a mood cue sheet (see D2). Any non-generated audio needs an I3 acquisition record. | Consent-locked voice refused by API *and* worker; recast touches only that character's lines; watermark detected after mux; I3 audio without an acquisition record or with a disallowed licence is refused. |
 | 1.7 | **Validate** | Whisper round-trip WER per line (faster-whisper, CPU int8), identity similarity vs bible per character threshold, traceability, watermark presence → ValidationReport → ReviewItems. | A check that cannot run counts as failed, never passed (already enforced by the schema). |
-| 1.8 | **Assemble** | FFmpeg mux to MP4 (video, dialogue, score) plus a provenance bundle listing every model, revision and license used, and every I3 attribution. OTIO export stays in Phase 4. | Output plays; bundle covers every artifact in the MP4, including every CC-BY attribution. |
+| 1.8 | **Assemble** | FFmpeg mux to MP4 (video, dialogue, score) plus a provenance bundle listing every model, revision and license used, and every I3 attribution. OTIO export stays in Phase 4. Loudness/ducking approach informed by the same study (`mix_soundtrack.py`). | Output plays; bundle covers every artifact in the MP4, including every CC-BY attribution. |
 | 1.9 | **UI** | Projects with live pipeline status; **Panel reader** (02); **Series bible** (03); **Voice casting** (05); a minimal Review queue list (no design file exists). Noto Sans JP/KR self-hosted for CJK text. | Vitest per component; Playwright + axe (WCAG 2.2 AA), keyboard-only paths, 375 px viewport. |
 | 1.10 | **End-to-end** | Sample chapter run with Together mocked by recorded fixtures in CI, plus an opt-in live run. Source and public-domain justification in `docs/sample-chapter-source.md`. | `make e2e` green. |
 
@@ -102,3 +102,25 @@ Read-only review of the public repo `kaomei/stickman-video-director`; nothing fr
 ### Phase 2 carry-over: trial-before-spend gate
 
 Before a batch of generative shots: render one to three representative shots at the lowest resolution, show them with their style and identity scores, then confirm final resolution and a maximum total budget (GPU minutes or Together credits, retries included, trial spend stated). The run stops before exceeding the cap, and a scope or budget change needs a new confirmation. Enforced server-side, recorded in the stage run.
+
+## Candidate to study at milestone 1.5: Moh4696/cinematic-skill (reviewed 2026-11-21)
+
+Read-only look at the public repo through `gh api`; nothing from it is run, installed or copied. MIT agent skill (872 stars, 135 forks, created and last pushed 2026-11-09, 3 commits, one maintainer) that builds narrated films entirely from code: items on one board, one continuous camera move, Skia (`skia-python`) drawing, word-timed hits from the narration, synthesised sound effects (`scripts/build_sfx.py`), a ducked, loudness-normalised mix (`scripts/mix_soundtrack.py`), memory-aware parallel render (`scripts/render.py`), stills and contact strips for self-review, and a Wikimedia fetcher with credits (`scripts/fetch_commons.py`). Paths are under `skills/cinematic-film/`.
+
+**Decision:** not adopted as a dependency, not installed, no code vendored. At milestone 1.5 planning, one Opus read-only study of `scripts/engine.py` (camera, items, timing API), `render.py`, `build_sfx.py` and `mix_soundtrack.py`, then a Skia-vs-numpy compositor comparison before 1.5 starts.
+
+**Study checklist:**
+- Camera model and keyframing, against our multiplane pan / tilt / zoom / parallax over layer-separated panels.
+- How word-level timing drives events, compared with our voice-first re-timing for recast: the Director sets duration constraints, Assemble fits shots to the actual audio.
+- Determinism guarantees (same input, same frame hashes).
+- Peak memory per shot against the 8 GB `worker-cpu` rule (I2).
+- `skia-python`: Linux arm64 wheels, wheel size, licence, loads offline. A new native dependency needs owner approval and a `LICENSES.md` row.
+- Test coverage and maintenance signals at study time (today it is one day old; its only test is `tests/check.mjs`).
+- Installer and supply-chain risk: its `npx skills add` and `curl | bash` installers are not used.
+
+**Cautions:**
+- Its image fetcher accepts CC BY-SA and has an `--allow-nonfree` bypass. Our allowlist stays stricter: owned, licensed or public domain (CLAUDE.md rule 1) and the I3 audio allowlist.
+- It composes photos and cards; it does not preserve source art or trace output to panels, so nothing in it replaces rule 2 traceability.
+- Its synthesised SFX are a candidate licence-clean baseline to compare against MMAudio for Phase 3 foley, not a replacement decision.
+
+**Acceptance for the study:** a one-page decision note in `docs/plans/` choosing the compositor, with measured evidence on a fixture shot (frame determinism, peak RSS, seconds per frame on the M2 CPU in Docker), merged before Task 1 of milestone 1.5 begins.
