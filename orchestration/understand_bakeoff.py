@@ -192,6 +192,20 @@ def pick_evenly(items: list[Any], n: int) -> list[Any]:
     return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
 
 
+def parse_indices(text: str) -> list[int]:
+    """``8,1,3`` -> [1, 3, 8]: 1-based panel positions, unique and sorted."""
+    out = set()
+    for part in text.split(","):
+        if not part.isdigit() or int(part) < 1:
+            raise ValueError("panel positions are 1-based integers, comma separated")
+        out.add(int(part))
+    return sorted(out)
+
+
+def select_indices(items: list[Any], indices: list[int]) -> list[Any]:
+    return [items[i - 1] for i in indices if i <= len(items)]
+
+
 def parse_config(text: str) -> tuple[str, dict[str, int]]:
     """``NAME[,key=int...]`` with keys from ``_OVERRIDES``; anything else is refused."""
     label, *pairs = text.split(",")
@@ -516,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dtypes", default="bfloat16,float32", type=str)
     ap.add_argument("--out", type=Path, default=Path("/reports/understand-bakeoff"))
     ap.add_argument("--pick", type=int, help="use N evenly spaced chapter panels of --limit")
+    ap.add_argument("--panels", type=parse_indices, help="1-based positions within --limit")
     ap.add_argument("--synthetic-cases", help="comma list of synthetic case names (default all)")
     ap.add_argument(
         "--config",
@@ -557,6 +572,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.chapter:
         ap.error("--chapter is required")
     chapter_panels = load_chapter_panels(args.chapter, args.pages[0], args.pages[1], args.limit)
+    if args.panels is not None:
+        chapter_panels = select_indices(chapter_panels, args.panels)
     if args.pick is not None:
         chapter_panels = pick_evenly(chapter_panels, args.pick)
     panels = [*chapter_panels, *synthetic]

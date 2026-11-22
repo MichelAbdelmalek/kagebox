@@ -14,6 +14,7 @@ from orchestration.understand_bakeoff import (
     fp32_exceeds_memory,
     metrics,
     parse_config,
+    parse_indices,
     pick_evenly,
     process_panels,
     record_cases,
@@ -166,3 +167,16 @@ def test_parse_config_accepts_only_known_overrides() -> None:
     for bad in ("B,threads", "B,dtype=float32", "B,threads=x", ",threads=4", "B c,threads=4"):
         with pytest.raises(ValueError):
             parse_config(bad)
+
+
+def test_parse_indices_one_based_unique_sorted() -> None:
+    assert parse_indices("8,1,3,3") == [1, 3, 8]
+    for bad in ("0", "a", "", "1,,2", "-1"):
+        with pytest.raises(ValueError):
+            parse_indices(bad)
+
+
+def test_select_indices_keeps_order_and_ignores_missing() -> None:
+    from orchestration.understand_bakeoff import select_indices
+
+    assert select_indices(list("abcdef"), [1, 3, 9]) == ["a", "c"]
