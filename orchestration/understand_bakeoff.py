@@ -78,6 +78,7 @@ class RunResult:
     status: str  # "ok" | SKIPPED_MEMORY | "failed"
     results: list[PanelResult] = field(default_factory=list)
     peak_rss_mb: float | None = None
+    label: str = ""
 
 
 # -- pure metrics ----------------------------------------------------------------------------
@@ -178,6 +179,33 @@ def metrics(results: list[PanelResult], peak_rss_mb: float | None = None) -> dic
     }
 
 
+_OVERRIDES = ("threads", "max_pixels")  # settings a config may vary; nothing else
+_LABEL = re.compile(r"^[A-Za-z0-9_-]{1,16}$")
+
+
+def pick_evenly(items: list[Any], n: int) -> list[Any]:
+    """n items spread evenly over the list, first and last included; stable for equal input."""
+    if n >= len(items):
+        return list(items)
+    if n <= 1:
+        return items[:n]
+    return [items[round(i * (len(items) - 1) / (n - 1))] for i in range(n)]
+
+
+def parse_config(text: str) -> tuple[str, dict[str, int]]:
+    """``NAME[,key=int...]`` with keys from ``_OVERRIDES``; anything else is refused."""
+    label, *pairs = text.split(",")
+    if not _LABEL.fullmatch(label):
+        raise ValueError("config name must be 1-16 letters, digits, '-' or '_'")
+    overrides: dict[str, int] = {}
+    for pair in pairs:
+        key, eq, value = pair.partition("=")
+        if not eq or key not in _OVERRIDES:
+            raise ValueError(f"config override must be one of {_OVERRIDES} as key=int")
+        overrides[key] = int(value)
+    return label, overrides
+
+
 def fp32_exceeds_memory(bf16_weight_bytes: int, limit_bytes: int) -> bool:
     """fp32 holds twice the bytes of the bf16 files on disk; keep room for activations."""
     return bf16_weight_bytes * 2 > FP32_BUDGET * limit_bytes
@@ -228,11 +256,13 @@ def _make_call(
     return lambda p: provider.vlm_structured(spec, instructions, p.ocr_text, [p.png], PanelReading)
 
 
-def _child(model: str, dtype: str, panels: list[BakePanel], out_file: str) -> None:
+def _child(
+    model: str, dtype: str, panels: list[BakePanel], out_file: str, overrides: dict[str, int]
+) -> None:
     from pipeline.understand.settings import load_settings, prompt_text
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")  # spawned: no parent config
-    settings = load_settings()
+    settings = load_settings().model_copy(update=overrides)
     instructions, _ = prompt_text(settings)
     status = "ok"
     results: list[PanelResult] = []
@@ -268,16 +298,23 @@ def _child(model: str, dtype: str, panels: list[BakePanel], out_file: str) -> No
     )
 
 
-def run_one(model: str, dtype: str, panels: list[BakePanel], out: Path) -> RunResult:
+def run_one(
+    model: str,
+    dtype: str,
+    panels: list[BakePanel],
+    out: Path,
+    overrides: dict[str, int] | None = None,
+    label: str = "",
+) -> RunResult:
     """Run one (model, dtype) in a fresh child process so its peak RSS is its own."""
     out.mkdir(parents=True, exist_ok=True)
-    out_file = out / f"{model}-{dtype}.raw.json"
+    out_file = out / f"{label or 'run'}-{model}-{dtype}.raw.json"
     ctx = multiprocessing.get_context("spawn")
-    proc = ctx.Process(target=_child, args=(model, dtype, panels, str(out_file)))
+    proc = ctx.Process(target=_child, args=(model, dtype, panels, str(out_file), overrides or {}))
     proc.start()
     proc.join()
     if proc.exitcode != 0 or not out_file.exists():
-        return RunResult(model, dtype, f"failed: exit {proc.exitcode}")
+        return RunResult(model, dtype, f"failed: exit {proc.exitcode}", label=label)
     raw = json.loads(out_file.read_text(encoding="utf-8"))
     out_file.unlink()  # the panel text lives in memory; only the sheet and metrics are kept
     by_id = {p.panel_id: p for p in panels}
@@ -291,7 +328,7 @@ def run_one(model: str, dtype: str, panels: list[BakePanel], out: Path) -> RunRe
         )
         for r in raw["results"]
     ]
-    return RunResult(model, dtype, raw["status"], results, raw["peak_rss_mb"])
+    return RunResult(model, dtype, raw["status"], results, raw["peak_rss_mb"], label)
 
 
 # -- recording synthetic fixtures ------------------------------------------------------------
@@ -377,7 +414,10 @@ def _fmt(reading: PanelReading | None) -> str:
 
 def contact_sheet(panels: list[BakePanel], runs: list[RunResult]) -> str:
     ok = [r for r in runs if r.status == "ok"]
-    head = "".join(f"<th>{html.escape(r.model)}<br>{html.escape(r.dtype)}</th>" for r in ok)
+    head = "".join(
+        f"<th>{html.escape(r.label)}<br>{html.escape(r.model)}<br>{html.escape(r.dtype)}</th>"
+        for r in ok
+    )
     body = []
     for p in panels:
         cells = []
@@ -475,13 +515,24 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--models", default="qwen3-vl-2b-instruct,qwen3-5-2b,qwen3-5-0-8b", type=str)
     ap.add_argument("--dtypes", default="bfloat16,float32", type=str)
     ap.add_argument("--out", type=Path, default=Path("/reports/understand-bakeoff"))
+    ap.add_argument("--pick", type=int, help="use N evenly spaced chapter panels of --limit")
+    ap.add_argument("--synthetic-cases", help="comma list of synthetic case names (default all)")
+    ap.add_argument(
+        "--config",
+        action="append",
+        type=parse_config,
+        help="NAME[,threads=N][,max_pixels=N]; repeat to compare settings (default: as configured)",
+    )
     ap.add_argument("--record", type=Path, help="write replay fixtures from synthetic cases only")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     models = [m for m in args.models.split(",") if m]
     dtypes = [d for d in args.dtypes.split(",") if d]
+    wanted = set(args.synthetic_cases.split(",")) if args.synthetic_cases else None
     synthetic = [
-        BakePanel(f"synthetic_{c.name}", c.png, c.ocr_text, c.name) for c in synthetic_cases()
+        BakePanel(f"synthetic_{c.name}", c.png, c.ocr_text, c.name)
+        for c in synthetic_cases()
+        if wanted is None or c.name in wanted
     ]
 
     from pipeline.understand.settings import load_settings, prompt_text
@@ -505,10 +556,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.chapter:
         ap.error("--chapter is required")
-    panels = [
-        *load_chapter_panels(args.chapter, args.pages[0], args.pages[1], args.limit),
-        *synthetic,
-    ]
+    chapter_panels = load_chapter_panels(args.chapter, args.pages[0], args.pages[1], args.limit)
+    if args.pick is not None:
+        chapter_panels = pick_evenly(chapter_panels, args.pick)
+    panels = [*chapter_panels, *synthetic]
     log.info("bake-off on %d panels (%d synthetic)", len(panels), len(synthetic))
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     out = args.out / stamp
@@ -517,15 +568,16 @@ def main(argv: list[str] | None = None) -> int:
     for model in models:
         _, weights = _spec_and_weights(model)
         for dtype in dtypes:
-            if dtype == "float32" and fp32_exceeds_memory(weights, limit):
-                log.info("%s %s: %s", model, dtype, SKIPPED_MEMORY)
-                runs.append(RunResult(model, dtype, SKIPPED_MEMORY))
-                continue
-            log.info("%s %s: running", model, dtype)
-            runs.append(run_one(model, dtype, panels, out))
-            log.info("%s %s: %s", model, dtype, runs[-1].status)
+            for label, overrides in args.config or [("cfg", {})]:
+                if dtype == "float32" and fp32_exceeds_memory(weights, limit):
+                    log.info("%s %s: %s", model, dtype, SKIPPED_MEMORY)
+                    runs.append(RunResult(model, dtype, SKIPPED_MEMORY, label=label))
+                    continue
+                log.info("%s %s %s %s: running", label, model, dtype, overrides)
+                runs.append(run_one(model, dtype, panels, out, overrides, label))
+                log.info("%s %s %s: %s", label, model, dtype, runs[-1].status)
     report = {
-        f"{r.model}/{r.dtype}": {"status": r.status, **metrics(r.results, r.peak_rss_mb)}
+        f"{r.label}/{r.model}/{r.dtype}": {"status": r.status, **metrics(r.results, r.peak_rss_mb)}
         for r in runs
     }
     out.mkdir(parents=True, exist_ok=True)

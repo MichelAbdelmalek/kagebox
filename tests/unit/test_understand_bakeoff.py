@@ -13,6 +13,8 @@ from orchestration.understand_bakeoff import (
     field_changes,
     fp32_exceeds_memory,
     metrics,
+    parse_config,
+    pick_evenly,
     process_panels,
     record_cases,
 )
@@ -143,3 +145,24 @@ def test_process_panels_reports_progress_without_text() -> None:
     )
     assert len(out) == 3
     assert seen == [(1, 3, True), (2, 3, True), (3, 3, True)]
+
+
+def test_pick_evenly_is_deterministic_and_spread() -> None:
+    items = list(range(10))
+    assert pick_evenly(items, 3) == [0, 4, 9]
+    assert pick_evenly(items, 3) == pick_evenly(items, 3)
+    assert pick_evenly(items, 1) == [0]
+    assert pick_evenly(items, 20) == items
+    assert pick_evenly([], 3) == []
+
+
+def test_parse_config_accepts_only_known_overrides() -> None:
+    assert parse_config("B,threads=4") == ("B", {"threads": 4})
+    assert parse_config("C,threads=4,max_pixels=301056") == (
+        "C",
+        {"threads": 4, "max_pixels": 301056},
+    )
+    assert parse_config("A") == ("A", {})
+    for bad in ("B,threads", "B,dtype=float32", "B,threads=x", ",threads=4", "B c,threads=4"):
+        with pytest.raises(ValueError):
+            parse_config(bad)
