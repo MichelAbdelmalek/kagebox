@@ -2,9 +2,9 @@
 # pipeline/understand/settings.py. max_attempts * max_time_s must stay under 540 s (the stale
 # limit minus a minute), so a slow panel never looks dead.
 prompt_version: v3
-threads: 6
+threads: 4 # the container sees 4 cores; 6 vs 4 measured as a wash (docs: task-4-report)
 dtype: bfloat16
-max_pixels: 602112 # 768 * 28 * 28
+max_pixels: 301056 # 384 * 28 * 28: half the image tokens of the old 602112, no visible loss
 max_new_tokens: 512
 max_attempts: 3
 max_time_s: 150 # per generate call
