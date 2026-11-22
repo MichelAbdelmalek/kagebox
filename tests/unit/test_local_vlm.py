@@ -139,7 +139,7 @@ def test_committed_settings_and_prompt_are_valid() -> None:
     s = load_settings()
     assert (s.threads, s.dtype, s.max_pixels, s.max_new_tokens) == (6, "bfloat16", 602112, 512)
     assert (s.max_attempts, s.max_time_s, s.max_minutes_per_chapter) == (3, 150, 420)
-    assert s.prompt_version == "v2"
+    assert s.prompt_version == "v3"
     text, digest = prompt_text(s)
     assert len(digest) == 64
     PanelReading.model_validate_json(extract_json(text))  # the prompt's example is valid
@@ -149,6 +149,17 @@ def test_prompt_v2_loads_and_hashes_raw_bytes() -> None:
     raw = (CONFIG_DIR / "prompts" / "understand.v2.md").read_bytes()
     text, digest = prompt_text(settings(prompt_version="v2"))
     assert text == raw.decode("utf-8") and digest == hashlib.sha256(raw).hexdigest()
+
+
+def test_prompt_v3_spells_out_figure_claim_objects_and_keeps_v2_rules() -> None:
+    v2, _ = prompt_text(settings(prompt_version="v2"))
+    v3, digest = prompt_text(settings(prompt_version="v3"))
+    assert digest != prompt_text(settings(prompt_version="v2"))[1]
+    # the 2B model wrote plain strings for figures under v2 and failed validation every time
+    assert "never a plain string" in v3 and "never a plain string" not in v2
+    assert 'evidence is always "visual"' in v3 and "quote" not in v3.lower()
+    assert extract_json(v3) == extract_json(v2)  # same example, same placeholders
+    PanelReading.model_validate_json(extract_json(v3))
 
 
 def test_prompt_digest_changes_with_the_prompt_version() -> None:
