@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 from typing import Any
@@ -17,6 +18,7 @@ from pipeline.providers.base import (
     StructuredOutputFailed,
 )
 from pipeline.providers.local_vlm import REPAIR_LINE, LocalVlmProvider
+from pipeline.providers.registry import CONFIG_DIR
 from pipeline.providers.structured import extract_json, structured_from_text
 from pipeline.understand.contract import PanelReading
 from pipeline.understand.settings import UnderstandSettings, load_settings, prompt_text
@@ -137,9 +139,38 @@ def test_committed_settings_and_prompt_are_valid() -> None:
     s = load_settings()
     assert (s.threads, s.dtype, s.max_pixels, s.max_new_tokens) == (6, "bfloat16", 602112, 512)
     assert (s.max_attempts, s.max_time_s, s.max_minutes_per_chapter) == (3, 150, 420)
+    assert s.prompt_version == "v2"
     text, digest = prompt_text(s)
     assert len(digest) == 64
     PanelReading.model_validate_json(extract_json(text))  # the prompt's example is valid
+
+
+def test_prompt_v2_loads_and_hashes_raw_bytes() -> None:
+    raw = (CONFIG_DIR / "prompts" / "understand.v2.md").read_bytes()
+    text, digest = prompt_text(settings(prompt_version="v2"))
+    assert text == raw.decode("utf-8") and digest == hashlib.sha256(raw).hexdigest()
+
+
+def test_prompt_digest_changes_with_the_prompt_version() -> None:
+    _, v1 = prompt_text(settings(prompt_version="v1"))
+    _, v2 = prompt_text(settings(prompt_version="v2"))
+    assert v1 != v2  # the digest is what goes into the stage params hash
+
+
+def test_prompt_v2_has_no_copyable_scene_words_and_says_visual_only() -> None:
+    v1, _ = prompt_text(settings(prompt_version="v1"))
+    v2, _ = prompt_text(settings(prompt_version="v2"))
+    example = extract_json(v1)
+    # every concrete value in the v1 example must be absent from v2
+    concrete = [
+        w
+        for w in ("rooftop", "dusk", "points at the sky", "evening", "long coat", "tall figure")
+        if w in example
+    ]
+    assert len(concrete) == 6
+    assert not [w for w in concrete if w in v2.lower()]
+    assert "quote" not in v2.lower() and '"text"' not in extract_json(v2)
+    assert 'evidence is always "visual"' in v2 and "null" in v2 and "data" in v2
 
 
 def test_prompt_version_cannot_escape_the_prompts_dir() -> None:
