@@ -17,7 +17,12 @@ from pipeline.providers.base import (
     ModelSpec,
     StructuredOutputFailed,
 )
-from pipeline.providers.local_vlm import REPAIR_LINE, LocalVlmProvider
+from pipeline.providers.local_vlm import (
+    REPAIR_LINE,
+    LocalVlmProvider,
+    json_position,
+    stop_reason,
+)
 from pipeline.providers.registry import CONFIG_DIR
 from pipeline.providers.structured import extract_json, structured_from_text
 from pipeline.understand.contract import PanelReading
@@ -401,3 +406,45 @@ def test_no_prompt_or_output_in_logs_or_exceptions(caplog: pytest.LogCaptureFixt
     shown = caplog.text + str(ei.value) + repr(ei.value) + ei.value.last_error
     assert SENTINEL_IN not in shown and SENTINEL_OUT not in shown
     assert ei.value.__cause__ is None
+
+
+# ---- per-attempt diagnostics (counts and classes only) ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("", "depth=0 str=0 last=none"),
+        ('{"a": {"b": 1}}', "depth=0 str=0 last=close"),
+        ('{"setting": {"value": "cut', "depth=2 str=1 last=word"),
+        ('{"setting": {"value": "x", "evid', "depth=2 str=1 last=word"),
+        ('{"a": [{"b": ', "depth=3 str=0 last=colon"),
+        ('{"a": 1,', "depth=1 str=0 last=comma"),
+        ('{"a": "x"', "depth=1 str=0 last=quote"),
+        ('{"a": "q\\"', "depth=1 str=1 last=quote"),
+        ("{", "depth=1 str=0 last=open"),
+    ],
+)
+def test_json_position_is_a_structural_class_never_text(text: str, expected: str) -> None:
+    assert json_position(text) == expected
+
+
+def test_stop_reason_classes() -> None:
+    eos = {9}
+    assert stop_reason([1, 2, 9], eos, 512, 5.0, 150) == "eos"
+    assert stop_reason(list(range(512)), eos, 512, 5.0, 150) == "max_new_tokens"
+    assert stop_reason([1, 2, 3], eos, 512, 151.0, 150) == "max_time"
+    assert stop_reason([1, 2, 3], eos, 512, 5.0, 150) == "other"
+    assert stop_reason([], eos, 512, 5.0, 150) == "other"
+
+
+def test_attempt_diagnostics_logged_without_text(caplog: pytest.LogCaptureFixture) -> None:
+    prov, proc, _, _ = make()
+    proc.reply = f'{{"answer": "{SENTINEL_OUT}'
+    with caplog.at_level(logging.INFO), pytest.raises(StructuredOutputFailed):
+        prov.vlm_structured(SPEC, "i", "c", [png(8, 8)], Out)
+    lines = [r.getMessage() for r in caplog.records if "attempt" in r.getMessage()]
+    assert len(lines) == 3
+    assert "tokens=2" in lines[0] and "stop=other" in lines[0]
+    assert "depth=1 str=1 last=word" in lines[0]
+    assert SENTINEL_OUT not in caplog.text

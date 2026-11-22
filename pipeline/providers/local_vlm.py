@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -20,7 +21,7 @@ from pipeline.providers.base import M, ModelLoadFailed, ModelSpec, fence_untrust
 from pipeline.providers.structured import structured_from_text
 from pipeline.understand.settings import UnderstandSettings
 
-__all__ = ["REPAIR_LINE", "LocalVlmProvider"]
+__all__ = ["REPAIR_LINE", "LocalVlmProvider", "json_position", "stop_reason"]
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +32,56 @@ _CROP_FORMATS = ("PNG",)  # what ingest writes for panel crops
 _DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 
 Loader = Callable[..., Any]
+
+
+def stop_reason(
+    new_ids: list[int], eos_ids: set[int], max_new_tokens: int, seconds: float, max_time_s: int
+) -> str:
+    """Why one generate call ended: eos, max_new_tokens, max_time, or other. Counts only."""
+    if new_ids and new_ids[-1] in eos_ids:
+        return "eos"
+    if len(new_ids) >= max_new_tokens:
+        return "max_new_tokens"
+    if seconds >= max_time_s:
+        return "max_time"
+    return "other"
+
+
+def _char_class(c: str) -> str:
+    if c == "{":
+        return "open"
+    if c == "}":
+        return "close"
+    if c == '"':
+        return "quote"
+    if c == ":":
+        return "colon"
+    if c == ",":
+        return "comma"
+    return "word" if c.isalnum() else "other"
+
+
+def json_position(text: str) -> str:
+    """Where a JSON answer ends, as a class: nesting depth, inside a string or not, and the class
+    of the last non-space character. Never any of the text itself."""
+    depth, in_str, esc = 0, False, False
+    for c in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+    stripped = text.rstrip()
+    last = _char_class(stripped[-1]) if stripped else "none"
+    return f"depth={max(depth, 0)} str={int(in_str)} last={last}"
 
 
 class LocalVlmProvider:
@@ -118,6 +169,7 @@ class LocalVlmProvider:
                     ],
                 },
             ]
+            start = time.perf_counter()
             with torch.inference_mode():
                 inputs = processor.apply_chat_template(
                     messages,
@@ -136,7 +188,18 @@ class LocalVlmProvider:
                 )
                 new_tokens = out[:, inputs["input_ids"].shape[1] :]
                 text: str = processor.batch_decode(new_tokens, skip_special_tokens=True)[0]
-            log.debug("attempt %d generated %d tokens", attempt, new_tokens.shape[1])
+            seconds = time.perf_counter() - start
+            ids = [int(t) for t in new_tokens[0].tolist()]
+            eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+            eos_ids = {eos} if isinstance(eos, int) else {int(e) for e in eos or ()}
+            log.info(  # counts and classes only: never any generated text
+                "attempt %d: tokens=%d stop=%s seconds=%.1f %s",
+                attempt,
+                len(ids),
+                stop_reason(ids, eos_ids, self._s.max_new_tokens, seconds, self._s.max_time_s),
+                seconds,
+                json_position(text),
+            )
             return text
 
         return structured_from_text(spec, schema, generate, self._s.max_attempts)
