@@ -22,9 +22,11 @@ import json
 import logging
 import math
 import multiprocessing
+import re
 import resource
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -34,7 +36,7 @@ from typing import Any
 from orchestration.understand_synthetic import synthetic_cases
 from pipeline.providers.base import ModelSpec, StructuredOutputFailed, fence_untrusted
 from pipeline.providers.replay import record_case
-from pipeline.understand.contract import MIN_QUOTE_CHARS, Claim, PanelReading, normalise
+from pipeline.understand.contract import Claim, PanelReading
 from pipeline.understand.settings import UnderstandSettings
 
 log = logging.getLogger("understand_bakeoff")
@@ -92,11 +94,16 @@ def _claims(reading: PanelReading) -> Iterator[Claim]:
         yield fig.emotion
 
 
+def _fold(text: str) -> str:
+    """NFKC and no whitespace, so cosmetic differences do not count as a changed field."""
+    return re.sub(r"\s+", "", unicodedata.normalize("NFKC", text))
+
+
 def _canon(reading: PanelReading, name: str) -> str | None:
     if name == "shot_hint":
         return reading.shot_hint
     claim: Claim = getattr(reading, name)
-    return None if _is_null(claim) else normalise(claim.value or "")
+    return None if _is_null(claim) else _fold(claim.value or "")
 
 
 def field_changes(clean: PanelReading | None, injected: PanelReading | None) -> list[str]:
@@ -114,20 +121,18 @@ def _percentile(values: list[float], q: float) -> float:
     return ordered[max(1, math.ceil(q * len(ordered))) - 1]  # nearest rank
 
 
-def _quote_counts(results: list[PanelResult]) -> tuple[int, int]:
-    text_claims = unsupported = 0
+def _text_claim_counts(results: list[PanelResult]) -> tuple[int, int]:
+    """(non-null claims, claims whose evidence is text: the contract refuses those)."""
+    claims = refused = 0
     for r in results:
         if r.reading is None:
             continue
-        ocr = normalise(r.ocr_text)
         for claim in _claims(r.reading):
-            if _is_null(claim) or claim.evidence != "text":
+            if _is_null(claim):
                 continue
-            text_claims += 1
-            quote = normalise(claim.quote or "")
-            if len(quote) < MIN_QUOTE_CHARS or quote not in ocr:
-                unsupported += 1
-    return text_claims, unsupported
+            claims += 1
+            refused += claim.evidence == "text"
+    return claims, refused
 
 
 def metrics(results: list[PanelResult], peak_rss_mb: float | None = None) -> dict[str, Any]:
@@ -138,7 +143,7 @@ def metrics(results: list[PanelResult], peak_rss_mb: float | None = None) -> dic
         n: (sum(_canon(rd, n) is None for rd in readings) / len(readings) if readings else None)
         for n in READING_FIELDS
     }
-    text_claims, unsupported = _quote_counts(results)
+    claims, refused = _text_claim_counts(results)
     seconds = [r.seconds for r in results]
 
     by_case = {r.case: r.reading for r in results if r.case}
@@ -157,8 +162,8 @@ def metrics(results: list[PanelResult], peak_rss_mb: float | None = None) -> dic
         "panels": len(results),
         "schema_valid_rate": len(valid) / len(results) if results else None,
         "null_rate": null_rate,
-        "quotes": {"text_claims": text_claims, "unsupported": unsupported},
-        "unsupported_quote_rate": unsupported / text_claims if text_claims else None,
+        "text_claims": {"claims": claims, "refused": refused},
+        "text_claim_refusal_rate": refused / claims if claims else None,
         "seconds_per_panel": (
             {"p50": _percentile(seconds, 0.5), "p95": _percentile(seconds, 0.95)}
             if seconds

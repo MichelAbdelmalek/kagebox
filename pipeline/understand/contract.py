@@ -1,17 +1,16 @@
 """The scene contract: what the vision model may say, and how it becomes a cited SceneJSON.
 
 The model sees one panel and returns a ``PanelReading``. It never writes IDs, panel references
-or citations; those are added here, by code. A claim is either read off the picture (visual) or
-backed by an exact quote of the panel's own OCR text. A quote that is not in that text is
-dropped and the field stays null, with an Issue for the review queue.
+or citations; those are added here, by code. Scene fields describe what is DRAWN: a claim whose
+evidence is ``text`` (taken from the speech bubbles) is dropped and the field stays null, with an
+Issue for the review queue. Dialogue is already stored as OCR bubbles, and text inside a panel is
+untrusted data that must never steer a scene field.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
-import unicodedata
 from typing import Annotated, Literal
 
 from pydantic import Field, model_validator
@@ -20,9 +19,7 @@ from pipeline.common.schemas import Cited, Provenance, SceneJSON, Strict
 from pipeline.common.schemas.understanding import Figure, ShotHint
 
 # Review item kinds raised by the understand stage.
-REVIEW_KINDS: tuple[str, ...] = ("scene_failed", "scene_unsupported_quote")
-
-MIN_QUOTE_CHARS = 2  # after normalisation; a single character proves nothing
+REVIEW_KINDS: tuple[str, ...] = ("scene_failed", "scene_text_claim")
 
 _Text500 = Annotated[str, Field(max_length=500)]
 
@@ -32,17 +29,14 @@ class Claim(Strict):
 
     value: _Text500 | None = None
     evidence: Literal["visual", "text"] | None = None
-    quote: _Text500 | None = None
 
     @model_validator(mode="after")
     def _evidence_rules(self) -> Claim:
         if self.value is None:
-            if self.evidence is not None or self.quote is not None:
-                raise ValueError("a null value carries no evidence and no quote")
+            if self.evidence is not None:
+                raise ValueError("a null value carries no evidence")
         elif self.evidence is None:
             raise ValueError("a value needs evidence: visual or text")
-        elif self.evidence == "text" and self.quote is None:
-            raise ValueError("text evidence needs a quote")
         return self
 
 
@@ -63,46 +57,18 @@ class PanelReading(Strict):
 
 
 class Issue(Strict):
-    kind: Literal["scene_unsupported_quote"]
+    kind: Literal["scene_text_claim"]
     field: str  # for example "weather" or "figures[1].emotion" (index in the model's answer)
 
 
-_PUNCT = str.maketrans(
-    {
-        "\u3002": ".",
-        "\u3001": ",",
-        "\u300c": '"',
-        "\u300d": '"',
-        "\u300e": '"',
-        "\u300f": '"',
-        "\u201c": '"',
-        "\u201d": '"',
-        "\u2018": "'",
-        "\u2019": "'",
-        "\u301c": "~",
-        "\uff5e": "~",
-    }
-)
-
-
-def normalise(text: str) -> str:
-    """NFKC, all whitespace removed, ASCII and full-width punctuation unified."""
-    folded = unicodedata.normalize("NFKC", text).translate(_PUNCT)
-    return re.sub(r"\s+", "", folded)
-
-
-def _resolve(
-    claim: Claim, field: str, panel_id: str, ocr_norm: str, issues: list[Issue]
-) -> Cited[str]:
-    """Turn a claim into a cited value, or an empty one (with an Issue if a quote failed)."""
+def _resolve(claim: Claim, field: str, panel_id: str, issues: list[Issue]) -> Cited[str]:
+    """Turn a claim into a cited value, or an empty one (with an Issue for text evidence)."""
     value = claim.value
     if value is None or not value.strip():
         return Cited[str]()
     if claim.evidence == "text":
-        quote = normalise(claim.quote or "")
-        if len(quote) < MIN_QUOTE_CHARS or quote not in ocr_norm:
-            issues.append(Issue(kind="scene_unsupported_quote", field=field))
-            return Cited[str]()
+        issues.append(Issue(kind="scene_text_claim", field=field))  # field name only, never text
+        return Cited[str]()
     return Cited[str](value=value, panel_ids=[panel_id])
 
 
@@ -111,15 +77,13 @@ def to_scene(
     *,
     scene_id: str,
     panel_id: str,
-    ocr_text: str,
     provenance: Provenance,
 ) -> tuple[SceneJSON, list[Issue]]:
-    """Cite every kept claim to ``panel_id``; null every claim the evidence does not support."""
+    """Cite every kept claim to ``panel_id``; null every claim that is not drawn."""
     issues: list[Issue] = []
-    ocr_norm = normalise(ocr_text)
 
     def resolve(claim: Claim, field: str) -> Cited[str]:
-        return _resolve(claim, field, panel_id, ocr_norm, issues)
+        return _resolve(claim, field, panel_id, issues)
 
     figures: list[Figure] = []
     for i, fig in enumerate(reading.figures):

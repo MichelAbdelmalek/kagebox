@@ -24,8 +24,8 @@ from pipeline.understand.contract import Claim, FigureReading, PanelReading
 NULL = Claim()
 
 
-def claim(value: str | None, evidence: str | None = "visual", quote: str | None = None) -> Claim:
-    return Claim(value=value, evidence=evidence if value else None, quote=quote)  # type: ignore[arg-type]
+def claim(value: str | None, evidence: str | None = "visual") -> Claim:
+    return Claim(value=value, evidence=evidence if value else None)  # type: ignore[arg-type]
 
 
 def reading(**kw: Claim | None) -> PanelReading:
@@ -61,11 +61,12 @@ def test_synthetic_cases_deterministic() -> None:
     assert len({c.png for c in a}) == 4  # speech and speech_injected share one image
 
 
-def test_metrics_counts_valid_null_and_quote_rates() -> None:
+def test_metrics_counts_valid_null_and_text_claim_rates() -> None:
     good = reading(
         setting=claim("a street", "visual"),
-        weather=claim("rain", "text", "雨が降る"),  # supported by the OCR below
-        action=claim("shouting", "text", "bogus quote"),  # unsupported
+        weather=claim("rain", "text"),  # refused by the contract
+        action=claim("shouting", "text"),  # refused by the contract
+        time_of_day=claim("dusk", "visual"),
         shot_hint="wide",
         figures=[FigureReading(description=claim("a man"), emotion=NULL)],
     )
@@ -77,12 +78,13 @@ def test_metrics_counts_valid_null_and_quote_rates() -> None:
     m = metrics(results, peak_rss_mb=1234.5)
     assert m["panels"] == 3
     assert m["schema_valid_rate"] == pytest.approx(2 / 3)
-    # null rate is over valid readings only (2): setting null in 1, time_of_day in 2, ...
+    # null rate is over valid readings only (2): setting null in 1, weather in 1, ...
     assert m["null_rate"]["setting"] == pytest.approx(0.5)
-    assert m["null_rate"]["time_of_day"] == pytest.approx(1.0)
+    assert m["null_rate"]["time_of_day"] == pytest.approx(0.5)
     assert m["null_rate"]["shot_hint"] == pytest.approx(0.5)
-    assert m["quotes"] == {"text_claims": 2, "unsupported": 1}
-    assert m["unsupported_quote_rate"] == pytest.approx(0.5)
+    assert m["text_claims"] == {"claims": 5, "refused": 2}  # non-null claims; text ones refused
+    assert m["text_claim_refusal_rate"] == pytest.approx(0.4)
+    assert "quotes" not in m and "unsupported_quote_rate" not in m
     assert m["seconds_per_panel"] == {"p50": 3.0, "p95": 5.0}
     assert m["peak_rss_mb"] == 1234.5
 
@@ -113,7 +115,7 @@ def test_record_writes_fixtures_replay_can_read(tmp_path: Path) -> None:
     cases = [BakePanel(c.name, c.png, c.ocr_text, c.name) for c in synthetic_cases()]
     out = json.dumps(
         {
-            k: {"value": None, "evidence": None, "quote": None}
+            k: {"value": None, "evidence": None}
             for k in ("setting", "action", "time_of_day", "weather")
         }
     )
