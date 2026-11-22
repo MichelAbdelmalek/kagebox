@@ -17,6 +17,7 @@ from pipeline.providers.base import (
 from pipeline.providers.registry import (
     ModelNotApproved,
     UnsafeWeights,
+    load_yaml,
     model_for_stage,
     trust_remote_code,
 )
@@ -83,9 +84,28 @@ def test_fence_cannot_be_closed_from_inside() -> None:
     assert fenced.count(UNTRUSTED_CLOSE) == 1 and fenced.endswith(UNTRUSTED_CLOSE)
 
 
-def test_unapproved_model_refused() -> None:
+def test_unapproved_model_refused(tmp_path: Path) -> None:
+    (tmp_path / "models.yaml").write_text(
+        "stages:\n  understand:\n    provider: local\n    model: null\n    status: proposed\n"
+    )
     with pytest.raises(ModelNotApproved):
-        model_for_stage("understand")  # proposed until the 1.2 bake-off
+        model_for_stage("understand", tmp_path)
+
+
+def test_understand_stage_is_the_approved_local_vl_model() -> None:
+    spec = model_for_stage("understand")
+    assert (spec.provider, spec.model, spec.license) == (
+        "local",
+        "qwen3-vl-2b-instruct",
+        "Apache-2.0",
+    )
+    assert spec.source_url.startswith("https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct")
+    entry = load_yaml("models.yaml")
+    stage = entry["stages"]["understand"]
+    pinned = entry["models"][spec.model]
+    assert pinned["status"] == "approved" and pinned["revision"] == spec.revision
+    assert pinned["license"] == spec.license and len(spec.revision) == 40
+    assert "fallback" not in stage and stage["status"] == "approved"
 
 
 def test_trust_remote_code_denied_by_default(tmp_path: Path) -> None:

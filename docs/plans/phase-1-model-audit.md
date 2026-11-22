@@ -55,3 +55,23 @@ CPU time and memory per model on arm64, and the combined RAM of all models again
 ## Decision (2026-11-21): local VLM
 
 Scene understanding runs a small open-weight vision model locally on `worker-cpu` instead of Together. Reasons: no page image leaves the machine (no cloud-processing consent needed for this stage), no per-token cost, and the loader already enforces safetensors, pinned revisions and checksums. Candidates are Qwen3-VL-2B-Instruct, Qwen3.5-2B and Qwen3.5-0.8B (all Apache-2.0), run in bf16 on CPU (no fp32 for the 2B models). `stages.understand` stays `proposed` with `model: null` until the bake-off pins one. Output is validated against the strict reading schema with retries; output that still fails becomes a ReviewItem. Together remains the provider for the director stage only.
+
+## Decision (2026-11-22): owner approved qwen3-vl-2b-instruct
+
+`stages.understand` is now `provider: local`, `model: qwen3-vl-2b-instruct` (Qwen/Qwen3-VL-2B-Instruct, revision `89644892e4d85e24eaac8bacfd4f463576704203`, Apache-2.0), `status: approved`, with no fallback for now. `qwen3-5-2b` and `qwen3-5-0-8b` stay pinned in `models:` and on disk; the 0.8B is kept as an optional fast "draft pass" candidate, to be re-tested in the next stage with prompt v2. Neither is a stage model.
+
+Evidence: the real bake-off (15 panels per run: 10 from one chapter plus 5 synthetic; report `data/reports/understand-bakeoff/20261121T200218Z/`, gitignored; prompt v1). Rates come from a small sample and are indicative only.
+
+| run | schema-valid | null rate (setting / action / time / weather / shot_hint) | text-evidence claims, unsupported quotes | s/panel p50 / p95 | peak RSS |
+|---|---|---|---|---|---|
+| qwen3-vl-2b-instruct bf16 | 15/15 (1.00) | 0 / 0 / 0.87 / 0.87 / 0 | 3, 1 (33%) | 153 / 322 | 5.8 GB |
+| qwen3-5-2b bf16 | 12/15 (0.80) | 0 / 0 / 0.83 / 0.92 / 0 | 1, 0 | 152 / 546 | 6.1 GB |
+| qwen3-5-0-8b bf16 | 15/15 (1.00) | 0 / 0 / 0.13 / 0.87 / 0 | 4, 3 (75%) | 59 / 110 | 3.2 GB |
+| qwen3-5-0-8b fp32 | 15/15 (1.00) | 0 / 0 / 0.13 / 0.87 / 0 | 3, 2 (67%) | 75 / 120 | 6.4 GB |
+
+Why this model: 100% schema-valid, descriptions stay on what is drawn, it nulls time of day and weather when unsure, and it did not copy the prompt example (the other two did). The 0.8B is 2.6x faster but invents content and cites text it does not have.
+
+Consequences of the bake-off, decided with this approval:
+- Every model set `weather` to "storm" from an instruction inside a speech bubble, with a quote that really was in the OCR text. Ruling R3: scene fields describe what is drawn, so a claim with `text` evidence is nulled and raised as `scene_text_claim`; the quote check is removed. Dialogue stays stored as OCR bubbles.
+- Ruling R5: prompt v2 (`configs/prompts/understand.v2.md`) replaces the concrete example with placeholders; v1 stays on disk as the prompt of the recorded run.
+- Still open: throughput. At p50 of 153 s a 238-panel chapter projects to about 10 h against the 7 h cap (`max_minutes_per_chapter: 420`); thread count, `max_pixels` and the cap need a measurement in the next stage.

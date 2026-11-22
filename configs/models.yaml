@@ -4,20 +4,19 @@
 # Policy (pipeline/providers/weights.py): every file is pinned by commit SHA + sha256 + size;
 # pickle formats are never accepted; .safetensors is the default weights format and any other
 # non-pickle format needs a reviewed format_exception. The stages section lists the model for each
-# stage: hosted (Together) for director, local for understand (a pinned entry in the models
-# section once chosen). A stage is used only when its status is approved.
+# stage: hosted (Together) for director, local for understand (qwen3-vl-2b-instruct, a pinned entry in
+# the models section; no fallback yet). A stage is used only when its status is approved.
 # Audit and decisions: docs/plans/phase-1-model-audit.md. Licenses: LICENSES.md.
 
 version: 1
 stages:
   understand:
     provider: local
-    model: null
-    candidates:
-    - qwen3-vl-2b-instruct
-    - qwen3-5-2b
-    - qwen3-5-0-8b
-    status: proposed
+    model: qwen3-vl-2b-instruct
+    revision: 89644892e4d85e24eaac8bacfd4f463576704203
+    license: Apache-2.0
+    source: https://huggingface.co/Qwen/Qwen3-VL-2B-Instruct/tree/89644892e4d85e24eaac8bacfd4f463576704203
+    status: approved
   director:
     provider: together
     model: openai/gpt-oss-120b
