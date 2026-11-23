@@ -104,7 +104,9 @@ def test_chapter_pipeline_wires_the_understand_runner(monkeypatch: pytest.Monkey
     monkeypatch.setattr(database_mod, "make_engine", lambda s: object())
     monkeypatch.setattr(settings_mod, "get_settings", lambda: object())
     monkeypatch.setattr(flows_mod, "db_rights_loader", lambda e: lambda p: None)
-    chapter_pipeline("proj_1", "chap_1")
+    chapter_pipeline("proj_1", "chap_1")  # unconfirmed: never a silent 12-hour run
+    assert seen["runners"]["understand"]("chap_1")["status"] == flows_mod.UNDERSTAND_SKIPPED
+    chapter_pipeline("proj_1", "chap_1", confirm_full_understand=True)
     assert seen["runners"]["understand"] is understand_mod.understand_stage
 
 
@@ -121,3 +123,38 @@ def test_deployment_parameters_validate() -> None:
         chapter_pipeline.validate_parameters(
             {"project_id": "proj_1", "chapter_id": "c", "profile": "nope"}
         )
+
+
+def test_pipeline_does_not_run_a_full_understand_unconfirmed() -> None:
+    from orchestration.flows import STAGES as ALL
+    from orchestration.flows import UNDERSTAND_SKIPPED, understand_runner
+
+    calls: list[str] = []
+
+    def full(chapter_id: str) -> dict[str, str]:
+        calls.append(chapter_id)
+        return {"stage": "understand", "chapter_id": chapter_id, "status": "done"}
+
+    assert "understand" in ALL
+    skipped = understand_runner(full, confirm_full=False)("chap_1")
+    assert skipped == {"stage": "understand", "chapter_id": "chap_1", "status": UNDERSTAND_SKIPPED}
+    assert UNDERSTAND_SKIPPED == "skipped: trial and confirmation required"
+    assert calls == []
+    assert understand_runner(full, confirm_full=True)("chap_1")["status"] == "done"
+    assert calls == ["chap_1"]
+    out = run_chapter(
+        lambda _: rec(),
+        "proj_1",
+        "chap_1",
+        "gpu",
+        runners={"understand": understand_runner(full, confirm_full=False)},
+    )
+    assert [r["status"] for r in out if r["stage"] == "understand"] == [UNDERSTAND_SKIPPED]
+    assert calls == ["chap_1"]
+
+
+def test_chapter_pipeline_declares_confirm_full_understand_default_false() -> None:
+    import inspect
+
+    p = inspect.signature(chapter_pipeline.fn).parameters["confirm_full_understand"]
+    assert p.default is False

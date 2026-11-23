@@ -72,6 +72,20 @@ def run_stage(
 
 Profile = Literal["cloud", "gpu"]
 
+UNDERSTAND_SKIPPED = "skipped: trial and confirmation required"
+
+
+def understand_runner(full: StageRunner, confirm_full: bool) -> StageRunner:
+    """A full understand run takes hours: the pipeline starts one only when it was confirmed
+    (after a trial); otherwise the stage is skipped without running a model."""
+    if confirm_full:
+        return full
+
+    def skipped(chapter_id: str) -> StageResult:
+        return {"stage": "understand", "chapter_id": chapter_id, "status": UNDERSTAND_SKIPPED}
+
+    return skipped
+
 
 def run_chapter(
     load: RightsLoader,
@@ -95,7 +109,10 @@ def run_chapter(
 
 @flow(name="chapter-pipeline", log_prints=False, validate_parameters=True)
 def chapter_pipeline(
-    project_id: str, chapter_id: str, profile: Profile = "cloud"
+    project_id: str,
+    chapter_id: str,
+    profile: Profile = "cloud",
+    confirm_full_understand: bool = False,
 ) -> list[StageResult]:
     """Deployment entry point. Parameters must stay JSON-serializable."""
     from orchestration.ingest_flow import ingest_stage  # deferred: they import this module
@@ -108,5 +125,8 @@ def chapter_pipeline(
         project_id,
         chapter_id,
         profile,
-        runners={"ingest": ingest_stage, "understand": understand_stage},
+        runners={
+            "ingest": ingest_stage,
+            "understand": understand_runner(understand_stage, confirm_full_understand),
+        },
     )
