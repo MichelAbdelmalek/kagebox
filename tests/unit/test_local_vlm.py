@@ -144,7 +144,7 @@ def test_settings_bounds(bad: dict[str, Any]) -> None:
 def test_committed_settings_and_prompt_are_valid() -> None:
     s = load_settings()
     assert (s.threads, s.dtype, s.max_pixels, s.max_new_tokens) == (4, "bfloat16", 301056, 512)
-    assert (s.max_attempts, s.max_time_s, s.max_minutes_per_chapter) == (3, 150, 720)
+    assert (s.max_attempts, s.max_time_s, s.max_minutes_per_chapter) == (2, 240, 720)
     assert s.prompt_version == "v3"
     text, digest = prompt_text(s)
     assert len(digest) == 64
