@@ -37,8 +37,8 @@ def rec(**over: Any) -> RightsRecord:
 
 
 @flow
-def harness_flow(load: Any, profile: str = "cloud") -> list[dict[str, str]]:
-    return run_chapter(load, "proj_1", "chap_1", profile)  # type: ignore[arg-type]
+def harness_flow(load: Any, profile: str = "cloud", runners: Any = None) -> list[dict[str, str]]:
+    return run_chapter(load, "proj_1", "chap_1", profile, runners=runners)  # type: ignore[arg-type]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -82,7 +82,7 @@ def test_understand_stage_needs_render_rights_only() -> None:
         return {"stage": "understand", "chapter_id": chapter_id, "status": "done"}
 
     with pytest.raises(RightsDenied, match="hosted provider"):  # director, a later stage
-        run_chapter(lambda _: no_cloud, "proj_1", "chap_1", "cloud", {"understand": runner})
+        harness_flow(lambda _: no_cloud, "cloud", {"understand": runner})
     assert ran == ["chap_1"]  # the stage itself ran
 
 
@@ -142,10 +142,9 @@ def test_pipeline_does_not_run_a_full_understand_unconfirmed() -> None:
     assert calls == []
     assert understand_runner(full, confirm_full=True)("chap_1")["status"] == "done"
     assert calls == ["chap_1"]
-    out = run_chapter(
+    # inside a flow run, so the stage tasks log to a flow run (no "without a flow run id" warnings)
+    out = harness_flow(
         lambda _: rec(),
-        "proj_1",
-        "chap_1",
         "gpu",
         runners={"understand": understand_runner(full, confirm_full=False)},
     )
