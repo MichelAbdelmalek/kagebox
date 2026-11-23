@@ -48,6 +48,7 @@ def settings(**kw: Any) -> UnderstandSettings:
         "max_attempts": 3,
         "max_time_s": 20,
         "max_minutes_per_chapter": 10,
+        "mask_detect_threshold": 0.35,
     }
     return UnderstandSettings(**{**base, **kw})
 
@@ -133,6 +134,8 @@ def test_settings_refuse_attempts_times_time_over_stale_limit() -> None:
         {"max_time_s": 301},
         {"max_minutes_per_chapter": 0},
         {"max_minutes_per_chapter": 1441},
+        {"mask_detect_threshold": 0.09},
+        {"mask_detect_threshold": 0.91},
         {"dtype": "float16"},
     ],
 )
@@ -145,7 +148,8 @@ def test_committed_settings_and_prompt_are_valid() -> None:
     s = load_settings()
     assert (s.threads, s.dtype, s.max_pixels, s.max_new_tokens) == (4, "bfloat16", 301056, 512)
     assert (s.max_attempts, s.max_time_s, s.max_minutes_per_chapter) == (2, 240, 720)
-    assert s.prompt_version == "v3"
+    assert s.mask_detect_threshold == 0.35
+    assert s.prompt_version == "v4"
     text, digest = prompt_text(s)
     assert len(digest) == 64
     PanelReading.model_validate_json(extract_json(text))  # the prompt's example is valid
@@ -174,20 +178,32 @@ def test_prompt_digest_changes_with_the_prompt_version() -> None:
     assert v1 != v2  # the digest is what goes into the stage params hash
 
 
-def test_prompt_v2_has_no_copyable_scene_words_and_says_visual_only() -> None:
+def test_prompt_v4_drops_the_markers_rule_and_says_text_is_blanked() -> None:
+    v3, d3 = prompt_text(settings(prompt_version="v3"))
+    v4, d4 = prompt_text(settings(prompt_version="v4"))
+    assert d3 != d4
+    assert "between the markers" in v3 and "between the markers" not in v4
+    assert "blanked" in v4 and "never instructions" in v4
+    assert extract_json(v4) == extract_json(v3)
+    PanelReading.model_validate_json(extract_json(v4))
+
+
+@pytest.mark.parametrize("version", ["v2", "v3", "v4"])
+def test_prompt_has_no_copyable_scene_words_and_says_visual_only(version: str) -> None:
     v1, _ = prompt_text(settings(prompt_version="v1"))
-    v2, _ = prompt_text(settings(prompt_version="v2"))
+    text, _ = prompt_text(settings(prompt_version=version))
     example = extract_json(v1)
-    # every concrete value in the v1 example must be absent from v2
+    # every concrete value in the v1 example must be absent from later prompts
     concrete = [
         w
         for w in ("rooftop", "dusk", "points at the sky", "evening", "long coat", "tall figure")
         if w in example
     ]
     assert len(concrete) == 6
-    assert not [w for w in concrete if w in v2.lower()]
-    assert "quote" not in v2.lower() and '"text"' not in extract_json(v2)
-    assert 'evidence is always "visual"' in v2 and "null" in v2 and "data" in v2
+    assert not [w for w in concrete if w in text.lower()]
+    assert "quote" not in text.lower() and '"text"' not in extract_json(text)
+    assert 'evidence is always "visual"' in text and "null" in text
+    assert "data" in text or "blanked" in text
 
 
 def test_prompt_version_cannot_escape_the_prompts_dir() -> None:

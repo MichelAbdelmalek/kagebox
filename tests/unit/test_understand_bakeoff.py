@@ -213,3 +213,54 @@ def test_chapter_panel_masks_stored_boxes() -> None:
     )
     out = Image.open(io.BytesIO(panel.sent_png())).convert("RGB")
     assert out.getpixel((10, 10)) == (255, 255, 255)
+
+
+def test_tap_records_raw_text_through_the_real_provider() -> None:
+    # --record was broken once: the provider passes on_invalid= to structured_from_text, which
+    # the tap's wrapper did not accept
+    from orchestration.understand_bakeoff import tap_raw_text
+    from tests.unit.test_local_vlm import SPEC as TOY
+    from tests.unit.test_local_vlm import Out, make
+    from tests.unit.test_local_vlm import png as toy_png
+
+    prov, proc, _, _ = make()
+    proc.reply = "not json"
+    panel = BakePanel("synthetic_x", toy_png(8, 8), "", "x")
+
+    def call(p: BakePanel) -> object:
+        return prov.vlm_structured(TOY, "i", "", [p.png], Out)
+
+    assert tap_raw_text(call)(panel) == ["not json"] * 3  # failed attempts are recorded too
+    proc.reply = '{"answer": "ok"}'
+    assert tap_raw_text(call)(panel) == ['{"answer": "ok"}']
+    from pipeline.providers import local_vlm
+
+    assert local_vlm.structured_from_text.__name__ == "structured_from_text"  # restored
+
+
+def test_process_panels_records_a_raising_panel_as_failed_by_class_name() -> None:
+    panels = [BakePanel(f"p{i}", b"x", "t") for i in range(3)]
+
+    def call(p: BakePanel) -> PanelReading:
+        if p.panel_id == "p1":
+            raise RuntimeError("secret model text")
+        return reading()
+
+    out = process_panels(call, panels)
+    assert [r.reading is not None for r in out] == [True, False, True]
+    assert out[1].error == "RuntimeError" and out[0].error is None
+    assert "secret" not in repr(out[1])
+
+
+def test_record_cases_uses_the_sent_image_for_the_key(tmp_path: Path) -> None:
+    cases = [BakePanel.from_case(c) for c in synthetic_cases()]
+    out = json.dumps(
+        {
+            k: {"value": None, "evidence": None}
+            for k in ("setting", "action", "time_of_day", "weather")
+        }
+    )
+    paths = record_cases(
+        cases, tmp_path, "instr", lambda p: [out], sent=lambda p: p.png + b"|detected"
+    )
+    assert len(paths) == 5  # a sent image that differs per panel: no dedupe

@@ -30,6 +30,8 @@ class UnderstandSettings(Strict):
     max_attempts: Annotated[int, Field(ge=1, le=5)]
     max_time_s: Annotated[int, Field(ge=10, le=300)]
     max_minutes_per_chapter: Annotated[int, Field(ge=1, le=1440)]
+    # recall-oriented detector threshold for the text mask (the ingest default is 0.5)
+    mask_detect_threshold: Annotated[float, Field(ge=0.1, le=0.9)]
 
     @model_validator(mode="after")
     def _limits(self) -> UnderstandSettings:

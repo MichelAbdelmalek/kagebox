@@ -38,7 +38,7 @@ from pipeline.common.schemas import BBox
 from pipeline.providers.base import ModelSpec, StructuredOutputFailed, fence_untrusted
 from pipeline.providers.replay import record_case
 from pipeline.understand.contract import Claim, PanelReading
-from pipeline.understand.mask import mask_text_regions
+from pipeline.understand.mask import mask_panel, mask_text_regions
 from pipeline.understand.settings import UnderstandSettings
 
 log = logging.getLogger("understand_bakeoff")
@@ -85,6 +85,7 @@ class PanelResult:
     reading: PanelReading | None  # None: no schema-valid answer
     ocr_text: str
     seconds: float
+    error: str | None = None  # exception class name when the panel raised; never a message
 
 
 @dataclass
@@ -264,26 +265,48 @@ def process_panels(
     out: list[PanelResult] = []
     for i, p in enumerate(panels, 1):
         start = time.perf_counter()
+        error: str | None = None
         try:
             reading: PanelReading | None = call(p)
         except StructuredOutputFailed:
             reading = None
+        except Exception as e:  # one bad panel must not lose the whole run; class name only
+            reading, error = None, type(e).__name__
         out.append(
-            PanelResult(p.panel_id, p.case, reading, p.ocr_text, time.perf_counter() - start)
+            PanelResult(p.panel_id, p.case, reading, p.ocr_text, time.perf_counter() - start, error)
         )
         if on_done is not None:
             on_done(i, len(panels), out[-1])
     return out
 
 
+def _sent_png_fn(settings: UnderstandSettings) -> Callable[[BakePanel], bytes]:
+    """What the model gets for a panel: the crop with its text masked by the stored boxes of the
+    page plus the bubble detector run on the crop (the same pinned model as ingest)."""
+    from pipeline.ingest.bubbles import BubbleDetector
+
+    detector = BubbleDetector()  # loads lazily, once per process
+
+    def sent(p: BakePanel) -> bytes:
+        if p.panel_bbox is None:
+            return p.png
+        return mask_panel(p.png, p.panel_bbox, p.boxes, detector, settings.mask_detect_threshold)
+
+    return sent
+
+
 def _make_call(
     model: str, dtype: str, settings: UnderstandSettings, instructions: str
-) -> Callable[[BakePanel], PanelReading]:
+) -> tuple[Callable[[BakePanel], PanelReading], Callable[[BakePanel], bytes]]:
     from pipeline.providers.local_vlm import LocalVlmProvider
 
     spec, _ = _spec_and_weights(model)
     provider = LocalVlmProvider(settings.model_copy(update={"dtype": dtype}))
-    return lambda p: provider.vlm_structured(spec, instructions, "", [p.sent_png()], PanelReading)
+    sent = _sent_png_fn(settings)
+    return (
+        lambda p: provider.vlm_structured(spec, instructions, "", [sent(p)], PanelReading),
+        sent,
+    )
 
 
 def _child(
@@ -297,12 +320,17 @@ def _child(
     status = "ok"
     results: list[PanelResult] = []
     try:
-        call = _make_call(model, dtype, settings, instructions)
+        call, _ = _make_call(model, dtype, settings, instructions)
         results = process_panels(
             call,
             panels,
             on_done=lambda i, n, r: log.info(
-                "  panel %d/%d %.1fs valid=%s", i, n, r.seconds, r.reading is not None
+                "  panel %d/%d %.1fs valid=%s error=%s",
+                i,
+                n,
+                r.seconds,
+                r.reading is not None,
+                r.error,
             ),
         )
     except Exception as e:  # model load failure etc.; the class name only, never a message
@@ -318,6 +346,7 @@ def _child(
                         "panel_id": r.panel_id,
                         "case": r.case,
                         "seconds": r.seconds,
+                        "error": r.error,
                         "reading": r.reading.model_dump() if r.reading else None,
                     }
                     for r in results
@@ -343,10 +372,14 @@ def run_one(
     proc = ctx.Process(target=_child, args=(model, dtype, panels, str(out_file), overrides or {}))
     proc.start()
     proc.join()
-    if proc.exitcode != 0 or not out_file.exists():
-        return RunResult(model, dtype, f"failed: exit {proc.exitcode}", label=label)
-    raw = json.loads(out_file.read_text(encoding="utf-8"))
-    out_file.unlink()  # the panel text lives in memory; only the sheet and metrics are kept
+    try:
+        if proc.exitcode != 0 or not out_file.exists():
+            return RunResult(model, dtype, f"failed: exit {proc.exitcode}", label=label)
+        raw = json.loads(out_file.read_text(encoding="utf-8"))
+    finally:
+        # the raw file holds validated model output: it never outlives this function, success
+        # or failure
+        out_file.unlink(missing_ok=True)
     by_id = {p.panel_id: p for p in panels}
     results = [
         PanelResult(
@@ -355,6 +388,7 @@ def run_one(
             PanelReading.model_validate(r["reading"]) if r["reading"] else None,
             by_id[r["panel_id"]].ocr_text,
             r["seconds"],
+            r.get("error"),
         )
         for r in raw["results"]
     ]
@@ -373,17 +407,20 @@ def record_cases(
     fixtures_dir: Path,
     instructions: str,
     call: Callable[[BakePanel], list[str]],
+    sent: Callable[[BakePanel], bytes] | None = None,
 ) -> list[Path]:
     """Write one replay fixture per synthetic panel. ``call`` returns the raw model text of
     each attempt. Chapter panels are refused before anything is written."""
     if not all(p.synthetic for p in panels):
         raise ValueError("only synthetic panels may be recorded as fixtures")
     paths: list[Path] = []
+    sent = sent or BakePanel.sent_png
     seen: set[str] = set()  # masked injection == clean: one fixture serves both
     for p in panels:
-        if _sha(p.sent_png()) in seen:
+        image = sent(p)
+        if _sha(image) in seen:
             continue
-        seen.add(_sha(p.sent_png()))
+        seen.add(_sha(image))
         if p.case is None:  # unreachable after the check above; keeps the type narrow
             raise ValueError("only synthetic panels may be recorded as fixtures")
         paths.append(
@@ -391,7 +428,7 @@ def record_cases(
                 fixtures_dir,
                 p.case,
                 _sha(instructions.encode("utf-8")),
-                _sha(p.sent_png()),
+                _sha(image),
                 _sha(fence_untrusted("").encode("utf-8")),
                 call(p),
             )
@@ -399,25 +436,32 @@ def record_cases(
     return paths
 
 
-def _recording_call(
-    model: str, dtype: str, settings: UnderstandSettings, instructions: str
-) -> Callable[[BakePanel], list[str]]:
-    """Run the real provider and capture each attempt's raw text via its structured helper."""
+def tap_raw_text(call: Callable[[BakePanel], Any]) -> Callable[[BakePanel], list[str]]:
+    """Wrap a provider call so it returns the raw model text of every attempt.
+
+    Taps the provider's ``structured_from_text`` helper; extra keyword arguments (``on_invalid``)
+    pass straight through.
+    """
     from pipeline.providers import local_vlm
 
-    call = _make_call(model, dtype, settings, instructions)
     real = getattr(local_vlm, _TAP_TARGET)
 
     def capture(p: BakePanel) -> list[str]:
         seen: list[str] = []
 
-        def wrapped(spec: ModelSpec, schema: Any, generate: Callable[[int], str], n: int) -> Any:
+        def wrapped(
+            spec: ModelSpec,
+            schema: Any,
+            generate: Callable[[int], str],
+            n: int,
+            **kw: Any,
+        ) -> Any:
             def tap(attempt: int) -> str:
                 text = generate(attempt)
                 seen.append(text)
                 return text
 
-            return real(spec, schema, tap, n)
+            return real(spec, schema, tap, n, **kw)
 
         setattr(local_vlm, _TAP_TARGET, wrapped)
         try:
@@ -517,12 +561,19 @@ def load_chapter_panels(chapter_id: str, first: int, last: int, limit: int) -> l
                 ).scalars()
             )
             ocr = "\n".join(str(a.get("text", "")) for a in artifacts)
+            # every stored region of the PAGE: a balloon crossing a panel border is stored on one
+            # neighbour only, and the mask must cover it in this crop too
+            page_regions = db.execute(
+                select(BubbleRow.artifact)
+                .join(PanelRow, PanelRow.id == BubbleRow.panel_id)
+                .where(PanelRow.page_id == row.page_id)
+            ).scalars()
             panels.append(
                 BakePanel(
                     row.id,
                     store.get(row.artifact["crop_ref"]),
                     ocr,
-                    boxes=tuple(BBox.model_validate(a["bbox"]) for a in artifacts),
+                    boxes=tuple(BBox.model_validate(a["bbox"]) for a in page_regions),
                     panel_bbox=BBox.model_validate(row.artifact["bbox"]),
                 )
             )
@@ -568,7 +619,11 @@ def main(argv: list[str] | None = None) -> int:
         type=parse_config,
         help="NAME[,threads=N][,max_pixels=N]; repeat to compare settings (default: as configured)",
     )
-    ap.add_argument("--record", type=Path, help="write replay fixtures from synthetic cases only")
+    ap.add_argument(
+        "--record",
+        type=Path,
+        help="synthetic replay fixtures to a writable dir (e.g. /reports/fx)",
+    )
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     models = [m for m in args.models.split(",") if m]
@@ -588,12 +643,8 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--record needs exactly one model")
         args.record.mkdir(parents=True, exist_ok=True)
         dtype = dtypes[0]
-        paths = record_cases(
-            synthetic,
-            args.record,
-            instructions,
-            _recording_call(models[0], dtype, settings, instructions),
-        )
+        call, sent = _make_call(models[0], dtype, settings, instructions)
+        paths = record_cases(synthetic, args.record, instructions, tap_raw_text(call), sent)
         log.info("recorded %d synthetic fixtures", len(paths))
         return 0
 

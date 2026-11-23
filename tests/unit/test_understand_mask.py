@@ -111,3 +111,72 @@ def test_huge_canvas_refused_before_decode() -> None:
     Image.new("1", (20_000, 20_000)).save(buf, format="PNG")
     with pytest.raises(UploadRejected):
         mask_text_regions(buf.getvalue(), [], PANEL)
+
+
+# ---- text_mask_boxes: stored boxes of the whole page UNION detection on the crop --------
+
+from PIL import Image as _Image  # noqa: E402
+
+from pipeline.ingest.bubbles import Region  # noqa: E402
+from pipeline.understand.mask import mask_panel, text_mask_boxes  # noqa: E402
+
+
+class FakeDetector:
+    def __init__(self, regions: list[Region] | None = None) -> None:
+        self.regions = regions or []
+        self.calls: list[tuple[tuple[int, int], float]] = []
+
+    def detect(self, img: _Image.Image, threshold: float = 0.5) -> list[Region]:
+        self.calls.append((img.size, threshold))
+        return self.regions
+
+
+def region(bbox: BBox, text: BBox | None = None, kind: str = "speech") -> Region:
+    return Region(bbox, kind, 0.9, "bubble", text)  # type: ignore[arg-type]
+
+
+def test_straddling_bubble_stored_on_the_neighbour_is_masked_here() -> None:
+    # stored page box spans x 150..190; this panel covers x 100..160: only 10 px of it is inside
+    boxes = text_mask_boxes(crop_png(), PANEL, [box(150, 210, 40, 20)], FakeDetector())
+    assert boxes == [BBox(x=50, y=10, w=10, h=20)]  # crop coordinates, clamped to the crop
+    out = pixels(mask_panel(crop_png(), PANEL, [box(150, 210, 40, 20)], FakeDetector()))
+    assert out.getpixel((55, 15)) == BG
+
+
+def test_stored_boxes_outside_the_panel_are_ignored() -> None:
+    assert (
+        text_mask_boxes(crop_png(), PANEL, [box(0, 0, 50, 50), box(300, 300, 9, 9)], FakeDetector())
+        == []
+    )
+
+
+def test_unstored_region_is_still_masked_by_detection() -> None:
+    det = FakeDetector([region(BBox(x=10, y=10, w=20, h=20), BBox(x=12, y=12, w=10, h=10))])
+    out = pixels(mask_panel(crop_png(), PANEL, [], det, threshold=0.35))
+    assert out.getpixel((10, 10)) == BG and out.getpixel((29, 29)) == BG  # the outer balloon box
+    assert det.calls == [((60, 40), 0.35)]  # the crop itself is detected, at the given threshold
+
+
+def test_detected_text_box_and_every_kind_are_masked() -> None:
+    det = FakeDetector(
+        [
+            region(BBox(x=0, y=0, w=5, h=5), None, "speech"),
+            region(BBox(x=20, y=30, w=8, h=8), BBox(x=40, y=30, w=8, h=8), "caption"),
+        ]
+    )
+    boxes = text_mask_boxes(crop_png(), PANEL, [], det)
+    assert BBox(x=40, y=30, w=8, h=8) in boxes and BBox(x=20, y=30, w=8, h=8) in boxes
+    assert BBox(x=0, y=0, w=5, h=5) in boxes
+
+
+def test_nothing_detected_nothing_stored_image_unchanged() -> None:
+    png = crop_png()
+    assert pixels(mask_panel(png, PANEL, [], FakeDetector())).tobytes() == pixels(png).tobytes()
+
+
+def test_output_png_has_no_metadata() -> None:
+    buf = io.BytesIO()
+    _Image.open(io.BytesIO(crop_png())).save(buf, format="PNG", icc_profile=b"x" * 64)
+    assert "icc_profile" in _Image.open(io.BytesIO(buf.getvalue())).info
+    out = _Image.open(io.BytesIO(mask_text_regions(buf.getvalue(), [], PANEL)))
+    assert "icc_profile" not in out.info
