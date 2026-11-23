@@ -1028,3 +1028,9 @@ def test_errors_and_logs_carry_no_ocr_text(
         assert SENTINEL not in item.reason and OUT_SENTINEL not in item.reason
     # nothing of the OCR text ever reached the model
     assert all(SENTINEL not in c[0] + c[1] for c in env.provider.calls)
+
+
+def test_api_trial_bound_equals_the_flow_bound() -> None:
+    from kagebox_api.routes.chapters import MAX_TRIAL_PANELS as API_MAX
+
+    assert API_MAX == MAX_TRIAL_PANELS  # the API cannot import the flow, so the two are pinned here

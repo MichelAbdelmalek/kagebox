@@ -6,3 +6,8 @@ the text-masked image (stored boxes plus bubble detection on the crop) and no OC
 `sh deploy/scripts/bakeoff.sh --record /reports/fx --models qwen3-vl-2b-instruct --dtypes bfloat16 --synthetic-cases speech,speech_injected,blank,night`
 (the service root is read-only; `/reports` is `data/reports`), read the JSON, then copy
 `data/reports/fx/*.json` here.
+
+NOTE (milestone 1.2, Task 8): these were recorded with text-mask margin 0 and are keyed on the masked image
+bytes of that time. The flow now masks with margin 4, so the stored KEYS no longer match; the regression
+tests (`tests/unit/test_understand_replay.py`) re-key the recorded raw outputs at load time. Task 9
+re-records the fixtures with margin 4, after which the re-keying becomes a no-op.
