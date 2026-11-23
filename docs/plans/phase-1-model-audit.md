@@ -58,7 +58,7 @@ Scene understanding runs a small open-weight vision model locally on `worker-cpu
 
 ## Decision (2026-11-22): owner approved qwen3-vl-2b-instruct
 
-`stages.understand` is now `provider: local`, `model: qwen3-vl-2b-instruct` (Qwen/Qwen3-VL-2B-Instruct, revision `89644892e4d85e24eaac8bacfd4f463576704203`, Apache-2.0), `status: approved`, with no fallback for now. `qwen3-5-2b` and `qwen3-5-0-8b` stay pinned in `models:` and on disk; the 0.8B is kept as an optional fast "draft pass" candidate, to be re-tested in the next stage with prompt v2. Neither is a stage model.
+`stages.understand` is now `provider: local`, `model: qwen3-vl-2b-instruct` (Qwen/Qwen3-VL-2B-Instruct, revision `89644892e4d85e24eaac8bacfd4f463576704203`, Apache-2.0), `status: approved`, with no fallback for now. `qwen3-5-2b` and `qwen3-5-0-8b` stay pinned in `models:` and on disk.
 
 Evidence: the real bake-off (15 panels per run: 10 from one chapter plus 5 synthetic; report `data/reports/understand-bakeoff/20261121T200218Z/`, gitignored; prompt v1). Rates come from a small sample and are indicative only.
 
@@ -75,3 +75,9 @@ Consequences of the bake-off, decided with this approval:
 - Every model set `weather` to "storm" from an instruction inside a speech bubble, with a quote that really was in the OCR text. Ruling R3: scene fields describe what is drawn, so a claim with `text` evidence is nulled and raised as `scene_text_claim`; the quote check is removed. Dialogue stays stored as OCR bubbles.
 - Ruling R5: prompt v2 (`configs/prompts/understand.v2.md`) replaces the concrete example with placeholders; v1 stays on disk as the prompt of the recorded run.
 - Still open: throughput. At p50 of 153 s a 238-panel chapter projects to about 10 h against the 7 h cap (`max_minutes_per_chapter: 420`); thread count, `max_pixels` and the cap need a measurement in the next stage.
+
+## Decision (2026-11-23): the two other candidates are de-approved (ruling R7)
+
+`qwen3-5-2b` and `qwen3-5-0-8b` are `status: proposed` in `configs/models.sources.yaml` and `configs/models.yaml`. Their files stay on the volume, but `models-fetch` skips them and `model_dir` refuses them (`ModelNotApproved`); `check_models` no longer loads them. Both are **not selected: evidence**:
+- qwen3-5-0-8b: nearly empty answers under prompt v3 (action and shot_hint null on every panel, one-word settings), still follows an injected weather instruction, so it cannot feed the director.
+- qwen3-5-2b: 12/15 schema-valid (0.80), parrots prompt examples, p95 546 s because of retries.

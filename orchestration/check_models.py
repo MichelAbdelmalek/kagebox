@@ -139,8 +139,6 @@ CHECKS: dict[str, Callable[[str], str]] = {
     "whisper-large-v3-turbo": whisper,
     "manga-ocr": manga_ocr,
     "qwen3-vl-2b-instruct": vlm,
-    "qwen3-5-2b": vlm,
-    "qwen3-5-0-8b": vlm,
 }
 
 

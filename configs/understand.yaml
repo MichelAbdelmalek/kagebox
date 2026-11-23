@@ -8,4 +8,4 @@ max_pixels: 301056 # 384 * 28 * 28: half the image tokens of the old 602112, no 
 max_new_tokens: 512
 max_attempts: 3
 max_time_s: 150 # per generate call
-max_minutes_per_chapter: 420
+max_minutes_per_chapter: 720 # overnight batch: resumable and cached; the trial gate projects the time first

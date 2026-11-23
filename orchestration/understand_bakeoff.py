@@ -556,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--chapter")
     ap.add_argument("--pages", type=_pages, default=(1, 1000))
     ap.add_argument("--limit", type=int, default=30)
-    ap.add_argument("--models", default="qwen3-vl-2b-instruct,qwen3-5-2b,qwen3-5-0-8b", type=str)
+    ap.add_argument("--models", default="qwen3-vl-2b-instruct", type=str)
     ap.add_argument("--dtypes", default="bfloat16,float32", type=str)
     ap.add_argument("--out", type=Path, default=Path("/reports/understand-bakeoff"))
     ap.add_argument("--pick", type=int, help="use N evenly spaced chapter panels of --limit")
