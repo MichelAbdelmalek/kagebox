@@ -41,3 +41,13 @@ def test_bakeoff_service_has_no_egress_and_no_published_ports() -> None:
     assert "models:/models:ro" in volumes
     assert "../data/reports:/reports" in volumes
     assert not any("docker.sock" in v for v in volumes)
+
+
+def test_bakeoff_target_never_rebuilds_the_image() -> None:
+    root = COMPOSE.parents[1]
+    makefile = (root / "Makefile").read_text()
+    line = next(x for x in makefile.splitlines() if x.startswith("bakeoff-understand:"))
+    assert "worker-image" not in line
+    script = (root / "deploy/scripts/bakeoff.sh").read_text()
+    assert "--no-build" in script and "/app/pipeline:ro" in script
+    assert "deploy/scripts/bakeoff.sh" in makefile

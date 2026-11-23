@@ -100,6 +100,5 @@ convert-models: worker-image ## offline: pickle -> safetensors in a sandbox, the
 	$(COMPOSE) --profile fetch run --rm models-convert
 	$(COMPOSE) --profile fetch run --rm models-promote
 
-bakeoff-understand: worker-image ## local vision bake-off (needs Docker memory >= 11 GB; ARGS="--chapter <id> ..." )
-	mkdir -p data/reports
-	$(COMPOSE) --profile bakeoff run --rm understand-bakeoff python -m orchestration.understand_bakeoff $(ARGS)
+bakeoff-understand: ## local vision bake-off, no image rebuild (needs Docker memory >= 11 GB; ARGS="--chapter <id> ...")
+	sh deploy/scripts/bakeoff.sh $(ARGS)

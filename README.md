@@ -90,7 +90,10 @@ Both return `202 {"job_id": ...}`. Follow the run with `GET /api/jobs/{job_id}` 
 | `test` | Python and web unit tests |
 | `lint` | ruff, ruff format, mypy --strict, bandit |
 | `scan` | `lint` + pip-audit, pnpm audit, hadolint, Trivy (repo), gitleaks; fails on high/critical |
+| `bakeoff-understand` | Vision-model bake-off through `deploy/scripts/bakeoff.sh`: runs in the existing `kagebox/worker:dev` image with the working tree's `pipeline/` and `orchestration/` bind-mounted, no rebuild |
 | `scan-images` | Trivy on the built images (exported tarballs; the Docker socket is never mounted) |
+
+**Image rebuilds are unavailable while the Debian apt signature error persists** (`apt-get update` fails with an invalid signature, so `make worker-image` and `make up-cloud` cannot rebuild, and a failed rebuild fills the Docker VM disk with build cache). Do not rebuild; start the stack with `KAGEBOX_PROFILE=cloud docker compose -f deploy/compose.yaml --env-file .env up -d --no-build --wait` and run the bake-off with the script above.
 
 The Phase 0 smoke test runs against the live stack: `sh tests/e2e/phase0_smoke.sh` (needs test users whose passwords are in `deploy/secrets/test_{admin,member}.password.txt`).
 
