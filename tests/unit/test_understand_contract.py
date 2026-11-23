@@ -134,3 +134,17 @@ def test_claim_without_evidence_is_drawn_and_null_value_ignores_evidence() -> No
 
 def test_review_kinds() -> None:
     assert REVIEW_KINDS == ("scene_failed", "scene_text_claim")
+
+
+def test_recorded_night_answer_validates() -> None:
+    # the 2B model's complete answer for the synthetic night panel (recorded 2026-11-23): it was
+    # rejected three times because time_of_day had a value and a null evidence
+    raw = (
+        '{"setting": {"value": "a dark night sky with a crescent moon", "evidence": "visual"}, '
+        '"action": {"value": null, "evidence": null}, '
+        '"time_of_day": {"value": "night", "evidence": null}, '
+        '"weather": {"value": null, "evidence": null}, '
+        '"shot_hint": "establishing_wide", "figures": []}'
+    )
+    scene, issues = convert(PanelReading.model_validate_json(raw))
+    assert scene.time_of_day.value == "night" and issues == []
