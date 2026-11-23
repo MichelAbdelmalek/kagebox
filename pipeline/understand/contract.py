@@ -13,7 +13,7 @@ import hashlib
 import json
 from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from pipeline.common.schemas import Cited, Provenance, SceneJSON, Strict
 from pipeline.common.schemas.understanding import Figure, ShotHint
@@ -25,19 +25,16 @@ _Text500 = Annotated[str, Field(max_length=500)]
 
 
 class Claim(Strict):
-    """One statement about the panel, with the kind of evidence behind it."""
+    """One statement about the panel, with the kind of evidence behind it.
+
+    Scene fields are visual-only, so a value without an evidence label counts as drawn (the 2B
+    model often omits it), and an evidence label on a null value means nothing. Only ``text``
+    evidence is refused, and the model's label is not a security boundary: the panel is sent
+    with its text regions masked (``pipeline/understand/mask.py``).
+    """
 
     value: _Text500 | None = None
     evidence: Literal["visual", "text"] | None = None
-
-    @model_validator(mode="after")
-    def _evidence_rules(self) -> Claim:
-        if self.value is None:
-            if self.evidence is not None:
-                raise ValueError("a null value carries no evidence")
-        elif self.evidence is None:
-            raise ValueError("a value needs evidence: visual or text")
-        return self
 
 
 class FigureReading(Strict):

@@ -117,13 +117,19 @@ def test_figures_cite_own_panel_and_figure_without_description_dropped() -> None
     assert [i.field for i in issues] == ["figures[3].description", "figures[3].emotion"]
 
 
-def test_claim_value_without_evidence_or_evidence_without_value_rejected() -> None:
+def test_claim_without_evidence_is_drawn_and_null_value_ignores_evidence() -> None:
+    # the 2B model answers {"value": "night", "evidence": null}: every complete answer failed
+    # validation three times. Scene fields are visual-only, so a missing label means visual.
+    scene, issues = convert(reading(time_of_day={"value": "night", "evidence": None}))
+    assert scene.time_of_day.value == "night" and scene.time_of_day.panel_ids == [PANEL]
+    assert issues == []
+    scene, issues = convert(reading(weather={"value": None, "evidence": "visual"}))
+    assert scene.weather.value is None and issues == []
+    # text evidence is still refused, and stray keys are still rejected
+    _, issues = convert(reading(weather={"value": "storm", "evidence": "text"}))
+    assert [i.field for i in issues] == ["weather"]
     with pytest.raises(ValidationError):
-        Claim.model_validate({"value": "x", "evidence": None})
-    with pytest.raises(ValidationError):
-        Claim.model_validate({"value": None, "evidence": "visual"})
-    with pytest.raises(ValidationError):
-        Claim.model_validate({"value": "x", "evidence": "visual", "quote": "stray"})  # gone
+        Claim.model_validate({"value": "x", "evidence": "visual", "quote": "stray"})
 
 
 def test_review_kinds() -> None:
