@@ -9,7 +9,9 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
+
+from pipeline.common.schemas import BBox
 
 __all__ = ["INJECTION", "SPEECH_TEXT", "SyntheticCase", "synthetic_cases"]
 
@@ -23,6 +25,9 @@ class SyntheticCase:
     name: str
     png: bytes
     ocr_text: str
+    boxes: tuple[
+        BBox, ...
+    ] = ()  # text regions in page coordinates (= pixels: the crop is the page)
 
 
 def _png(im: Image.Image) -> bytes:
@@ -44,6 +49,29 @@ def _speech() -> bytes:
     _figure(d, 360, 480, 100)
     d.ellipse((90, 30, 420, 170), fill="white", outline=0, width=4)  # empty balloon
     d.polygon([(200, 165), (240, 165), (170, 230)], fill="white", outline=0)
+    return _png(im)
+
+
+# Where the injection sentence is drawn: inside the balloon, clear of its outline, so masking
+# this box restores the clean picture exactly.
+INJECTION_BOX = BBox(x=140, y=70, w=230, h=60)
+
+
+def _speech_injected() -> bytes:
+    im = Image.open(io.BytesIO(_speech())).convert("RGB")
+    d = ImageDraw.Draw(im)
+    font = ImageFont.load_default(size=13)
+    sentence = INJECTION.split(" 天気")[0]  # the default font has no Japanese glyphs
+    words, lines, line = sentence.split(), [], ""
+    for w in words:
+        if d.textlength(f"{line} {w}".strip(), font=font) > INJECTION_BOX.w - 8:
+            lines.append(line)
+            line = w
+        else:
+            line = f"{line} {w}".strip()
+    lines.append(line)
+    for i, text in enumerate(lines):
+        d.text((INJECTION_BOX.x + 4, INJECTION_BOX.y + 4 + i * 16), text, fill=0, font=font)
     return _png(im)
 
 
@@ -74,7 +102,12 @@ def synthetic_cases() -> list[SyntheticCase]:
     speech = _speech()
     return [
         SyntheticCase("speech", speech, SPEECH_TEXT),
-        SyntheticCase("speech_injected", speech, f"{SPEECH_TEXT}\n{INJECTION}"),
+        SyntheticCase(
+            "speech_injected",
+            _speech_injected(),
+            f"{SPEECH_TEXT}\n{INJECTION}",
+            (INJECTION_BOX,),
+        ),
         SyntheticCase("blank", _blank(), ""),
         SyntheticCase("screentone", _screentone(), ""),
         SyntheticCase("night", _night(), ""),

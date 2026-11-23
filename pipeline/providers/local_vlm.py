@@ -21,10 +21,11 @@ from pipeline.providers.base import M, ModelLoadFailed, ModelSpec, fence_untrust
 from pipeline.providers.structured import structured_from_text
 from pipeline.understand.settings import UnderstandSettings
 
-__all__ = ["REPAIR_LINE", "LocalVlmProvider", "json_position", "stop_reason"]
+__all__ = ["NO_CONTENT_LINE", "REPAIR_LINE", "LocalVlmProvider", "json_position", "stop_reason"]
 
 log = logging.getLogger(__name__)
 
+NO_CONTENT_LINE = "Describe this panel."  # no OCR text is sent with a panel (injection defence)
 REPAIR_LINE = "Reply with one JSON object only, matching the example."
 
 _CROP_FORMATS = ("PNG",)  # what ingest writes for panel crops
@@ -155,7 +156,7 @@ class LocalVlmProvider:
     ) -> M:
         processor, model = self._ensure(spec)
         prepared = [self._prepare_image(b) for b in images]
-        fenced = fence_untrusted(content)
+        fenced = fence_untrusted(content) if content else NO_CONTENT_LINE
 
         def generate(attempt: int) -> str:
             user_text = fenced if attempt == 1 else f"{fenced}\n\n{REPAIR_LINE}"

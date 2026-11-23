@@ -18,6 +18,7 @@ from pipeline.providers.base import (
     StructuredOutputFailed,
 )
 from pipeline.providers.local_vlm import (
+    NO_CONTENT_LINE,
     REPAIR_LINE,
     LocalVlmProvider,
     json_position,
@@ -485,3 +486,11 @@ def test_failed_attempt_logs_error_shape(caplog: pytest.LogCaptureFixture) -> No
         prov.vlm_structured(SPEC, "i", "c", [png(8, 8)], Strict)
     assert "invalid: setting: string_type; ?: extra_forbidden" in caplog.text
     assert SENTINEL_OUT not in caplog.text
+
+
+def test_empty_content_sends_a_neutral_line_without_fence_or_ocr() -> None:
+    prov, proc, _, _ = make()
+    prov.vlm_structured(SPEC, "SYSTEM", "", [png(8, 8)], Out)
+    text = proc.messages[0][1]["content"][1]["text"]
+    assert UNTRUSTED_OPEN not in text and UNTRUSTED_CLOSE not in text
+    assert text == NO_CONTENT_LINE

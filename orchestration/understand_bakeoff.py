@@ -33,10 +33,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from orchestration.understand_synthetic import synthetic_cases
+from orchestration.understand_synthetic import SyntheticCase, synthetic_cases
+from pipeline.common.schemas import BBox
 from pipeline.providers.base import ModelSpec, StructuredOutputFailed, fence_untrusted
 from pipeline.providers.replay import record_case
 from pipeline.understand.contract import Claim, PanelReading
+from pipeline.understand.mask import mask_text_regions
 from pipeline.understand.settings import UnderstandSettings
 
 log = logging.getLogger("understand_bakeoff")
@@ -54,8 +56,22 @@ GB = 1024**3
 class BakePanel:
     panel_id: str
     png: bytes
-    ocr_text: str  # untrusted; never logged
+    ocr_text: str  # untrusted; never logged and never sent to the model
     case: str | None = None  # set for synthetic panels only
+    boxes: tuple[BBox, ...] = ()  # detected text regions, PAGE coordinates
+    panel_bbox: BBox | None = None  # where the crop sits on the page
+
+    @classmethod
+    def from_case(cls, c: SyntheticCase) -> BakePanel:
+        return cls(
+            f"synthetic_{c.name}", c.png, c.ocr_text, c.name, c.boxes, BBox(x=0, y=0, w=512, h=512)
+        )
+
+    def sent_png(self) -> bytes:
+        """What the model gets: the crop with its text regions filled flat."""
+        if not self.boxes or self.panel_bbox is None:
+            return self.png
+        return mask_text_regions(self.png, self.boxes, self.panel_bbox)
 
     @property
     def synthetic(self) -> bool:
@@ -267,7 +283,7 @@ def _make_call(
 
     spec, _ = _spec_and_weights(model)
     provider = LocalVlmProvider(settings.model_copy(update={"dtype": dtype}))
-    return lambda p: provider.vlm_structured(spec, instructions, p.ocr_text, [p.png], PanelReading)
+    return lambda p: provider.vlm_structured(spec, instructions, "", [p.sent_png()], PanelReading)
 
 
 def _child(
@@ -363,7 +379,11 @@ def record_cases(
     if not all(p.synthetic for p in panels):
         raise ValueError("only synthetic panels may be recorded as fixtures")
     paths: list[Path] = []
+    seen: set[str] = set()  # masked injection == clean: one fixture serves both
     for p in panels:
+        if _sha(p.sent_png()) in seen:
+            continue
+        seen.add(_sha(p.sent_png()))
         if p.case is None:  # unreachable after the check above; keeps the type narrow
             raise ValueError("only synthetic panels may be recorded as fixtures")
         paths.append(
@@ -371,8 +391,8 @@ def record_cases(
                 fixtures_dir,
                 p.case,
                 _sha(instructions.encode("utf-8")),
-                _sha(p.png),
-                _sha(fence_untrusted(p.ocr_text).encode("utf-8")),
+                _sha(p.sent_png()),
+                _sha(fence_untrusted("").encode("utf-8")),
                 call(p),
             )
         )
@@ -438,7 +458,7 @@ def contact_sheet(panels: list[BakePanel], runs: list[RunResult]) -> str:
         for r in ok:
             hit = next((x for x in r.results if x.panel_id == p.panel_id), None)
             cells.append(f"<td>{_fmt(hit.reading) if hit else ''}</td>")
-        img = base64.b64encode(p.png).decode("ascii")
+        img = base64.b64encode(p.sent_png()).decode("ascii")  # what the model saw
         label = html.escape(p.case or p.panel_id)
         body.append(
             f'<tr><td><div>{label}</div><img src="data:image/png;base64,{img}" width="220"></td>'
@@ -489,13 +509,23 @@ def load_chapter_panels(chapter_id: str, first: int, last: int, limit: int) -> l
         ).scalars()
         panels: list[BakePanel] = []
         for row in rows:
-            texts = db.execute(
-                select(BubbleRow.artifact)
-                .where(BubbleRow.panel_id == row.id)
-                .order_by(BubbleRow.reading_order)
-            ).scalars()
-            ocr = "\n".join(str(a.get("text", "")) for a in texts)
-            panels.append(BakePanel(row.id, store.get(row.artifact["crop_ref"]), ocr))
+            artifacts = list(
+                db.execute(
+                    select(BubbleRow.artifact)
+                    .where(BubbleRow.panel_id == row.id)
+                    .order_by(BubbleRow.reading_order)
+                ).scalars()
+            )
+            ocr = "\n".join(str(a.get("text", "")) for a in artifacts)
+            panels.append(
+                BakePanel(
+                    row.id,
+                    store.get(row.artifact["crop_ref"]),
+                    ocr,
+                    boxes=tuple(BBox.model_validate(a["bbox"]) for a in artifacts),
+                    panel_bbox=BBox.model_validate(row.artifact["bbox"]),
+                )
+            )
     return panels
 
 
@@ -545,9 +575,7 @@ def main(argv: list[str] | None = None) -> int:
     dtypes = [d for d in args.dtypes.split(",") if d]
     wanted = set(args.synthetic_cases.split(",")) if args.synthetic_cases else None
     synthetic = [
-        BakePanel(f"synthetic_{c.name}", c.png, c.ocr_text, c.name)
-        for c in synthetic_cases()
-        if wanted is None or c.name in wanted
+        BakePanel.from_case(c) for c in synthetic_cases() if wanted is None or c.name in wanted
     ]
 
     from pipeline.understand.settings import load_settings, prompt_text
