@@ -124,3 +124,7 @@ Read-only look at the public repo through `gh api`; nothing from it is run, inst
 - Its synthesised SFX are a candidate licence-clean baseline to compare against MMAudio for Phase 3 foley, not a replacement decision.
 
 **Acceptance for the study:** a one-page decision note in `docs/plans/` choosing the compositor, with measured evidence on a fixture shot (frame determinism, peak RSS, seconds per frame on the M2 CPU in Docker), merged before Task 1 of milestone 1.5 begins.
+
+## Understand: prompt-injection mitigation and its remaining risk (milestone 1.2)
+
+The vision model never receives OCR text, and every detected text region of a panel (bubble detector run on the crop, plus every stored region of the page that touches it) is blanked with a flat colour before the model sees the image. Scene fields are visual-only. This is a mitigation, not a proof. Remaining risk: text the detector misses (low contrast, small, rotated or unusual lettering), text drawn as part of the scenery (signs, posters, sound effects in the artwork) and lettering in scripts the detector was not trained on can still be read. The impact is limited to a wrong scene description: the model has no tools and no privileges, its output is validated by a strict schema and cited by code, and any claim backed by text evidence is refused.
