@@ -202,7 +202,13 @@ class LocalVlmProvider:
             )
             return text
 
-        return structured_from_text(spec, schema, generate, self._s.max_attempts)
+        return structured_from_text(
+            spec,
+            schema,
+            generate,
+            self._s.max_attempts,
+            on_invalid=lambda n, shape: log.info("attempt %d invalid: %s", n, shape),
+        )
 
     def llm_structured(
         self, spec: ModelSpec, instructions: str, content: str, schema: type[M]

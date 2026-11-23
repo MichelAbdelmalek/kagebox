@@ -24,7 +24,7 @@ from pipeline.providers.local_vlm import (
     stop_reason,
 )
 from pipeline.providers.registry import CONFIG_DIR
-from pipeline.providers.structured import extract_json, structured_from_text
+from pipeline.providers.structured import error_shape, extract_json, structured_from_text
 from pipeline.understand.contract import PanelReading
 from pipeline.understand.settings import UnderstandSettings, load_settings, prompt_text
 
@@ -443,8 +443,45 @@ def test_attempt_diagnostics_logged_without_text(caplog: pytest.LogCaptureFixtur
     proc.reply = f'{{"answer": "{SENTINEL_OUT}'
     with caplog.at_level(logging.INFO), pytest.raises(StructuredOutputFailed):
         prov.vlm_structured(SPEC, "i", "c", [png(8, 8)], Out)
-    lines = [r.getMessage() for r in caplog.records if "attempt" in r.getMessage()]
+    lines = [r.getMessage() for r in caplog.records if "tokens=" in r.getMessage()]
     assert len(lines) == 3
     assert "tokens=2" in lines[0] and "stop=other" in lines[0]
     assert "depth=1 str=1 last=word" in lines[0]
+    assert SENTINEL_OUT not in caplog.text
+
+
+# ---- validation failure shape ----------------------------------------------------------
+
+
+def test_error_shape_has_paths_and_types_never_model_keys_or_values() -> None:
+    class Inner(BaseModel):
+        model_config = {"extra": "forbid"}
+        value: str | None = None
+
+    class Top(BaseModel):
+        model_config = {"extra": "forbid"}
+        setting: Inner
+
+    try:
+        Top.model_validate_json(
+            f'{{"setting": {{"value": 3, "{SENTINEL_OUT}": 1}}, "x{SENTINEL_OUT}": 1}}'
+        )
+    except ValueError as e:
+        shape = error_shape(e)
+    assert "setting.value: string_type" in shape
+    assert "setting.?: extra_forbidden" in shape and "?: extra_forbidden" in shape
+    assert SENTINEL_OUT not in shape
+    assert error_shape(ValueError("boom")) == "ValueError"
+
+
+def test_failed_attempt_logs_error_shape(caplog: pytest.LogCaptureFixture) -> None:
+    class Strict(BaseModel):
+        model_config = {"extra": "forbid"}
+        setting: str
+
+    prov, proc, _, _ = make()
+    proc.reply = f'{{"setting": 5, "{SENTINEL_OUT}": 1}}'
+    with caplog.at_level(logging.INFO), pytest.raises(StructuredOutputFailed):
+        prov.vlm_structured(SPEC, "i", "c", [png(8, 8)], Strict)
+    assert "invalid: setting: string_type; ?: extra_forbidden" in caplog.text
     assert SENTINEL_OUT not in caplog.text
