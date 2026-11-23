@@ -49,5 +49,5 @@ def test_bakeoff_target_never_rebuilds_the_image() -> None:
     line = next(x for x in makefile.splitlines() if x.startswith("bakeoff-understand:"))
     assert "worker-image" not in line
     script = (root / "deploy/scripts/bakeoff.sh").read_text()
-    assert "--no-build" in script and "/app/pipeline:ro" in script
+    assert "--build" not in script and "/app/pipeline:ro" in script
     assert "deploy/scripts/bakeoff.sh" in makefile

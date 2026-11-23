@@ -1,0 +1,10 @@
+{
+  "case": "night",
+  "prompt_sha256": "1d546e0ee92f15ddadd5e06ed95536027bea3717127fa60c361eafd8902064b6",
+  "image_sha256": "29ba85e397f9bfc7264424ace194f537df97766dd38bef0a9587e5d9e7b04091",
+  "content_sha256": "03e67902c4e0150947e13f96fab89ea4f8c7b18bbb4a9c180d6966dd9768dee5",
+  "fixture_key": "d02908944bc8399dc3a7f664bbef2a9097c4084446405929e5620195906c4e9f",
+  "outputs": [
+    "{\"setting\": {\"value\": \"A dark, empty space with a pattern of small white dots on a dark background.\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"establishing_wide\", \"figures\": []}"
+  ]
+}

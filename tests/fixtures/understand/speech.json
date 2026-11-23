@@ -1,0 +1,10 @@
+{
+  "case": "speech",
+  "prompt_sha256": "1d546e0ee92f15ddadd5e06ed95536027bea3717127fa60c361eafd8902064b6",
+  "image_sha256": "c37e0c59c757562c1b31b922ad64ed3cda22d8f00b36572d8ac6a8d54a8a8460",
+  "content_sha256": "03e67902c4e0150947e13f96fab89ea4f8c7b18bbb4a9c180d6966dd9768dee5",
+  "fixture_key": "6ace63a1ec1db5e526c1cc8bedd65c6fab7e695dca1cf1c55189ffcf57bc964e",
+  "outputs": [
+    "{\"setting\": {\"value\": \"Two simple stick figures standing side by side, with a diagonal line above them\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"close_up\", \"figures\": [{\"description\": {\"value\": \"A figure with a round head and a rectangular body\", \"evidence\": \"visual\"}, \"emotion\": {\"value\": null, \"evidence\": null}}]}"
+  ]
+}
