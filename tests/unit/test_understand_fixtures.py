@@ -15,8 +15,8 @@ def test_recorded_outputs_validate_against_the_current_contract() -> None:
     for f in files:
         data = json.loads(f.read_text(encoding="utf-8"))
         assert data["outputs"]
-        for raw in data["outputs"]:
-            PanelReading.model_validate_json(raw)
+        # a cut-off first attempt is recorded as it happened; the last output is the valid retry
+        PanelReading.model_validate_json(data["outputs"][-1])
 
 
 def test_replay_provider_loads_the_fixture_directory() -> None:

@@ -39,6 +39,8 @@ Rights record in Kagebox: basis `licensed`, licensor 有限会社佐藤漫画製
 | Chapter 1 page range and count: PDF pages 3–58, 56 pages (第1話 研修医の夜; colour pages 3–6, spread 4–5) | Done (2026-11-19) |
 | Rights record created in Kagebox (member submits, admin approves; evidence = PDF wrapping the terms snapshot) | Done (2026-11-19, `make ingest-sample`) |
 | Chapter 1 ingested through the API, contact sheets reviewed | Done (2026-11-19); see "Ingest results" |
+| Understand: 10-panel trial through the API, Prefect and the worker; text-mask check by eye | Done (2026-11-23); see "Understand results (trial)". Projection is over the 12 h budget: the full run waits for the owner |
+| Understand: full chapter (238 panels), fully cached re-run | Not run (owner's decision after the trial) |
 
 | File (in `data/fixtures/blackjack-v1/`, gitignored) | Size | sha256 |
 |---|---|---|
@@ -95,6 +97,49 @@ First run on 2026-11-19 with `make up-cloud` then `make ingest-sample` (cloud pr
 | After P4 | 42 | 54 | 61 | 72 | 82 | 95 |
 
 No threshold separates correct panels from real errors. Correct bleed panels on page 7 measure 0.26, 0.66 and 0.82, while real errors measured 0.51–0.80 before the merge. Lowering the threshold would hide real errors, so the evidence does not support a change.
+
+## Understand results (trial)
+
+`make understand-sample` on 2026-11-23: a trial of the first 10 panels (pages 1-4 of the chapter, PDF pages 3-6, the colour pages) through Caddy, the API, the Prefect `chapter-understand` deployment and `worker-cpu`, with qwen3-vl-2b-instruct (bf16), prompt v4, text-mask margin 4 and threshold 0.35. The full chapter has **not** been run. Report, contact sheets and mask sheets are in `data/reports/` (gitignored; panel pixels and scene text never go into git).
+
+**Timings are contended and so an upper bound.** The Mac was swapping (about 9 GB of 10 GB swap used, 17 GB RAM, other apps open) and the 1-minute load average read 7 to 18 while the trial ran (it includes the inference's own 4 threads). The rule for meaningful timings is a load under 6, which this run did not meet. The trial scenes are now cached, so a re-measure needs a deliberate re-run of fresh panels.
+
+| Metric | Trial (10 panels) |
+|---|---|
+| Valid scenes / failed / review items | 10 / 0 / 0 |
+| Model load | 49.4 s |
+| Seconds per panel, mean (the flow's own figure) | 218.7 s |
+| Seconds per panel, p50 / p95 / max (from scene timestamps, n = 10) | 189.2 s / 466.8 s / 466.8 s |
+| Wall time of the trial (stage row) | 2,237 s (37 min) |
+| Worker memory, `docker stats` peak (10 s samples) | 1.64 GiB (the weights are memory-mapped; the bake-off measured 5.5 GB process RSS) |
+| Projected full run (49.4 s + 218.7 s x 228 uncached) | **49,913 s = 13.9 h, `over_budget` = true** (limit `max_minutes_per_chapter` = 720 min) |
+| Same projection at the p50 | 43,194 s = 12.0 h (right at the limit) |
+| Earlier bake-off, same model (15 panels, also under load) | p50 128 s, p95 572 s: the trial is slower than that |
+
+Null rates over the 10 scenes (null = no visual evidence): setting 0%, action 40%, shot_hint 0%, time_of_day 70%, weather 80%. Figures per panel: 0, 1, 1, 1, 1, 1, 0, 0, 1, 1 (mean 0.7; 14% of figure emotions are null). No panel failed, no scene text was refused, so no review items were raised.
+
+**Quality notes from the contact sheet (10 panels, read by eye).** The settings and shot hints are plausible (stage and audience, crowd in suits, a man at a microphone). Findings, not fixed:
+
+- One panel (PDF page 4, panel 1) has the literal string "unknown" as the value of both `time_of_day` and `weather`: the model wrote the word instead of null, the schema accepts any text, so those two fields count as known. A "no-evidence" word list is a possible later guard.
+- `time_of_day: day` on the crowd scene (PDF page 5) and `weather: sunny` on a building exterior are guesses the pictures can support only weakly.
+- The panel crops of this chapter hold figures at the size of one or two per panel, so the figure list is short; identity is milestone 1.3.
+
+**Text-mask check by eye (27 panels, the real detector at threshold 0.35, margin 4). Page numbers below are PDF pages.** The sheets show each stored crop beside the masked image; for the 10 trial panels the masked image was verified byte-identical (sha256) to the one the model was sent. The panels: the 10 trial panels, every panel of PDF pages 7, 20 and 34 that was picked, and 10 evenly spaced others (PDF pages 8, 12, 16, 22, 27, 30, 38, 44, 48, 53).
+
+- Speech balloons and caption/narration boxes: fully masked in all 27 panels, including vertical narration over art (pages 8, 34) and tall balloons. No dialogue was readable in any masked image.
+- Free text without a balloon: the chapter title (page 4), the gate sign (page 6) and the ceremony banner (page 3) were masked.
+- **Text left readable.** SFX lettering outside balloons: the "ゴシ" strokes on page 7 (panels 1 and 2), parts of the large brush SFX and the repeated SFX strips on page 20 (panel 2). Two small SFX ovals on page 7 panel 1 also stayed. A wall sign on page 6 panel 4 ("手術室") stayed readable although both balloons next to it were masked, and a small door sign on page 44 is only partly covered. A text claim from such lettering is refused by the evidence rule, and the model has no tools; the impact is a wrong scene description.
+- **Masks over important art (false positives).** Boxes are balloon box plus text box plus margin, so tall or crossing balloons blank much of the picture: on page 20 panel 2 (the busiest panel) roughly a third of the panel, including parts of both faces and a torso; on page 7 panel 2 the figure's forehead and cap; on page 53 panel 3 the man's brow and nose; the screentone area right of the face on page 48 panel 3 (no text there); and the whole of the sky around a balloon on page 20 panel 1 (visible white box on screentone). The fill is the median of the crop border, so it is white on manga and brown or grey on colour pages.
+- Two ingest effects were visible: some crops contain a neighbouring panel strip (page 44 panel 1 shows a second panel below), as in the known merged-panel cases.
+- **Synthetic cases (real detector).** A regular dot pattern is masked over the whole panel (identical to a blank panel), and the crescent moon in the `night` case gets a box. Both are noted in `tests/fixtures/understand/README.md`.
+
+Recommendation: **no threshold or margin change** on this evidence. Lowering the threshold would add more boxes over art that is already being lost, and the text that stays readable (SFX, signs) is lettering the detector was not trained on, which a lower threshold is not shown to fix. A fix would be a different detector or an SFX-aware step, a later milestone.
+
+**Known gaps (for the owner's decision on the full run).**
+
+- The projection is over budget (13.9 h against 12 h at the measured mean) on a contended machine; at a quiet load it may fit, but the trial could not show that. Options: run when the Mac is quiet, raise `max_minutes_per_chapter`, or accept the run being resumed (every stored scene is cached, so a stopped run continues where it ended).
+- The literal "unknown" value, SFX and signs left readable, over-masking of art: see above.
+- Not done yet: the full run, the fully cached re-run (0 model loads), and the trial-versus-actual comparison (they follow the owner's decision).
 
 ## Studied, not used
 

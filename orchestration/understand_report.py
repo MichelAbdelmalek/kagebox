@@ -271,14 +271,14 @@ def _cell(png: bytes, item: dict[str, Any]) -> Image.Image:
         draw.text((x, y), "no scene (failed or not run)", fill=(230, 0, 0), font=_font(15))
     else:
         for name in SCENE_FIELDS:
-            draw.text((x, y), f"{name}: {ascii_line(scene[name], 34)}", fill=0, font=_font(14))
+            draw.text((x, y), f"{name}: {ascii_line(scene[name], 52)}", fill=0, font=_font(14))
             y += 19
         draw.text((x, y), f"figures: {len(scene['figures'])}", fill=0, font=_font(14))
         y += 19
         for f in scene["figures"][:4]:
             draw.text(
                 (x + 8, y),
-                "- " + ascii_line(f["description"], 38),
+                "- " + ascii_line(f["description"], 56),
                 fill=(60, 60, 60),
                 font=_font(13),
             )
