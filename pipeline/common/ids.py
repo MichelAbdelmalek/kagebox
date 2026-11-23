@@ -34,6 +34,7 @@ PREFIXES = frozenset(
         "page",
         "panel",
         "bubble",
+        "scene",
         "char",
         "shot",
         "v",

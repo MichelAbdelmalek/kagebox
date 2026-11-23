@@ -22,7 +22,7 @@
 - **User-safe errors only:** `stage_runs.error` and `review_items.reason` hold fixed messages, never tracebacks, model output or OCR text. Validation errors are logged with `safe_errors` (field and type only).
 - **Memory:** `worker-cpu` `mem_limit: 8g` (Task 8); one heavy flow at a time (`serve(..., limit=1)`); one panel at a time; the model loads only inside the understand flow, once per run, and only when at least one panel is uncached.
 - **Settings** (`configs/understand.yaml`, validated by `UnderstandSettings`): `prompt_version: v4` (v1-v3 stay on disk: they produced recorded runs), `threads: 4`, `dtype: bfloat16`, `max_pixels: 301056` (384 × 28 × 28), `max_new_tokens: 512`, `max_attempts: 2`, `max_time_s: 240` (per generate call), `mask_detect_threshold: 0.35` (0.1-0.9), `max_minutes_per_chapter: 720` (ruling R8: an overnight batch, resumable and cached; the trial gate projects the time first). `max_attempts × max_time_s` must stay under `STALE_INGEST_S − 60` (540 s). Measured attempts exceeded `max_time_s` (263 s and 308 s under load), so the flow MUST heartbeat from a background thread every 60 s during a panel (Task 6; not implemented yet).
-- **Flow timeout:** `FLOW_TIMEOUT_S = 8 * 3600`, above the 7 h budget; the budget stops cleanly first.
+- **Flow timeout:** `FLOW_TIMEOUT_S = 13 * 3600`, above the 12 h budget (`max_minutes_per_chapter: 720`); the budget stops cleanly first (the earlier 8 h value was below the budget).
 - **Fixtures:** committed recordings come **only from synthetic panels** drawn in code, never from the manga. CI never loads a model.
 
 ## Review Focus
@@ -181,8 +181,8 @@
 ### Task 6: The understand flow
 
 **Files:**
-- Create: `orchestration/understand_flow.py`, `pipeline/understand/request.py` (the request builder calls `mask_text_regions(crop, bubble boxes, panel bbox)` from `pipeline/understand/mask.py` and sends NO OCR text: `content` is empty; OCR text stays in the DB and in `input_hashes`, never in the request)
-- Modify: `orchestration/flows.py` (remove `understand` from `CLOUD_STAGES`; `chapter_pipeline` runner `understand`), `orchestration/serve.py` (deployment `chapter-understand`, `concurrency_limit=1`; `serve(..., limit=1)`), `orchestration/ingest_flow.py` (`_commit` also deletes the understand `REVIEW_KINDS` and the chapter's non-ingest `StageRunRow`s; `_fail_unstarted` only considers `JobRow.stage == "ingest"`)
+- Create: `orchestration/understand_flow.py`, `pipeline/understand/request.py` (the request builder calls `mask_panel(crop, panel bbox, every stored box of the page, detector, threshold, margin_px)` from `pipeline/understand/mask.py`, FAIL CLOSED: any mask error or a missing panel box fails that panel and the model is never called with an unmasked image; it sends NO OCR text: `content` is empty. `input_hashes` = [sha256 of the MASKED image sent, sha256 of the OCR text]; the OCR text stays in the DB, never in the request)
+- Modify: `orchestration/flows.py` (remove `understand` from `CLOUD_STAGES`; `chapter_pipeline` runner `understand`), `orchestration/serve.py` (deployment `chapter-understand`, `concurrency_limit=1`; `serve(..., limit=1)`), `orchestration/ingest_flow.py` (`_commit` also deletes the understand `REVIEW_KINDS`, the chapter's scenes and its non-ingest `StageRunRow`s; `_start` refuses while the understand stage is alive; `_fail_unstarted` only considers `JobRow.stage == "ingest"`)
 - Test: `tests/unit/test_understand_flow.py` (SQLite, `MemoryObjectStore`, a fake provider), extend `tests/unit/test_flows.py` and `tests/unit/test_ingest_flow.py`
 
 **Interfaces:**
@@ -190,7 +190,7 @@
 - Produces:
   - `panel_ocr_text(bubbles: list[Bubble]) -> str` (bubble texts in reading order, newline-joined).
   - `scene_params(settings, spec, prompt_sha) -> dict` and `input_hashes(crop: bytes, ocr_text: str) -> list[str]`.
-  - `UnderstandDeps(engine, store, settings, provider_factory: Callable[[ModelSpec], ModelProvider])`, `build_deps()`, `build_engine()`.
+  - `UnderstandDeps(engine, store, settings, provider_factory: Callable[[ModelSpec], ModelProvider], detector_factory: Callable[[], Detector])`, `build_deps()`, `build_engine()`.
   - `UnderstandSummary(panels, scenes, cached, failed, flagged, trial: bool, seconds_per_panel: float | None, projected_total_s: float | None)`.
   - `MAX_TRIAL_PANELS = 50`; `project_total_s(load_s: float, seconds_per_panel: float, uncached_panels: int) -> float`.
   - `UnderstandAlreadyRunning(RuntimeError)` (user-safe message, like `IngestAlreadyRunning`).
