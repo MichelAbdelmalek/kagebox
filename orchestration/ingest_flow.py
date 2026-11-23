@@ -94,8 +94,11 @@ from pipeline.common.dbmodels import (
     ProjectRow,
     ReviewItemRow,
     RightsRow,
+    SceneRow,
+    StageRunRow,
     ingest_stale_before,
     ingest_takeover_allowed,
+    stage_alive,
 )
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import RightsDenied, RightsRecord, require_render_allowed
@@ -118,6 +121,7 @@ from pipeline.ingest.process import (
 from pipeline.ingest.sources import MAX_IMAGE_BYTES, Fit, SourceKind, detect_kind, iter_pages
 from pipeline.providers.registry import load_yaml
 from pipeline.providers.weights import load_conversions
+from pipeline.understand.contract import REVIEW_KINDS as UNDERSTAND_REVIEW_KINDS
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +145,7 @@ TIMED_OUT = "ingest timed out"
 FLOW_TIMEOUT_S = 3 * 3600
 JOB_OPEN = ("submitted", "running")  # job statuses a run may still move on
 ALREADY_RUNNING = "ingest already running"
+UNDERSTAND_RUNNING = "understand is running on this chapter"
 IMPORT_MISSING = "the imported source file is not available"
 UPLOAD_MISSING = "the uploaded source file is not available"
 SOURCE_CHANGED = "the source file changed since it was added"
@@ -320,6 +325,9 @@ def _start(engine: Engine, chapter_id: str, run_id: str) -> _Chapter:
     """Take the chapter for this run with one conditional UPDATE, or refuse."""
     now = datetime.now(UTC)
     with Session(engine) as s, s.begin():
+        understand = s.get(StageRunRow, (chapter_id, "understand"))
+        if understand is not None and stage_alive(understand, ingest_stale_before(now)):
+            raise IngestAlreadyRunning(UNDERSTAND_RUNNING)  # its scenes would be orphaned
         res = cast(
             "CursorResult[Any]",
             s.execute(
@@ -416,10 +424,17 @@ def _commit(engine: Engine, ch: _Chapter, results: list[PageResult]) -> int:
         _rights_in(s, ch.project_id)  # under the chapter lock, in the writing transaction
         s.execute(
             delete(ReviewItemRow).where(
-                ReviewItemRow.chapter_id == ch.id, ReviewItemRow.kind.in_(REVIEW_KINDS)
+                ReviewItemRow.chapter_id == ch.id,
+                ReviewItemRow.kind.in_((*REVIEW_KINDS, *UNDERSTAND_REVIEW_KINDS)),
             )
         )
-        for model in (BubbleRow, PanelRow, PageRow):
+        # The panels change, so scenes and the later stages' runs are stale: drop them.
+        s.execute(
+            delete(StageRunRow).where(
+                StageRunRow.chapter_id == ch.id, StageRunRow.stage != "ingest"
+            )
+        )
+        for model in (SceneRow, BubbleRow, PanelRow, PageRow):
             s.execute(delete(model).where(model.chapter_id == ch.id))
         for r in results:
             s.add(
@@ -625,7 +640,7 @@ def _fail_unstarted(engine: Engine, chapter_id: str, run_id: str) -> None:
             return
         latest = s.scalar(
             select(JobRow.flow_run_id)
-            .where(JobRow.chapter_id == chapter_id)
+            .where(JobRow.chapter_id == chapter_id, JobRow.stage == "ingest")
             .order_by(JobRow.created_at.desc(), JobRow.id.desc())
             .limit(1)
         )
