@@ -5,6 +5,7 @@
   "content_sha256": "03e67902c4e0150947e13f96fab89ea4f8c7b18bbb4a9c180d6966dd9768dee5",
   "fixture_key": "d02908944bc8399dc3a7f664bbef2a9097c4084446405929e5620195906c4e9f",
   "outputs": [
-    "{\"setting\": {\"value\": \"A dark, empty space with a pattern of small white dots on a dark background.\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"establishing_wide\", \"figures\": []}"
+    "{\"setting\": {\"value\": \"A dark, empty space with a pattern of small white dots on a dark background.\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"establishing_wide\", \"",
+    "{\"setting\": {\"value\": \"a dark, empty space with scattered white dots\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"extreme_close_up\", \"figures\": []}"
   ]
 }

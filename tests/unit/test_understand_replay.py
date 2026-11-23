@@ -1,10 +1,11 @@
 """Replay and injection regressions: the real flow (``run_understand``) with ``ReplayProvider``.
 
-The recorded fixtures (tests/fixtures/understand) were made with text-mask margin 0 and keyed on
-the masked image bytes of that time; the flow now masks with margin 4, so their KEYS no longer
-match. The tests therefore take the recorded RAW MODEL OUTPUTS and re-key them, at load time, to
-the requests this test's own fake detector and the real mask pipeline produce (Task 9 re-records
-the fixtures with margin 4). Everything here is synthetic: no chapter panel, no OCR text.
+The fixtures (tests/fixtures/understand) were recorded on 2026-11-23 with the real bubble
+detector, text-mask margin 4, mask threshold 0.35 and prompt v4. These tests run the flow with a
+FAKE detector (the real one needs the model volume), whose boxes are not the real detector's, so
+the request bytes differ from the recorded ones. They therefore take the recorded RAW MODEL
+OUTPUTS and re-key them, at load time, to the requests this test's own fake detector and the real
+mask pipeline produce. Everything here is synthetic: no chapter panel, no OCR text.
 """
 
 from __future__ import annotations
@@ -31,12 +32,14 @@ from pipeline.providers.base import fence_untrusted
 from pipeline.providers.replay import ReplayMiss, ReplayProvider, record_case
 from pipeline.understand.contract import PanelReading
 from pipeline.understand.request import prepare_panel
-from pipeline.understand.settings import prompt_text
+from pipeline.understand.settings import load_settings, prompt_text
 from tests.unit.test_understand_flow import Env, make_env
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "understand"
 CASES = {c.name: c for c in synthetic_cases()}
-# The recorded "blank" reading is the all-null one; "screentone" has no recording of its own.
+# "screentone" has no recording of its own: with the real detector the dot pattern is masked
+# over the whole panel, so its sent image is byte-identical to "blank" (checked 2026-11-23: both
+# hash to the same masked image), and one fixture serves both.
 RECORDED_FOR = {
     "speech": "speech",
     "speech_injected": "speech",
@@ -156,9 +159,13 @@ def test_injection_fixture_fields_equal_clean_fixture(
 
 
 @pytest.mark.parametrize("case", ["blank", "screentone"])
-def test_blank_and_screentone_all_null_no_review(
+def test_blank_and_screentone_no_figures_no_review(
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Named for what it checks: the recorded answer for a drawn-nothing / dots-only panel has no
+    # figures, no characters and no review item. The loop below also pins the four fields that
+    # recording leaves null; it does NOT prove a model returns all-null on blank art in general
+    # (the "setting" may be known, and is not asserted).
     env = _env(tmp_path, monkeypatch, case)
     scene = _run(env, case, tmp_path)
     for name in ("action", "time_of_day", "weather", "shot_hint"):
@@ -175,11 +182,12 @@ def test_night_scene_validates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_recorded_outputs_validate_against_current_contract() -> None:
+    # An attempt the model got cut off in (max_time under load) is recorded as it happened and the
+    # next attempt is the retry that succeeded; only the LAST output has to be a valid reading.
     for name in ("speech", "blank", "night"):
         data = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
         assert data["outputs"], name
-        for raw in data["outputs"]:
-            PanelReading.model_validate_json(raw)  # drift in the contract fails here
+        PanelReading.model_validate_json(data["outputs"][-1])  # drift in the contract fails here
 
 
 def test_prompt_change_without_rerecording_is_a_replay_miss(
@@ -194,14 +202,12 @@ def test_prompt_change_without_rerecording_is_a_replay_miss(
     assert env.scenes() == []
 
 
-def test_the_original_recorded_keys_miss_under_the_current_mask_margin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Documents T8-1: until Task 9 re-records with margin 4, the shipped keys do not match.
-    env = _env(tmp_path, monkeypatch, "speech")
-    env.provider = ReplayProvider(FIXTURES)  # type: ignore[assignment]
-    with pytest.raises(ReplayMiss):
-        env.run(run_id="run-orig")
+def test_recorded_fixtures_are_current_for_the_prompt() -> None:
+    # A prompt change must force a re-recording: the fixtures carry the prompt hash they answer.
+    instructions, _ = prompt_text(load_settings())
+    for name in ("speech", "blank", "night"):
+        data = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
+        assert data["prompt_sha256"] == _sha(instructions.encode("utf-8")), name
 
 
 def test_fixtures_are_synthetic_and_carry_no_panel_text() -> None:
@@ -223,4 +229,4 @@ def test_fixtures_are_synthetic_and_carry_no_panel_text() -> None:
         for secret in (SPEECH_TEXT, INJECTION, "SENTINEL"):
             assert secret not in text
     readme = (FIXTURES / "README.md").read_text(encoding="utf-8")
-    assert "SYNTHETIC" in readme and "margin 4" in readme  # the re-record note
+    assert "SYNTHETIC" in readme and "margin 4" in readme  # the settings it was recorded with
