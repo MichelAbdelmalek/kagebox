@@ -13,7 +13,10 @@ from pipeline.common.dbmodels import STALE_INGEST_S
 from pipeline.common.schemas import Strict
 from pipeline.providers.registry import CONFIG_DIR, load_yaml
 
-__all__ = ["UnderstandSettings", "load_settings", "prompt_text"]
+__all__ = ["ATTN_IMPLEMENTATION", "UnderstandSettings", "load_settings", "prompt_text"]
+
+# Attention implementation the local vision provider loads with (part of the cache key).
+ATTN_IMPLEMENTATION = "eager"
 
 # A slow panel must never look dead: all attempts of one panel stay under the stale limit.
 MAX_PANEL_S = STALE_INGEST_S - 60
@@ -32,6 +35,8 @@ class UnderstandSettings(Strict):
     max_minutes_per_chapter: Annotated[int, Field(ge=1, le=1440)]
     # recall-oriented detector threshold for the text mask (the ingest default is 0.5)
     mask_detect_threshold: Annotated[float, Field(ge=0.1, le=0.9)]
+    # dilation of every masked box, in crop pixels, so lettering that overhangs its box is covered
+    margin_px: Annotated[int, Field(ge=0, le=32)] = 4
 
     @model_validator(mode="after")
     def _limits(self) -> UnderstandSettings:

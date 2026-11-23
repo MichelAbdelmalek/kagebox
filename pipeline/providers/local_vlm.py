@@ -19,7 +19,7 @@ from pipeline.common.uploads import UploadRejected, open_image_checked
 from pipeline.providers import local
 from pipeline.providers.base import M, ModelLoadFailed, ModelSpec, fence_untrusted
 from pipeline.providers.structured import structured_from_text
-from pipeline.understand.settings import UnderstandSettings
+from pipeline.understand.settings import ATTN_IMPLEMENTATION, UnderstandSettings
 
 __all__ = ["NO_CONTENT_LINE", "REPAIR_LINE", "LocalVlmProvider", "json_position", "stop_reason"]
 
@@ -109,7 +109,7 @@ class LocalVlmProvider:
                 AutoModelForImageTextToText,
                 spec.model,
                 dtype=_DTYPES[self._s.dtype],
-                attn="eager",  # SDPA in bf16 on CPU is ~100x slower
+                attn=ATTN_IMPLEMENTATION,  # SDPA in bf16 on CPU is ~100x slower
             )
             if not self._threads_set:
                 torch.set_num_threads(self._s.threads)
@@ -121,6 +121,10 @@ class LocalVlmProvider:
             raise ModelLoadFailed()
         self._loaded[spec.model] = (processor, model)
         return processor, model
+
+    def load(self, spec: ModelSpec) -> None:
+        """Load the model now (otherwise it loads at the first call), so a caller can time it."""
+        self._ensure(spec)
 
     # -- images -------------------------------------------------------------------------
 

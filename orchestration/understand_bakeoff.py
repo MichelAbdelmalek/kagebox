@@ -288,9 +288,16 @@ def _sent_png_fn(settings: UnderstandSettings) -> Callable[[BakePanel], bytes]:
     detector = BubbleDetector()  # loads lazily, once per process
 
     def sent(p: BakePanel) -> bytes:
-        if p.panel_bbox is None:
-            return p.png
-        return mask_panel(p.png, p.panel_bbox, p.boxes, detector, settings.mask_detect_threshold)
+        if p.panel_bbox is None:  # fail closed: never send an unmasked crop
+            raise ValueError("panel box missing: refusing to send an unmasked image")
+        return mask_panel(
+            p.png,
+            p.panel_bbox,
+            p.boxes,
+            detector,
+            settings.mask_detect_threshold,
+            settings.margin_px,
+        )
 
     return sent
 

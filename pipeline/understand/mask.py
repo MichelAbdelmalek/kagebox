@@ -40,6 +40,7 @@ from pipeline.ingest.bubbles import Region
 __all__ = ["Detector", "mask_panel", "mask_text_regions", "text_mask_boxes"]
 
 _PNG = ("PNG",)
+MAX_MARGIN_PX = 32
 
 
 def _border_median(img: Image.Image) -> tuple[int, int, int]:
@@ -98,12 +99,15 @@ def text_mask_boxes(
     stored_boxes: Sequence[BBox],
     detector: Detector,
     threshold: float = 0.35,
+    margin_px: int = 4,
 ) -> list[BBox]:
-    """Every box to blank, in CROP coordinates and clamped to the crop.
+    """Every box to blank, in CROP coordinates, grown by ``margin_px`` and clamped to the crop.
 
     ``stored_boxes`` are region boxes of the whole page (page coordinates); those that intersect
     the panel count. The detector runs on the crop itself.
     """
+    if not 0 <= margin_px <= MAX_MARGIN_PX:
+        raise ValueError(f"margin_px must be between 0 and {MAX_MARGIN_PX}")
     with open_image_checked(crop_png, _PNG) as src:
         crop = src.convert("RGB")
     w, h = crop.size
@@ -111,8 +115,8 @@ def text_mask_boxes(
     out: list[BBox] = []
 
     def add(x0: float, y0: float, x1: float, y1: float) -> None:
-        cx0, cy0 = max(0, math.floor(x0)), max(0, math.floor(y0))
-        cx1, cy1 = min(w, math.ceil(x1)), min(h, math.ceil(y1))
+        cx0, cy0 = max(0, math.floor(x0) - margin_px), max(0, math.floor(y0) - margin_px)
+        cx1, cy1 = min(w, math.ceil(x1) + margin_px), min(h, math.ceil(y1) + margin_px)
         if cx1 > cx0 and cy1 > cy0:
             out.append(BBox(x=cx0, y=cy0, w=cx1 - cx0, h=cy1 - cy0))
 
@@ -138,9 +142,10 @@ def mask_panel(
     stored_boxes: Sequence[BBox],
     detector: Detector,
     threshold: float = 0.35,
+    margin_px: int = 4,
 ) -> bytes:
     """The crop PNG with every text region (see ``text_mask_boxes``) filled flat."""
-    boxes = text_mask_boxes(crop_png, panel_bbox, stored_boxes, detector, threshold)
+    boxes = text_mask_boxes(crop_png, panel_bbox, stored_boxes, detector, threshold, margin_px)
     with open_image_checked(crop_png, _PNG) as src:
         size = src.size
     return mask_text_regions(crop_png, boxes, BBox(x=0, y=0, w=size[0], h=size[1]))

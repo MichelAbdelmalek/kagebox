@@ -510,3 +510,11 @@ def test_empty_content_sends_a_neutral_line_without_fence_or_ocr() -> None:
     text = proc.messages[0][1]["content"][1]["text"]
     assert UNTRUSTED_OPEN not in text and UNTRUSTED_CLOSE not in text
     assert text == NO_CONTENT_LINE
+
+
+def test_load_loads_the_model_once_before_the_first_call() -> None:
+    provider, _, _, loader = make()
+    provider.load(SPEC)
+    assert [c[0] for c in loader.calls].count("AutoModelForImageTextToText") == 1
+    provider.load(SPEC)
+    assert len(loader.calls) == 2  # processor + model, cached after the first load

@@ -137,7 +137,7 @@ def region(bbox: BBox, text: BBox | None = None, kind: str = "speech") -> Region
 
 def test_straddling_bubble_stored_on_the_neighbour_is_masked_here() -> None:
     # stored page box spans x 150..190; this panel covers x 100..160: only 10 px of it is inside
-    boxes = text_mask_boxes(crop_png(), PANEL, [box(150, 210, 40, 20)], FakeDetector())
+    boxes = text_mask_boxes(crop_png(), PANEL, [box(150, 210, 40, 20)], FakeDetector(), margin_px=0)
     assert boxes == [BBox(x=50, y=10, w=10, h=20)]  # crop coordinates, clamped to the crop
     out = pixels(mask_panel(crop_png(), PANEL, [box(150, 210, 40, 20)], FakeDetector()))
     assert out.getpixel((55, 15)) == BG
@@ -164,7 +164,7 @@ def test_detected_text_box_and_every_kind_are_masked() -> None:
             region(BBox(x=20, y=30, w=8, h=8), BBox(x=40, y=30, w=8, h=8), "caption"),
         ]
     )
-    boxes = text_mask_boxes(crop_png(), PANEL, [], det)
+    boxes = text_mask_boxes(crop_png(), PANEL, [], det, margin_px=0)
     assert BBox(x=40, y=30, w=8, h=8) in boxes and BBox(x=20, y=30, w=8, h=8) in boxes
     assert BBox(x=0, y=0, w=5, h=5) in boxes
 

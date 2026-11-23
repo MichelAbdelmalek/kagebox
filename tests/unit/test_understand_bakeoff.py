@@ -264,3 +264,16 @@ def test_record_cases_uses_the_sent_image_for_the_key(tmp_path: Path) -> None:
         cases, tmp_path, "instr", lambda p: [out], sent=lambda p: p.png + b"|detected"
     )
     assert len(paths) == 5  # a sent image that differs per panel: no dedupe
+
+
+def test_sent_png_fn_refuses_a_panel_without_a_box_instead_of_sending_it_unmasked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pipeline.ingest.bubbles as bubbles_mod
+    from orchestration.understand_bakeoff import _sent_png_fn
+    from pipeline.understand.settings import load_settings
+
+    monkeypatch.setattr(bubbles_mod, "BubbleDetector", lambda: object())
+    sent = _sent_png_fn(load_settings())
+    with pytest.raises(ValueError, match="unmasked"):
+        sent(BakePanel("pnl_1", b"png", "text", panel_bbox=None))
