@@ -51,3 +51,23 @@ def test_bakeoff_target_never_rebuilds_the_image() -> None:
     script = (root / "deploy/scripts/bakeoff.sh").read_text()
     assert "--build" not in script and "/app/pipeline:ro" in script
     assert "deploy/scripts/bakeoff.sh" in makefile
+
+
+def _env(service: str) -> dict[str, object]:
+    env = _services()[service].get("environment", {})
+    assert isinstance(env, dict)
+    return env
+
+
+def test_worker_cpu_memory_fits_the_vision_model() -> None:
+    # The local 2B vision model (bf16, about 4-5 GB weights plus activations) runs in worker-cpu.
+    assert _services()["worker-cpu"]["mem_limit"] == "8g"
+
+
+def test_workers_run_hub_offline() -> None:
+    # Weights come from the read-only models volume only; nothing may reach the Hub at runtime.
+    for name in ("worker-cpu", "worker-gpu"):
+        env = _env(name)
+        assert env.get("HF_HUB_OFFLINE") == "1", name
+        assert env.get("TRANSFORMERS_OFFLINE") == "1", name
+        assert "models:/models:ro" in _services()[name]["volumes"], name  # type: ignore[operator]

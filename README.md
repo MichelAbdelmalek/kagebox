@@ -95,6 +95,14 @@ Both return `202 {"job_id": ...}`. Follow the run with `GET /api/jobs/{job_id}` 
 
 **Image rebuilds are unavailable while the Debian apt signature error persists** (`apt-get update` fails with an invalid signature, so `make worker-image` and `make up-cloud` cannot rebuild, and a failed rebuild fills the Docker VM disk with build cache). Do not rebuild; start the stack with `KAGEBOX_PROFILE=cloud docker compose -f deploy/compose.yaml --env-file .env up -d --no-build --wait` and run the bake-off with the script above.
 
+### Understand stage (scene descriptions)
+
+`understand` describes every panel with a local vision model (Qwen3-VL 2B, bf16, CPU, loaded from the read-only `models` volume; the workers run with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so nothing is fetched at runtime and no panel leaves the machine). Text regions are flattened before the model sees a panel, and OCR text is never sent. Expect about 2 minutes per panel (measured p50 128 s, p95 570 s on a contended 4-core CPU), so a 238-panel chapter is an overnight batch: run a trial first (`limit_panels`, at most 50), read the projected time, then confirm the full run. Runs are cached and resumable.
+
+- **Memory:** `worker-cpu` has `mem_limit: 8g` (peak RSS about 5.5 GB). Raise Docker Desktop's memory to about 11-12 GB (Settings, Resources) so the worker, Postgres and the rest of the stack fit together.
+- **One heavy flow at a time:** the worker serves with a limit of 1 and concurrency 1, so ingest and understand never run together; a second heavy run waits in the queue. Re-ingesting a chapter while it is being understood is refused with 409.
+- Compose changes are applied with `docker compose ... up -d --no-build --wait` (see the rebuild note above); `make up-cloud` is not needed for them.
+
 The Phase 0 smoke test runs against the live stack: `sh tests/e2e/phase0_smoke.sh` (needs test users whose passwords are in `deploy/secrets/test_{admin,member}.password.txt`).
 
 ## Compute profiles
