@@ -25,6 +25,7 @@ from pipeline.common.dbmodels import (
     User,
     aware,
     claim_stage,
+    full_run_allowed,
     stage_alive,
     stage_takeover_allowed,
 )
@@ -312,6 +313,36 @@ def test_stage_alive_matches_sql_rule(tmp_path: Any) -> None:
             )
         )
         assert stage_alive(row, stale_before) == (allowed is None), row.stage
+
+
+def test_full_run_allowed_rule_and_null_counts(tmp_path: Any) -> None:
+    """SQL NULL, JSON null and absent counts all mean "no counts"; a trial or a budget stop that
+    finished after the chapter's last ingest start allows a full run, nothing else does."""
+    from sqlalchemy import JSON
+
+    s = _session(tmp_path)
+    ids = _seed(s)
+    row = StageRunRow(chapter_id=ids["chap"], stage="understand", status="pending")
+    s.add(row)
+    s.commit()
+    ingest = NOW - timedelta(hours=2)
+    done = NOW - timedelta(hours=1)
+    assert full_run_allowed(None, ingest) is False
+    assert full_run_allowed(row, ingest) is False  # no finished_at
+    row.finished_at = done
+    for counts in (None, JSON.NULL, {}):  # SQL NULL, JSON null, empty
+        row.counts = counts
+        s.commit()
+        s.refresh(row)
+        assert row.counts in (None, {}) and full_run_allowed(row, ingest) is False
+    for counts in ({"trial": True}, {"resumable": True}):
+        row.counts = counts
+        assert full_run_allowed(row, ingest) is True
+        assert full_run_allowed(row, NOW) is False  # re-ingested after it finished
+        assert full_run_allowed(row, None) is False
+    for counts in ({"trial": False}, {"resumable": False}, {"trial": 1}):
+        row.counts = counts
+        assert full_run_allowed(row, ingest) is False
 
 
 def test_job_stage_defaults_to_ingest(tmp_path: Any) -> None:

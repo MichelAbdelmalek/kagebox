@@ -185,6 +185,21 @@ def test_replay_hit_and_miss(tmp_path: Path) -> None:
         ReplayProvider(tmp_path).vlm_structured(SPEC, "r2", "c", [img], Out)
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["not json at all", '{"answer": 5}', '{"other": "x"}', ""],
+)
+def test_structured_failure_last_error_is_a_plain_identifier(text: str) -> None:
+    import re
+
+    from pipeline.providers.structured import structured_from_text
+
+    with pytest.raises(StructuredOutputFailed) as ei:
+        structured_from_text(SPEC, Out, lambda attempt: text, 2)
+    assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ei.value.last_error), ei.value.last_error
+    assert not text or text not in ei.value.last_error  # a class name, never the quoted output
+
+
 def test_replay_refuses_duplicate_fixture_keys(tmp_path: Path) -> None:
     from pipeline.providers.replay import ReplayProvider, record_case
 
@@ -193,6 +208,32 @@ def test_replay_refuses_duplicate_fixture_keys(tmp_path: Path) -> None:
     with pytest.raises(ValueError) as ei:
         ReplayProvider(tmp_path)
     assert "two.json" in str(ei.value) and "SECRET-OUT" not in str(ei.value)
+
+
+def test_replay_rechecks_the_fixture_key_on_load(tmp_path: Path) -> None:
+    from pipeline.providers.replay import ReplayProvider, record_case
+
+    path = record_case(tmp_path, "one", "p", "i", "c", ['{"answer": "x"}'])
+    ReplayProvider(tmp_path)  # a good fixture loads
+    data = json.loads(path.read_text())
+    data["fixture_key"] = "0" * 64  # edited by hand, or hashes changed without the key
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=r"one\.json.*fixture_key"):
+        ReplayProvider(tmp_path)
+    data["fixture_key"] = "x"
+    del data["image_sha256"]  # missing fields are refused too, not a KeyError
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match=r"one\.json"):
+        ReplayProvider(tmp_path)
+
+
+def test_record_case_stores_recorded_with_metadata_when_given(tmp_path: Path) -> None:
+    from pipeline.providers.replay import ReplayProvider, record_case
+
+    meta = {"margin_px": 4, "mask_detect_threshold": 0.35, "prompt_version": "v4"}
+    path = record_case(tmp_path, "one", "p", "i", "c", ["{}"], recorded_with=meta)
+    assert json.loads(path.read_text())["recorded_with"] == meta
+    ReplayProvider(tmp_path)  # the extra key is metadata only
 
 
 def test_fence_survives_nested_and_split_markers() -> None:

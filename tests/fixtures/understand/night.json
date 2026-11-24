@@ -7,5 +7,10 @@
   "outputs": [
     "{\"setting\": {\"value\": \"A dark, empty space with a pattern of small white dots on a dark background.\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"establishing_wide\", \"",
     "{\"setting\": {\"value\": \"a dark, empty space with scattered white dots\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"extreme_close_up\", \"figures\": []}"
-  ]
+  ],
+  "recorded_with": {
+    "margin_px": 4,
+    "mask_detect_threshold": 0.35,
+    "prompt_version": "v4"
+  }
 }

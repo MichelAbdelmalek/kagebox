@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 from pipeline.providers.base import M, ModelSpec, fence_untrusted
@@ -27,6 +28,11 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def fixture_key(prompt_sha: str, image_sha: str, content_sha: str) -> str:
+    """The hash a fixture carries over its three request hashes (checked again on load)."""
+    return _sha(json.dumps([prompt_sha, image_sha, content_sha], separators=(",", ":")).encode())
+
+
 def record_case(
     fixtures_dir: Path,
     case: str,
@@ -34,32 +40,28 @@ def record_case(
     image_sha: str,
     content_sha: str,
     outputs: list[str],
+    recorded_with: Mapping[str, str | int | float] | None = None,
 ) -> Path:
-    """Write `<case>.json`. `case` is a plain token (it becomes a file name)."""
+    """Write `<case>.json`. `case` is a plain token (it becomes a file name).
+
+    ``recorded_with`` (optional) is metadata only, for example the mask settings and prompt
+    version the outputs were recorded with; replay ignores it and tests may pin it."""
     if not _CASE.fullmatch(case):
         raise ValueError("case must be 1-64 letters, digits, '-' or '_'")
     if not outputs:
         raise ValueError("a fixture needs at least one output")
-    fixture_key = _sha(
-        json.dumps([prompt_sha, image_sha, content_sha], separators=(",", ":")).encode()
-    )
+    doc: dict[str, object] = {
+        "case": case,
+        "prompt_sha256": prompt_sha,
+        "image_sha256": image_sha,
+        "content_sha256": content_sha,
+        "fixture_key": fixture_key(prompt_sha, image_sha, content_sha),
+        "outputs": outputs,
+    }
+    if recorded_with is not None:
+        doc["recorded_with"] = dict(recorded_with)
     path = fixtures_dir / f"{case}.json"
-    path.write_text(
-        json.dumps(
-            {
-                "case": case,
-                "prompt_sha256": prompt_sha,
-                "image_sha256": image_sha,
-                "content_sha256": content_sha,
-                "fixture_key": fixture_key,
-                "outputs": outputs,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    path.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return path
 
 
@@ -71,10 +73,16 @@ class ReplayProvider:
         self._cases: dict[tuple[str, str, str], list[str]] = {}
         for f in sorted(fixtures_dir.glob("*.json")):
             d = json.loads(f.read_text(encoding="utf-8"))
-            key = (d["prompt_sha256"], d["image_sha256"], d["content_sha256"])
+            try:
+                key = (d["prompt_sha256"], d["image_sha256"], d["content_sha256"])
+                stored, outputs = d["fixture_key"], d["outputs"]
+            except (KeyError, TypeError):
+                raise ValueError(f"{f.name}: not a replay fixture (missing fields)") from None
+            if stored != fixture_key(*key):  # a hand edit or a re-hash without the key
+                raise ValueError(f"{f.name}: fixture_key does not match its request hashes")
             if key in self._cases:
                 raise ValueError(f"{f.name}: duplicate fixture for the same prompt, image and text")
-            self._cases[key] = list(d["outputs"])
+            self._cases[key] = list(outputs)
 
     def _run(
         self,

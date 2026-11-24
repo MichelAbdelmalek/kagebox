@@ -30,9 +30,9 @@ from pipeline.common.schemas import BBox, Panel, SceneJSON
 from pipeline.ingest.bubbles import Region
 from pipeline.providers.base import fence_untrusted
 from pipeline.providers.replay import ReplayMiss, ReplayProvider, record_case
-from pipeline.understand.contract import PanelReading
 from pipeline.understand.request import prepare_panel
 from pipeline.understand.settings import load_settings, prompt_text
+from tests.unit.test_understand_fixtures import check_recorded_outputs
 from tests.unit.understand_env import Env, make_env
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "understand"
@@ -186,8 +186,7 @@ def test_recorded_outputs_validate_against_current_contract() -> None:
     # next attempt is the retry that succeeded; only the LAST output has to be a valid reading.
     for name in ("speech", "blank", "night"):
         data = json.loads((FIXTURES / f"{name}.json").read_text(encoding="utf-8"))
-        assert data["outputs"], name
-        PanelReading.model_validate_json(data["outputs"][-1])  # drift in the contract fails here
+        check_recorded_outputs(name, data["outputs"])  # earlier attempts stay invalid too
 
 
 def test_prompt_change_without_rerecording_is_a_replay_miss(
@@ -224,6 +223,7 @@ def test_fixtures_are_synthetic_and_carry_no_panel_text() -> None:
             "content_sha256",
             "fixture_key",
             "outputs",
+            "recorded_with",
         }
         assert len(text) < 4000  # hashes and short model text only, never pixels
         for secret in (SPEECH_TEXT, INJECTION, "SENTINEL"):

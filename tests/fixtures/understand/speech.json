@@ -7,5 +7,10 @@
   "outputs": [
     "{\"setting\": {\"value\": \"Two simple stick figures standing side by side, with a diagonal line above them\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\":",
     "{\"setting\": {\"value\": \"Two simple stick figures standing side by side, with a lightning bolt above them.\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": \"close_up\", \"figures\": [{\"description\": {\"value\": \"A figure with a round head and a rectangular body\", \"evidence\": \"visual\"}, \"emotion\": {\"value\": null, \"evidence\": null}}]}"
-  ]
+  ],
+  "recorded_with": {
+    "margin_px": 4,
+    "mask_detect_threshold": 0.35,
+    "prompt_version": "v4"
+  }
 }

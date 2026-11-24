@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import re
 from typing import Any
 
 import pytest
@@ -240,6 +241,8 @@ def test_truncated_invalid_or_repeating_output_retries_then_fails() -> None:
         assert calls == [1, 2, 3]
         assert ei.value.attempts == 3
         assert ei.value.last_error in {"ValueError", "ValidationError"}
+        # a plain identifier: it goes into review items and logs, so never a message or free text
+        assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", ei.value.last_error)
 
 
 def test_structured_succeeds_on_a_later_attempt() -> None:

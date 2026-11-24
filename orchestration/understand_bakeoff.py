@@ -27,7 +27,7 @@ import resource
 import sys
 import time
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -415,6 +415,7 @@ def record_cases(
     instructions: str,
     call: Callable[[BakePanel], list[str]],
     sent: Callable[[BakePanel], bytes] | None = None,
+    recorded_with: Mapping[str, str | int | float] | None = None,
 ) -> list[Path]:
     """Write one replay fixture per synthetic panel. ``call`` returns the raw model text of
     each attempt. Chapter panels are refused before anything is written."""
@@ -438,6 +439,7 @@ def record_cases(
                 _sha(image),
                 _sha(fence_untrusted("").encode("utf-8")),
                 call(p),
+                recorded_with,
             )
         )
     return paths
@@ -651,7 +653,14 @@ def main(argv: list[str] | None = None) -> int:
         args.record.mkdir(parents=True, exist_ok=True)
         dtype = dtypes[0]
         call, sent = _make_call(models[0], dtype, settings, instructions)
-        paths = record_cases(synthetic, args.record, instructions, tap_raw_text(call), sent)
+        meta = {
+            "margin_px": settings.margin_px,
+            "mask_detect_threshold": settings.mask_detect_threshold,
+            "prompt_version": settings.prompt_version,
+        }
+        paths = record_cases(
+            synthetic, args.record, instructions, tap_raw_text(call), sent, recorded_with=meta
+        )
         log.info("recorded %d synthetic fixtures", len(paths))
         return 0
 

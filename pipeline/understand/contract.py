@@ -5,6 +5,13 @@ or citations; those are added here, by code. Scene fields describe what is DRAWN
 evidence is ``text`` (taken from the speech bubbles) is dropped and the field stays null, with an
 Issue for the review queue. Dialogue is already stored as OCR bubbles, and text inside a panel is
 untrusted data that must never steer a scene field.
+
+OCR text is never sent to this stage (the content is empty), but the provider still fences any
+content it is given with ``fence_untrusted``; its ``_neutralise`` (``pipeline/providers/base.py``)
+first removes the fence markers and every run of three or more ``<`` or ``>`` characters, again
+and again until the text stops changing (removing a marker can join its neighbours into a new
+one), so content can never close the fence from inside. It is a delimiter guard, not a filter for
+meaning: the real defences are the text mask on the image and the evidence rule above.
 """
 
 from __future__ import annotations

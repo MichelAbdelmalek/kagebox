@@ -130,6 +130,13 @@ def test_record_writes_fixtures_replay_can_read(tmp_path: Path) -> None:
     assert got.setting.value is None
 
 
+def test_record_stores_the_settings_when_given(tmp_path: Path) -> None:
+    cases = [BakePanel.from_case(c) for c in synthetic_cases()]
+    meta = {"margin_px": 4, "mask_detect_threshold": 0.35, "prompt_version": "v4"}
+    paths = record_cases(cases, tmp_path, "instr", lambda p: ["{}"], recorded_with=meta)
+    assert all(json.loads(p.read_text())["recorded_with"] == meta for p in paths)
+
+
 def test_fp32_skip_rule() -> None:
     limit = 10 * 1024**3
     assert fp32_exceeds_memory(4_255_140_312, limit)  # 2B model in bf16 on disk -> ~8.5 GB fp32

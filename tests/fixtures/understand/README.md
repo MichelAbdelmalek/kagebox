@@ -4,6 +4,8 @@ Replay fixtures for the understand stage: raw model text for SYNTHETIC panels on
 `configs/understand.yaml` (text-mask margin 4, mask threshold 0.35), each request being the
 text-masked image (stored boxes plus the REAL bubble detector on the crop) and no OCR text.
 
+Each fixture also carries `recorded_with` (mask margin, mask threshold, prompt version): metadata only, pinned by `tests/unit/test_understand_fixtures.py` so that changing a setting without re-recording fails a test. `record_case(..., recorded_with=...)` writes it. (Added by hand to the 2026-11-23 recordings with the values stated above; the recordings themselves were not redone.)
+
 Which synthetic case maps to which fixture, as recorded with the real detector:
 
 - `speech_injected` masks to the same image as `speech` (the injected sentence and the balloon are

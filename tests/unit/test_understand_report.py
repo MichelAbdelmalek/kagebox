@@ -13,6 +13,7 @@ from orchestration.understand_report import (
     build_report,
     figures_summary,
     null_rates,
+    pace_stats,
     panel_seconds,
     percentile,
 )
@@ -79,6 +80,18 @@ def test_figures_summary_histogram_and_empty_descriptions() -> None:
         "mean": None,
         "emotion_null_pct": None,
     }
+
+
+def test_pace_reports_n_and_calls_p95_the_max_below_twenty_panels() -> None:
+    few = pace_stats([float(i) for i in range(1, 11)])  # n = 10
+    assert few["n"] == 10 and few["p95_is_max"] is True
+    assert few["p95_s"] == few["max_s"] == 10.0  # nearest-rank p95 of 10 values IS the max
+    edge = pace_stats([float(i) for i in range(1, 20)])  # n = 19
+    assert edge["p95_is_max"] is True
+    enough = pace_stats([float(i) for i in range(1, 21)])  # n = 20
+    assert enough["n"] == 20 and enough["p95_is_max"] is False and enough["p95_s"] == 19.0
+    none = pace_stats([])
+    assert none["n"] == 0 and none["p95_s"] is None and none["max_s"] is None
 
 
 def test_percentile_nearest_rank_and_panel_seconds_from_timestamps() -> None:

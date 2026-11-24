@@ -122,7 +122,9 @@ def vlm(name: str) -> str:
             "content": [{"type": "image"}, {"type": "text", "text": "Describe this image."}],
         }
     ]
-    prompt = proc.apply_chat_template(messages, add_generation_prompt=True)
+    # the kwarg the understand provider passes too (local_vlm.py); the pinned Instruct template
+    # does not reference it (checked 2026-11-24), so it is accepted and ignored, never an error
+    prompt = proc.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False)
     inputs = proc(text=[prompt], images=[image], return_tensors="pt")
     ids = model.generate(**inputs, max_new_tokens=5, do_sample=False)
     return f"generated {tuple(ids.shape)}"

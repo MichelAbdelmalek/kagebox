@@ -98,6 +98,21 @@ def percentile(values: Sequence[float], q: float) -> float | None:
     return ordered[min(rank, len(ordered)) - 1]
 
 
+P95_MIN_N = 20  # below this many panels the "p95" is just the slowest one or two
+
+
+def pace_stats(secs: Sequence[float]) -> dict[str, Any]:
+    """Percentiles of seconds per panel, with n. With fewer than ``P95_MIN_N`` panels the p95 is
+    effectively the max, and ``p95_is_max`` says so (read it as a maximum, not a percentile)."""
+    return {
+        "n": len(secs),
+        "p50_s": percentile(secs, 50),
+        "p95_s": percentile(secs, 95),
+        "p95_is_max": len(secs) < P95_MIN_N,
+        "max_s": max(secs) if secs else None,
+    }
+
+
 def panel_seconds(created: Sequence[float], started: float, load_s: float) -> list[float]:
     """Seconds per described panel from consecutive scene timestamps (epoch seconds).
 
@@ -204,9 +219,7 @@ def build_report(
         "measured_panels": stage.get("measured_panels", len(secs)),
         "mean_s": stage.get("seconds_per_panel")
         or (round(sum(secs) / len(secs), 3) if secs else None),
-        "p50_s": percentile(secs, 50),
-        "p95_s": percentile(secs, 95),
-        "max_s": max(secs) if secs else None,
+        **pace_stats(secs),
         "per_panel_s": secs,
     }
 
