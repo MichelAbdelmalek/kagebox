@@ -1185,6 +1185,40 @@ def test_understand_full_run_needs_confirmed_current_trial(env: Env) -> None:
         assert row.counts == {"trial": True, "panels": 3} and row.finished_at is not None
 
 
+def test_understand_full_run_resumes_after_a_budget_stop_only(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    url = f"/api/chapters/{cid}/understand"
+    budget = {
+        "status": "failed",
+        "error": "understand stopped at its time budget; run it again to continue",
+        "finished_at": datetime.now(UTC) - timedelta(hours=1),
+    }
+    with respx.mock(assert_all_called=False) as mock:
+        route = u_prefect(mock)
+        # Any other failure (counts None, as claim_stage resets them) keeps the gate.
+        set_stage(env, cid, **budget, counts=None)
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        # A budget stop is resumable, but only with the confirmation, and not across a re-ingest.
+        set_stage(env, cid, **budget, counts={"resumable": True})
+        assert env.c.post(url, json={}).status_code == 422
+        set_stage(
+            env,
+            cid,
+            **(budget | {"finished_at": datetime.now(UTC) - timedelta(hours=3)}),
+            counts={"resumable": True},
+        )
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        set_stage(env, cid, **budget, counts={"resumable": False})
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        assert route.call_count == 0
+        set_stage(env, cid, **budget, counts={"resumable": True})
+        r = env.c.post(url, json={"confirm_full": True})
+        assert r.status_code == 202, r.text
+        assert json.loads(route.calls.last.request.content) == {"parameters": {"chapter_id": cid}}
+
+
 def test_understand_conflict_while_running_and_stale_allowed(env: Env) -> None:
     pid = project(env)
     cid = chapter(env, pid)

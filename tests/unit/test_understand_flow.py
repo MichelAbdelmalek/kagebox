@@ -718,6 +718,7 @@ def test_budget_stops_with_resumable_message(
     assert len(env.scenes()) == 2  # stored scenes remain
     row = env.stage()
     assert (row.status, row.error) == ("failed", BUDGET)
+    assert row.counts == {"resumable": True} and row.finished_at is not None  # API: confirm_full ok
     clock.now = 0
     env.provider.calls.clear()
     summary = env.run()

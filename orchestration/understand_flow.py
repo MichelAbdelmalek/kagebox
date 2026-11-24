@@ -293,18 +293,38 @@ def _beating(engine: Engine, run: _Run) -> Iterator[_Heartbeat]:
     hb.check()
 
 
-def _fail(engine: Engine, chapter_id: str, message: str, run_id: str) -> None:
+# Stored in ``counts`` when the chapter budget stopped a full run: its scenes are cached, so the
+# API lets the user confirm a full run again without a new trial (claim_stage resets counts, so
+# any later run replaces the marker).
+RESUMABLE_COUNTS: dict[str, Any] = {"resumable": True}
+
+
+def _fail(
+    engine: Engine,
+    chapter_id: str,
+    message: str,
+    run_id: str,
+    counts: dict[str, Any] | None = None,
+) -> None:
     """Mark the stage failed, only while ``run_id`` still owns it."""
     with Session(engine) as s, s.begin():
         row = s.get(StageRunRow, (chapter_id, STAGE), with_for_update=True)
         if row is not None and _owns(row, run_id):
             row.status, row.error, row.finished_at = "failed", message, datetime.now(UTC)
+            if counts is not None:
+                row.counts = counts
 
 
-def _safe_fail(engine: Engine, chapter_id: str, message: str, run_id: str) -> None:
+def _safe_fail(
+    engine: Engine,
+    chapter_id: str,
+    message: str,
+    run_id: str,
+    counts: dict[str, Any] | None = None,
+) -> None:
     """``_fail`` that never raises, so the caller re-raises the ORIGINAL error."""
     try:
-        _fail(engine, chapter_id, message, run_id)
+        _fail(engine, chapter_id, message, run_id, counts)
     except Exception:
         log.exception("could not mark understand of chapter %s failed", chapter_id)
 
@@ -697,7 +717,10 @@ def run_understand(
         raise
     except (RightsDenied, UnderstandRefused, ModelLoadFailed) as exc:  # fixed, user-safe messages
         log.warning("chapter %s understand stopped: %s", chapter_id, exc)
-        _safe_fail(deps.engine, chapter_id, str(exc), run.run_id)
+        budget = isinstance(exc, UnderstandRefused) and str(exc) == BUDGET
+        _safe_fail(
+            deps.engine, chapter_id, str(exc), run.run_id, RESUMABLE_COUNTS if budget else None
+        )
         set_job(deps.engine, run.run_id, "failed")
         raise
     except ValidationError as exc:  # never log or re-raise it with its (untrusted) input

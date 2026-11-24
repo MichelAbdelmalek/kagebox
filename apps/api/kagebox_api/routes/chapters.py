@@ -735,6 +735,17 @@ def _trial_is_current(db: Session, row: ChapterRow) -> bool:
     return counts.get("trial") is True and aware(st.finished_at) >= aware(row.ingest_started_at)
 
 
+def _budget_resumable(db: Session, row: ChapterRow) -> bool:
+    """The last run was stopped by the chapter time budget (its flow stores
+    ``counts.resumable``) after the chapter's last ingest start: its scenes are cached, so the
+    full run may be confirmed again without a new trial. Any later run resets the marker."""
+    st = db.get(StageRunRow, (row.id, UNDERSTAND))
+    if st is None or st.finished_at is None or row.ingest_started_at is None:
+        return False
+    counts = st.counts or {}
+    return counts.get("resumable") is True and aware(st.finished_at) >= aware(row.ingest_started_at)
+
+
 def _claim_pending(db: Session, chapter_id: str) -> bool:
     """Conditional upsert of the stage row to 'pending'; False while a live run holds it."""
     key = (StageRunRow.chapter_id == chapter_id, StageRunRow.stage == UNDERSTAND)
@@ -775,7 +786,9 @@ def start_understand(
     if row.status != "ready":
         raise HTTPException(status.HTTP_409_CONFLICT, NOT_READY)
     _require_rights(db, user, row.project_id)  # local processing: render right, no cloud gate
-    if body.limit_panels is None and not (body.confirm_full and _trial_is_current(db, row)):
+    if body.limit_panels is None and not (
+        body.confirm_full and (_trial_is_current(db, row) or _budget_resumable(db, row))
+    ):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, TRIAL_REQUIRED)
     if not _claim_pending(db, row.id):
         db.rollback()
