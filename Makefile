@@ -56,7 +56,8 @@ test-models: ## offline: tests that load the real pinned weights (models volume 
 	$(UV) sync -q --locked --all-extras --group dev
 	docker run --rm --network none -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox_models:/models:ro -w /app -e UV_OFFLINE=1 -e HF_HUB_OFFLINE=1 -e KAGEBOX_MODELS_DIR=/models $(UV_IMAGE) sh -c 'uv run --offline pytest -m models -q -o addopts="-ra --strict-markers"; rc=$$?; [ $$rc -eq 5 ] && rc=0; exit $$rc'
 
-lint: ## ruff, mypy, bandit
+lint: ## ruff, mypy, bandit (installs the locked dependencies first: mypy needs them, and `make scan` runs lint on a fresh checkout)
+	$(UV) sync -q --locked --all-extras --group dev
 	$(UV) run ruff check .
 	$(UV) run ruff format --check .
 	$(UV) run mypy
