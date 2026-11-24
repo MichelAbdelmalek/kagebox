@@ -147,7 +147,7 @@ services:
     volumes:
       - models:/models:ro
       - ../data/imports:/imports:ro  # same per-project directories the api lists for imports
-    networks: [back, egress]
+    networks: [back]  # no internet: weights are local, no stage calls a hosted API (the first one that does gets egress back, with its own test)
     depends_on:
       prefect-server: {condition: service_healthy}
       objects-init: {condition: service_completed_successfully}

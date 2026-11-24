@@ -30,6 +30,17 @@ def test_workers_get_only_the_secrets_they_read() -> None:
         assert "KAGEBOX_TOGETHER_API_KEY_FILE" not in env  # type: ignore[operator]
 
 
+def test_worker_cpu_has_no_egress_and_only_models_fetch_has() -> None:
+    # No worker-cpu stage calls the internet: ingest, OCR and understand load pinned weights
+    # from the read-only models volume, and nothing in the pipeline uses Together yet.
+    services = _services()
+    assert services["worker-cpu"]["networks"] == ["back"]
+    with_egress = {
+        name for name, svc in services.items() if "egress" in (svc.get("networks") or [])
+    }
+    assert with_egress == {"models-fetch"}
+
+
 def test_bakeoff_service_has_no_egress_and_no_published_ports() -> None:
     svc = _services()["understand-bakeoff"]
     assert svc["profiles"] == ["bakeoff"]

@@ -36,10 +36,9 @@ flowchart LR
   api --> pg & obj
   wc --> pf & pg & obj & qd
   wg --> pf & obj
-  wc -- "egress network" --> together[(Together AI)]
 ```
 
-Only Caddy publishes a port, bound to `127.0.0.1`. Postgres, Qdrant, the object store, Prefect and (later) ComfyUI live on internal networks with no route to the internet. Only `worker-cpu` and the one-shot `models-fetch` job have egress.
+Only Caddy publishes a port, bound to `127.0.0.1`. Postgres, Qdrant, the object store, Prefect and (later) ComfyUI live on internal networks with no route to the internet. Only the one-shot `models-fetch` job has egress; `worker-cpu` has none (its weights are local and no stage calls a hosted API yet).
 
 | Path | What it is |
 |---|---|
