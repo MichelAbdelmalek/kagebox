@@ -529,9 +529,14 @@ def _understand(
     detector: Detector | None = None
     provider: ModelProvider | None = None
     _beat(deps.engine, run)
+    last_beat = started
     for work in selected:
-        if _monotonic() - started > s.max_minutes_per_chapter * 60:
+        now = _monotonic()
+        if now - started > s.max_minutes_per_chapter * 60:
             raise UnderstandRefused(BUDGET)
+        if now - last_beat >= HEARTBEAT_INTERVAL_S:  # cached panels never reach a model call
+            _beat(deps.engine, run)
+            last_beat = now
         panel_started = _monotonic()
         if detector is None:
             detector = deps.detector_factory()  # once per run; a failure here fails the run

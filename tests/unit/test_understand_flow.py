@@ -565,6 +565,30 @@ def test_fully_cached_rerun_loads_no_model(tmp_path: Path, monkeypatch: pytest.M
     assert (summary.scenes, summary.cached) == (4, 4)
 
 
+def test_walking_cached_panels_beats_the_stage_every_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch, panels=8)
+    env.run()  # fill the cache
+    clock = Clock(monkeypatch)
+    beats: list[float] = []
+    real_beat = uf._beat
+    monkeypatch.setattr(uf, "_beat", lambda e, r: (beats.append(clock.now), real_beat(e, r)))
+    real_cached = uf._cached
+
+    def slow_cached(*a: Any) -> bool:
+        clock.now += 30  # a cached panel still costs time (crop, mask, hashes)
+        return real_cached(*a)
+
+    monkeypatch.setattr(uf, "_cached", slow_cached)
+    summary = env.run()
+    assert (summary.cached, env.provider.loads) == (8, 1)  # no model call in the second run
+    # one beat at the start, then one per HEARTBEAT_INTERVAL_S of walking (60 s = 2 panels)
+    assert beats[0] == 0 and len(beats) >= 4
+    gaps = [b - a for a, b in zip(beats, beats[1:], strict=False)]
+    assert all(g <= uf.HEARTBEAT_INTERVAL_S + 30 for g in gaps)
+
+
 def test_prompt_or_settings_change_invalidates_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
