@@ -18,7 +18,8 @@ __all__ = ["ATTN_IMPLEMENTATION", "UnderstandSettings", "load_settings", "prompt
 # Attention implementation the local vision provider loads with (part of the cache key).
 ATTN_IMPLEMENTATION = "eager"
 
-# A slow panel must never look dead: all attempts of one panel stay under the stale limit.
+# One generate call stays under the stale limit; a background heartbeat (understand_flow) keeps
+# the stage alive between beats, so several attempts on one panel may take longer in total.
 MAX_PANEL_S = STALE_INGEST_S - 60
 
 _VERSION = re.compile(r"^[A-Za-z0-9_.-]{1,16}$")
@@ -31,7 +32,7 @@ class UnderstandSettings(Strict):
     max_pixels: Annotated[int, Field(ge=50_000, le=2_000_000)]
     max_new_tokens: Annotated[int, Field(ge=64, le=2048)]
     max_attempts: Annotated[int, Field(ge=1, le=5)]
-    max_time_s: Annotated[int, Field(ge=10, le=300)]
+    max_time_s: Annotated[int, Field(ge=10, le=600)]
     max_minutes_per_chapter: Annotated[int, Field(ge=1, le=1440)]
     # recall-oriented detector threshold for the text mask (the ingest default is 0.5)
     mask_detect_threshold: Annotated[float, Field(ge=0.1, le=0.9)]
@@ -42,8 +43,8 @@ class UnderstandSettings(Strict):
     def _limits(self) -> UnderstandSettings:
         if not _VERSION.fullmatch(self.prompt_version) or ".." in self.prompt_version:
             raise ValueError("prompt_version must be a short plain token")
-        if self.max_attempts * self.max_time_s >= MAX_PANEL_S:
-            raise ValueError(f"max_attempts * max_time_s must stay under {MAX_PANEL_S} s")
+        if self.max_time_s >= MAX_PANEL_S:
+            raise ValueError(f"max_time_s must stay under {MAX_PANEL_S} s")
         return self
 
 

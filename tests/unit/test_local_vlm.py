@@ -111,12 +111,10 @@ def make(**kw: Any) -> tuple[LocalVlmProvider, FakeProcessor, FakeModel, Loader]
 # ---- settings -------------------------------------------------------------------------
 
 
-def test_settings_refuse_attempts_times_time_over_stale_limit() -> None:
+def test_settings_refuse_one_call_over_stale_limit() -> None:
     with pytest.raises(ValueError):
-        settings(max_attempts=5, max_time_s=150)
-    with pytest.raises(ValueError):
-        settings(max_attempts=3, max_time_s=180)  # 540 is not under 540
-    settings(max_attempts=3, max_time_s=150)
+        settings(max_attempts=2, max_time_s=540)  # 540 is not under 540
+    settings(max_attempts=3, max_time_s=539)  # attempts add up; the heartbeat covers the total
 
 
 @pytest.mark.parametrize(
@@ -131,7 +129,7 @@ def test_settings_refuse_attempts_times_time_over_stale_limit() -> None:
         {"max_attempts": 0},
         {"max_attempts": 6},
         {"max_time_s": 9},
-        {"max_time_s": 301},
+        {"max_time_s": 601},
         {"max_minutes_per_chapter": 0},
         {"max_minutes_per_chapter": 1441},
         {"mask_detect_threshold": 0.09},
@@ -147,7 +145,7 @@ def test_settings_bounds(bad: dict[str, Any]) -> None:
 def test_committed_settings_and_prompt_are_valid() -> None:
     s = load_settings()
     assert (s.threads, s.dtype, s.max_pixels, s.max_new_tokens) == (4, "bfloat16", 301056, 512)
-    assert (s.max_attempts, s.max_time_s, s.max_minutes_per_chapter) == (2, 240, 720)
+    assert (s.max_attempts, s.max_time_s, s.max_minutes_per_chapter) == (2, 420, 720)
     assert s.mask_detect_threshold == 0.35
     assert s.prompt_version == "v4"
     text, digest = prompt_text(s)

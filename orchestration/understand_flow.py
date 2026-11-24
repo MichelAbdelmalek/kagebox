@@ -100,7 +100,7 @@ log = logging.getLogger(__name__)
 FLOW_NAME = "chapter-understand"
 STAGE = "understand"
 MAX_TRIAL_PANELS = 50
-# A slow panel (up to max_attempts * max_time_s plus load) must never look dead.
+# A slow panel (several attempts of up to max_time_s) must never look dead: the heartbeat beats.
 HEARTBEAT_INTERVAL_S = 60.0
 # Prefect ends a run that exceeds this. It must stay above the chapter budget
 # (max_minutes_per_chapter: 720 = 12 h), which ends a healthy run cleanly and resumably first;

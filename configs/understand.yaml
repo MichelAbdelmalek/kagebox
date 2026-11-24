@@ -1,13 +1,13 @@
 # Scene understanding (milestone 1.2): local vision model on worker-cpu. Validated by
-# pipeline/understand/settings.py. max_attempts * max_time_s must stay under 540 s (the stale
-# limit minus a minute), so a slow panel never looks dead.
+# pipeline/understand/settings.py. max_time_s must stay under 540 s (the stale limit minus a
+# minute); the flow's heartbeat thread keeps a slow panel alive across attempts.
 prompt_version: v4
 threads: 4 # the container sees 4 cores; 6 vs 4 measured as a wash (docs: task-4-report)
 dtype: bfloat16
 max_pixels: 301056 # 384 * 28 * 28: half the image tokens of the old 602112, no visible loss
 max_new_tokens: 512
 max_attempts: 2 # a cut-off greedy answer repeats: more attempts only burn time
-max_time_s: 240 # per generate call; 150 cut off figure-heavy answers when the CPU was busy
+max_time_s: 420 # per generate call; 240 cut off 28% of panels in the first full run (16 of 57)
 max_minutes_per_chapter: 720 # overnight batch: resumable and cached; the trial gate projects the time first
 mask_detect_threshold: 0.35 # text mask: bubble detector on the panel crop, recall over precision
 margin_px: 4 # text mask: every detected or stored box grows by this many pixels before it is filled
