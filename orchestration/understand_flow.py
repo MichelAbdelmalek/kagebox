@@ -220,7 +220,9 @@ def _start(engine: Engine, chapter_id: str, run_id: str, require_trial: bool = F
     """Gates, then take the stage with one guarded UPDATE. Refused: nothing is touched."""
     now = datetime.now(UTC)
     with Session(engine) as s, s.begin():
-        row = s.get(ChapterRow, chapter_id)
+        # Lock order everywhere: the chapter row, then the stage row (ingest's start and commit
+        # do the same). Holding the chapter lock also serialises this start with an ingest's.
+        row = s.get(ChapterRow, chapter_id, with_for_update=True)
         if row is None:
             raise LookupError("chapter not found")
         if row.status != "ready":  # also: an ingest is running on it
@@ -469,10 +471,10 @@ def _store_scene(
     artifact = scene.model_dump(mode="json", exclude={"unknown_fields"})
     SceneJSON.model_validate_json(json.dumps(artifact))  # re-validated at write
     with Session(engine) as s, s.begin():
-        stage = _owned_stage(s, run)
-        chapter = s.get(ChapterRow, run.chapter_id, with_for_update=True)
+        chapter = s.get(ChapterRow, run.chapter_id, with_for_update=True)  # chapter, then stage
         if chapter is None or chapter.status != "ready":
             raise UnderstandRefused(CHAPTER_CHANGED)
+        stage = _owned_stage(s, run)
         _rights_in(s, run.project_id)
         panel = s.get(PanelRow, panel_id)
         if panel is None or panel.chapter_id != run.chapter_id:  # the chapter id is never input

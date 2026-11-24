@@ -325,7 +325,12 @@ def _start(engine: Engine, chapter_id: str, run_id: str) -> _Chapter:
     """Take the chapter for this run with one conditional UPDATE, or refuse."""
     now = datetime.now(UTC)
     with Session(engine) as s, s.begin():
-        understand = s.get(StageRunRow, (chapter_id, "understand"))
+        # Lock order everywhere: the chapter row, then the stage row (as _commit and understand's
+        # start and writes). Locked here so a concurrent understand start cannot slip in between
+        # the liveness check and the takeover.
+        if s.get(ChapterRow, chapter_id, with_for_update=True) is None:
+            raise LookupError("chapter not found")
+        understand = s.get(StageRunRow, (chapter_id, "understand"), with_for_update=True)
         if understand is not None and stage_alive(understand, ingest_stale_before(now)):
             raise IngestAlreadyRunning(UNDERSTAND_RUNNING)  # its scenes would be orphaned
         res = cast(

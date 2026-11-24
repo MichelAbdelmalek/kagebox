@@ -50,6 +50,7 @@ from pipeline.common.uploads import UploadRejected
 from pipeline.ingest.bubbles import Region
 from pipeline.ingest.panels import slice_strip
 from pipeline.ingest.process import params_hash
+from tests.unit.lock_order import both_locked, record_row_locks, violations
 
 EVIDENCE = "evidence/sha256/" + "a" * 64 + ".pdf"
 W, H = 600, 800
@@ -1141,6 +1142,19 @@ def test_reingest_clears_understand_review_items_and_stage_runs(
     found = kinds(env, cid)
     assert "scene_failed" not in found and "scene_text_claim" not in found
     assert "ocr_low_confidence" not in found  # ingest's own items are replaced as before
+
+
+def test_ingest_start_locks_the_chapter_row_before_the_stage_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+    with Session(env.engine) as s, s.begin():
+        s.add(StageRunRow(chapter_id=cid, stage="understand", status="done"))
+    events = record_row_locks(monkeypatch)
+    ingest_flow(cid)  # _start (chapter, then the understand stage row), then _commit
+    assert both_locked(events) >= 1
+    assert violations(events) == []
 
 
 def test_ingest_refused_while_understand_runs(

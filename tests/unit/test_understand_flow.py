@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import logging
 import threading
@@ -67,6 +68,7 @@ from pipeline.providers.base import ModelLoadFailed, ModelSpec, StructuredOutput
 from pipeline.providers.registry import model_for_stage
 from pipeline.understand.contract import Claim, FigureReading, PanelReading
 from pipeline.understand.settings import load_settings
+from tests.unit.lock_order import both_locked, record_row_locks, violations
 
 EVIDENCE = "evidence/sha256/" + "a" * 64 + ".pdf"
 SENTINEL = "SENTINEL-OCR-31ce"
@@ -610,7 +612,7 @@ def test_walking_cached_panels_beats_the_stage_every_interval(
     assert (summary.cached, env.provider.loads) == (8, 1)  # no model call in the second run
     # one beat at the start, then one per HEARTBEAT_INTERVAL_S of walking (60 s = 2 panels)
     assert beats[0] == 0 and len(beats) >= 4
-    gaps = [b - a for a, b in zip(beats, beats[1:], strict=False)]
+    gaps = [b - a for a, b in itertools.pairwise(beats)]
     assert all(g <= uf.HEARTBEAT_INTERVAL_S + 30 for g in gaps)
 
 
@@ -651,6 +653,16 @@ def test_flow_entry_gate_and_the_pipeline_bypass(
     # the pipeline's own stage passes confirm_full_understand=True by design and skips the gate
     assert uf.understand_stage(env.chapter_id)["status"] == "done"
     assert len(env.provider.calls) == 4
+
+
+def test_every_transaction_locks_the_chapter_row_before_the_stage_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch, panels=2)
+    events = record_row_locks(monkeypatch)
+    env.run()
+    assert both_locked(events) >= 2  # _store_scene per panel (the start claims by UPDATE)
+    assert violations(events) == []  # same order as ingest's start and _commit
 
 
 def test_prompt_or_settings_change_invalidates_cache(
