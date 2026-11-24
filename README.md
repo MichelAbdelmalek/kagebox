@@ -72,7 +72,7 @@ make user
 
 Rights approval needs two people: a member submits a rights record, an admin approves it. Open https://localhost:8443 and sign in. Caddy uses its own local CA; accept the certificate warning or trust the root at `caddy-data:/data/caddy/pki/authorities/local/root.crt`.
 
-For Phase 1 generation, put your Together AI key in `deploy/secrets/together_api_key.txt`.
+The `understand` stage runs a local model and needs no API key. A Together AI key (`deploy/secrets/together_api_key.txt`) is only for later hosted stages (for example the director); no stage uses it yet and it is not mounted into the workers.
 
 Chapter sources up to 200 MB are uploaded over HTTP (`POST /api/chapters/{id}/upload`). Larger ones are imported server-side. Imports are scoped per project: put the file in `data/imports/<project_id>/` (gitignored; create the directory; regular files only, symlinks are ignored, a hard link is fine) and call `POST /api/chapters/{id}/import` with `{"name": "<file name>", "page_start": 1, "page_end": N}`. The API and the worker look only in the directory of the chapter's own project, so a source staged for one project can neither be imported nor probed through another (whose rights record does not cover it). `data/imports` is mounted read-only at `/imports` into `api` and `worker-cpu`; the API only matches the bare name against a listing of the project's directory.
 
@@ -82,7 +82,7 @@ Both return `202 {"job_id": ...}`. Follow the run with `GET /api/jobs/{job_id}` 
 
 | Target | What it does |
 |---|---|
-| `up-cloud` | Start the stack, generation on Together AI (default; no GPU needed) |
+| `up-cloud` | Start the stack, no GPU needed (default). Later generation stages use Together AI; `understand` runs locally on the CPU in every profile |
 | `up-gpu` | Start with `worker-gpu` (needs the NVIDIA Container Toolkit) |
 | `down` / `logs` / `ps` | Stop (volumes kept), follow logs, list services |
 | `admin` / `user` | Create an account (password prompted, never echoed or logged) |
@@ -96,7 +96,7 @@ Both return `202 {"job_id": ...}`. Follow the run with `GET /api/jobs/{job_id}` 
 
 ### Understand stage (scene descriptions)
 
-`understand` describes every panel with a local vision model (Qwen3-VL 2B, bf16, CPU, loaded from the read-only `models` volume; the workers run with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so nothing is fetched at runtime and no panel leaves the machine). Text regions are flattened before the model sees a panel, and OCR text is never sent. Expect about 2 minutes per panel (measured p50 128 s, p95 570 s on a contended 4-core CPU), so a 238-panel chapter is an overnight batch: run a trial first (`limit_panels`, at most 50), read the projected time, then confirm the full run. Runs are cached and resumable.
+`understand` describes every panel with a local vision model (Qwen3-VL 2B, bf16, CPU, loaded from the read-only `models` volume; the workers run with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so nothing is fetched at runtime and no panel leaves the machine). Text regions are flattened before the model sees a panel, and OCR text is never sent. Measured on an idle Mac with 4 CPU threads: p50 91 s and p95 128 s per panel (187 panels), so the 238-panel sample chapter took about 5 h for its 187 uncached panels (the rest were cached). Under load it is slower. It is an overnight batch: run a trial first (`limit_panels`, at most 50), read the projected time, then confirm the full run. Runs are cached and resumable.
 
 - **Memory:** `worker-cpu` has `mem_limit: 8g` (peak RSS about 5.5 GB). Raise Docker Desktop's memory to about 11-12 GB (Settings, Resources) so the worker, Postgres and the rest of the stack fit together.
 - **One heavy flow at a time:** the worker serves with a limit of 1 and concurrency 1, so ingest and understand never run together; a second heavy run waits in the queue. Re-ingesting a chapter while it is being understood is refused with 409.
@@ -108,7 +108,7 @@ The Phase 0 smoke test runs against the live stack: `sh tests/e2e/phase0_smoke.s
 
 | Profile | Runs where | Hardware |
 |---|---|---|
-| `cloud` (default) | VLM/LLM on Together AI; OCR, embeddings, Whisper, 2.5D render and assembly on CPU | Any Docker host; 8 GB RAM for Docker recommended. Apple Silicon works (images are multi-arch). |
+| `cloud` (default) | `understand` (local Qwen3-VL-2B-Instruct on CPU, no cloud), OCR, embeddings, Whisper, 2.5D render and assembly on CPU; later LLM stages on Together AI | Any Docker host. Give Docker Desktop about 11-12 GB of memory (the vision model alone peaks near 5.5 GB). Apple Silicon works (images are multi-arch). |
 | `gpu` | Adds `worker-gpu` (ComfyUI API mode, TTS, music) | NVIDIA GPU with the Container Toolkit. Expected Phase 1–2 needs: 12 GB VRAM for TTS and 2.5D work, 24 GB+ for in-betweening and I2V models (to be confirmed per model). |
 
 Docker on macOS cannot use the Apple GPU, so on a Mac the `cloud` profile is the one to use.
