@@ -40,7 +40,7 @@ Rights record in Kagebox: basis `licensed`, licensor 有限会社佐藤漫画製
 | Rights record created in Kagebox (member submits, admin approves; evidence = PDF wrapping the terms snapshot) | Done (2026-11-19, `make ingest-sample`) |
 | Chapter 1 ingested through the API, contact sheets reviewed | Done (2026-11-19); see "Ingest results" |
 | Understand: 10-panel trial through the API, Prefect and the worker; text-mask check by eye | Done (2026-11-23); see "Understand results (trial)". Projection is over the 12 h budget: the full run waits for the owner |
-| Understand: full chapter (238 panels), fully cached re-run | Not run (owner's decision after the trial) |
+| Understand: full chapter (238 panels), fully cached re-run | Done (2026-11-24); see "Understand results (full chapter)" |
 
 | File (in `data/fixtures/blackjack-v1/`, gitignored) | Size | sha256 |
 |---|---|---|
@@ -140,6 +140,25 @@ Recommendation: **no threshold or margin change** on this evidence. Lowering the
 - The projection is over budget (13.9 h against 12 h at the measured mean) on a contended machine; at a quiet load it may fit, but the trial could not show that. Options: run when the Mac is quiet, raise `max_minutes_per_chapter`, or accept the run being resumed (every stored scene is cached, so a stopped run continues where it ended).
 - The literal "unknown" value, SFX and signs left readable, over-masking of art: see above.
 - Not done yet: the full run, the fully cached re-run (0 model loads), and the trial-versus-actual comparison (they follow the owner's decision).
+
+
+## Understand results (full chapter)
+
+Full run on 2026-11-24 (`make understand-sample CONFIRM=yes`), `max_time_s` 420, 2 attempts, idle Mac. It was split in two: the first attempt (2026-11-23) saved 41 scenes and cut off 16 panels at the old 240 s limit before Docker Desktop stopped (the dead Prefect run held the concurrency slot until it was marked crashed by hand); the resumed run did the remaining 187 panels.
+
+| Metric | Value |
+|---|---|
+| Scenes / failed / flagged / new review items | 238 / 0 / 0 / 0 (the 157 review items are all from ingest) |
+| Panels generated in the resumed run | 187 (51 were cached from before, including the 10 trial panels) |
+| Seconds per panel (mean / p50 / p95 / max) | 96.4 / 91.0 / 128.4 / 345.7 |
+| Wall time of the resumed run | 18,030 s (5.0 h) |
+| Null rates | setting 0%, action 32.4%, shot_hint 0%, time_of_day 85.3%, weather 92.4% |
+| Figures per panel | mean 1.02 (0: 34, 1: 174, 2: 27, 4: 2, 6: 1); emotion null 5.8% |
+| Fully cached re-run | 238 cached, 0 model calls, 0 failed; worker memory peak sampled 3.9 GiB |
+
+The loaded trial projection (13.9 h) was too pessimistic: on an idle machine the pace is about 1.6 min per panel. Raising `max_time_s` from 240 to 420 s removed all cut-offs (the first run lost 16 of 57 panels). Reports and contact sheets live in `data/reports/understand-sample-full-*` (gitignored).
+
+Known issues carried to the fix wave: one scene stores the literal "unknown" for time of day and weather; sound-effect lettering and some signs stay readable under the text mask; the mask blanks part of the art in busy panels.
 
 ## Studied, not used
 
