@@ -33,7 +33,7 @@ from pipeline.providers.replay import ReplayMiss, ReplayProvider, record_case
 from pipeline.understand.contract import PanelReading
 from pipeline.understand.request import prepare_panel
 from pipeline.understand.settings import load_settings, prompt_text
-from tests.unit.test_understand_flow import Env, make_env
+from tests.unit.understand_env import Env, make_env
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "understand"
 CASES = {c.name: c for c in synthetic_cases()}

@@ -20,7 +20,7 @@ from pipeline.common.schemas import SceneJSON
 from pipeline.providers.base import StructuredOutputFailed
 from pipeline.providers.registry import model_for_stage
 from pipeline.understand.contract import Claim, FigureReading
-from tests.unit.test_understand_flow import make_env, reading
+from tests.unit.understand_env import make_env, reading
 
 SECRET = "SENTINEL-SCENE-77aa"
 
