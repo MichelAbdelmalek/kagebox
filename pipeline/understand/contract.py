@@ -23,6 +23,12 @@ REVIEW_KINDS: tuple[str, ...] = ("scene_failed", "scene_text_claim")
 
 _Text500 = Annotated[str, Field(max_length=500)]
 
+# What the small model writes when it has nothing to say. A value that is only one of these
+# (after trimming and lower-casing) means "not drawn": the field stays null, never the literal.
+UNKNOWN_SENTINELS: frozenset[str] = frozenset(
+    {"unknown", "n/a", "na", "none", "unclear", "not visible", "not applicable", "null", "-"}
+)
+
 
 class Claim(Strict):
     """One statement about the panel, with the kind of evidence behind it.
@@ -59,9 +65,12 @@ class Issue(Strict):
 
 
 def _resolve(claim: Claim, field: str, panel_id: str, issues: list[Issue]) -> Cited[str]:
-    """Turn a claim into a cited value, or an empty one (with an Issue for text evidence)."""
+    """Turn a claim into a cited value, or an empty one (with an Issue for text evidence).
+
+    Empty, whitespace-only and sentinel values (``UNKNOWN_SENTINELS``) are unknown: null, no Issue.
+    """
     value = claim.value
-    if value is None or not value.strip():
+    if value is None or not value.strip() or value.strip().lower() in UNKNOWN_SENTINELS:
         return Cited[str]()
     if claim.evidence == "text":
         issues.append(Issue(kind="scene_text_claim", field=field))  # field name only, never text

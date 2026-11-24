@@ -148,3 +148,49 @@ def test_recorded_night_answer_validates() -> None:
     )
     scene, issues = convert(PanelReading.model_validate_json(raw))
     assert scene.time_of_day.value == "night" and issues == []
+
+
+SENTINELS = [
+    "unknown",
+    "Unknown",
+    "N/A",
+    "n/a",
+    "NA",
+    "none",
+    "None",
+    "unclear",
+    "Not visible",
+    "NOT APPLICABLE",
+    "null",
+    "-",
+    "  unknown  ",
+]
+
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+@pytest.mark.parametrize("field", ["setting", "action", "time_of_day", "weather"])
+def test_sentinel_text_is_null_for_every_scene_field(field: str, sentinel: str) -> None:
+    scene, issues = convert(reading(**{field: visual(sentinel)}))
+    cited = getattr(scene, field)
+    assert cited.value is None and cited.panel_ids == []
+    assert issues == []
+
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_sentinel_figure_emotion_is_null(sentinel: str) -> None:
+    fig = {"description": visual("a tall figure"), "emotion": visual(sentinel)}
+    scene, _ = convert(reading(figures=[fig]))
+    assert scene.figures[0].description.value == "a tall figure"
+    assert scene.figures[0].emotion.value is None
+
+
+@pytest.mark.parametrize("sentinel", SENTINELS)
+def test_sentinel_figure_description_drops_the_figure(sentinel: str) -> None:
+    fig = {"description": visual(sentinel), "emotion": visual("calm")}
+    scene, _ = convert(reading(figures=[fig]))
+    assert scene.figures == []
+
+
+def test_real_text_containing_a_sentinel_word_is_kept() -> None:
+    scene, _ = convert(reading(weather=visual("none of the clouds are dark")))
+    assert scene.weather.value == "none of the clouds are dark"

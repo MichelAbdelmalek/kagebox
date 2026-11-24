@@ -158,6 +158,8 @@ Full run on 2026-11-24 (`make understand-sample CONFIRM=yes`), `max_time_s` 420,
 
 The loaded trial projection (13.9 h) was too pessimistic: on an idle machine the pace is about 1.6 min per panel. Raising `max_time_s` from 240 to 420 s removed all cut-offs (the first run lost 16 of 57 panels). Reports and contact sheets live in `data/reports/understand-sample-full-*` (gitignored).
 
+Fix-wave note: the contract now turns a small closed set of "no information" words ("unknown", "n/a", "none", "unclear", "not visible", "not applicable", "null", "-", any case) into null for every scene field. Scenes already stored are not rewritten: the one scene that still holds the literal "unknown" is corrected only when it is generated again. Find it with `SELECT panel_id FROM scenes WHERE artifact::text ILIKE '%"unknown"%';` (read-only; the panel is PDF page 4, panel 1) and re-describe that panel with a run whose cache misses it (for example after a prompt or settings change); no database edit is needed or wanted.
+
 Known issues carried to the fix wave: one scene stores the literal "unknown" for time of day and weather; sound-effect lettering and some signs stay readable under the text mask; the mask blanks part of the art in busy panels.
 
 ## Studied, not used
