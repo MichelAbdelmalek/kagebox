@@ -54,6 +54,7 @@ from kagebox_api.security import sign_media
 from pipeline.common.dbmodels import (
     SceneRow,
     StageRunRow,
+    full_run_allowed,
     ingest_alive,
     ingest_stale_before,
     ingest_takeover_allowed,
@@ -719,31 +720,10 @@ def import_source(
 # understand
 
 
-def _trial_is_current(db: Session, row: ChapterRow) -> bool:
-    """A finished trial newer than the chapter's last ingest start.
-
-    Rule: the stage row says ``counts.trial`` and has ``finished_at`` no earlier than the
-    chapter's ``ingest_started_at``. Re-ingesting the source (or any later ingest) replaces the
-    panels, so an older trial no longer describes them. The status is ignored (a refused later
-    start can flip it); starting a run only touches status and error, so a trial stays visible
-    until a new run claims the stage (which resets its counts).
-    """
-    st = db.get(StageRunRow, (row.id, UNDERSTAND))
-    if st is None or st.finished_at is None or row.ingest_started_at is None:
-        return False
-    counts = st.counts or {}
-    return counts.get("trial") is True and aware(st.finished_at) >= aware(row.ingest_started_at)
-
-
-def _budget_resumable(db: Session, row: ChapterRow) -> bool:
-    """The last run was stopped by the chapter time budget (its flow stores
-    ``counts.resumable``) after the chapter's last ingest start: its scenes are cached, so the
-    full run may be confirmed again without a new trial. Any later run resets the marker."""
-    st = db.get(StageRunRow, (row.id, UNDERSTAND))
-    if st is None or st.finished_at is None or row.ingest_started_at is None:
-        return False
-    counts = st.counts or {}
-    return counts.get("resumable") is True and aware(st.finished_at) >= aware(row.ingest_started_at)
+def _full_run_allowed(db: Session, row: ChapterRow) -> bool:
+    """A finished trial, or a run the budget stopped, newer than the chapter's last ingest start
+    (the rule lives in ``full_run_allowed``, shared with the flow's own re-check)."""
+    return full_run_allowed(db.get(StageRunRow, (row.id, UNDERSTAND)), row.ingest_started_at)
 
 
 def _claim_pending(db: Session, chapter_id: str) -> bool:
@@ -786,9 +766,7 @@ def start_understand(
     if row.status != "ready":
         raise HTTPException(status.HTTP_409_CONFLICT, NOT_READY)
     _require_rights(db, user, row.project_id)  # local processing: render right, no cloud gate
-    if body.limit_panels is None and not (
-        body.confirm_full and (_trial_is_current(db, row) or _budget_resumable(db, row))
-    ):
+    if body.limit_panels is None and not (body.confirm_full and _full_run_allowed(db, row)):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, TRIAL_REQUIRED)
     if not _claim_pending(db, row.id):
         db.rollback()

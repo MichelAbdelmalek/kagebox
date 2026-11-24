@@ -63,6 +63,7 @@ from pipeline.common.dbmodels import (
     SceneRow,
     StageRunRow,
     claim_stage,
+    full_run_allowed,
 )
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import (
@@ -116,6 +117,7 @@ MODEL_NOT_LOADED = "the vision model could not be loaded"
 NOT_READY = "chapter is not ready"
 CHAPTER_CHANGED = "the chapter changed during understanding"
 BUDGET = "understand stopped at its time budget; run it again to continue"
+TRIAL_REQUIRED = "run a trial first and confirm the full run"  # same text as the API's
 BAD_TRIAL = f"the trial size must be between 1 and {MAX_TRIAL_PANELS} panels"
 
 
@@ -214,7 +216,7 @@ def _rights_in(s: Session, project_id: str) -> None:
     require_render_allowed(rec, datetime.now(UTC))
 
 
-def _start(engine: Engine, chapter_id: str, run_id: str) -> _Run:
+def _start(engine: Engine, chapter_id: str, run_id: str, require_trial: bool = False) -> _Run:
     """Gates, then take the stage with one guarded UPDATE. Refused: nothing is touched."""
     now = datetime.now(UTC)
     with Session(engine) as s, s.begin():
@@ -224,6 +226,10 @@ def _start(engine: Engine, chapter_id: str, run_id: str) -> _Run:
         if row.status != "ready":  # also: an ingest is running on it
             raise UnderstandRefused(NOT_READY)
         _rights_in(s, row.project_id)
+        if require_trial and not full_run_allowed(
+            s.get(StageRunRow, (chapter_id, STAGE)), row.ingest_started_at
+        ):  # read before claim_stage, which resets the trial's counts
+            raise UnderstandRefused(TRIAL_REQUIRED)
         if not claim_stage(s, chapter_id, STAGE, run_id, now):
             raise UnderstandAlreadyRunning(ALREADY_RUNNING)
         return _Run(chapter_id, row.project_id, run_id)
@@ -702,10 +708,18 @@ def run_understand(
     deps: UnderstandDeps,
     run_id: str | None = None,
     limit_panels: int | None = None,
+    require_trial: bool = False,
 ) -> UnderstandSummary:
+    """``require_trial``: a full run (no ``limit_panels``) needs a current finished trial or a
+    budget-stopped run, as the API checks (``full_run_allowed``); the flow entry sets it."""
     if limit_panels is not None and not 1 <= limit_panels <= MAX_TRIAL_PANELS:
         raise UnderstandRefused(BAD_TRIAL)  # before claiming anything
-    run = _start(deps.engine, chapter_id, run_id or ingest_flow.current_run_id())
+    run = _start(
+        deps.engine,
+        chapter_id,
+        run_id or ingest_flow.current_run_id(),
+        require_trial=require_trial and limit_panels is None,
+    )
     set_job = ingest_flow._safe_set_job
     set_job(deps.engine, run.run_id, "running")
     try:
@@ -819,13 +833,25 @@ def on_failed(flow: Flow[Any, Any], flow_run: FlowRun, state: State[Any] | None)
     on_failure=[on_failed],
     timeout_seconds=FLOW_TIMEOUT_S,
 )
-def understand_flow(chapter_id: str, limit_panels: int | None = None) -> UnderstandSummary:
-    """Deployment entry point. Parameters must stay JSON-serializable."""
-    return run_understand(chapter_id, build_deps(), limit_panels=limit_panels)
+def understand_flow(
+    chapter_id: str, limit_panels: int | None = None, pipeline_confirmed: bool = False
+) -> UnderstandSummary:
+    """Deployment entry point. Parameters must stay JSON-serializable.
+
+    A full run (no ``limit_panels``) re-checks the trial gate the API enforces, so a run started
+    any other way (a Prefect UI run, a direct deployment call) cannot skip it.
+    ``pipeline_confirmed`` is set only by ``understand_stage``: the chapter pipeline already ran
+    the stage on an explicit ``confirm_full_understand=True`` (``orchestration.flows``)."""
+    return run_understand(
+        chapter_id,
+        build_deps(),
+        limit_panels=limit_panels,
+        require_trial=not pipeline_confirmed,
+    )
 
 
 def understand_stage(chapter_id: str) -> StageResult:
     """The chapter pipeline's understand stage: a full run."""
-    summary = understand_flow(chapter_id)
+    summary = understand_flow(chapter_id, pipeline_confirmed=True)
     counts = {k: str(v) for k, v in summary.model_dump().items()}
     return {"stage": STAGE, "chapter_id": chapter_id, "status": "done", **counts}

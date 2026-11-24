@@ -173,6 +173,10 @@ class Env:
     def run(self, **kw: Any) -> uf.UnderstandSummary:
         return run_understand(self.chapter_id, self.deps(), **kw)
 
+    def stage_missing(self) -> bool:
+        with Session(self.engine) as s:
+            return s.get(StageRunRow, (self.chapter_id, "understand")) is None
+
     def stage(self) -> StageRunRow:
         with Session(self.engine) as s:
             row = s.get(StageRunRow, (self.chapter_id, "understand"))
@@ -610,6 +614,45 @@ def test_walking_cached_panels_beats_the_stage_every_interval(
     assert all(g <= uf.HEARTBEAT_INTERVAL_S + 30 for g in gaps)
 
 
+def confirm_trial_gate(env: Env, trial: bool = True) -> None:
+    """Run a trial (ingest_started_at set before it, as a real ingest would have)."""
+    env.update(ChapterRow, env.chapter_id, ingest_started_at=datetime.now(UTC) - timedelta(hours=1))
+    if trial:
+        env.run(limit_panels=1)
+
+
+def test_full_run_through_the_flow_entry_needs_a_current_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    confirm_trial_gate(env, trial=False)
+    with pytest.raises(UnderstandRefused, match="trial"):  # no trial at all
+        env.run(require_trial=True)
+    assert env.provider.calls == [] and env.stage_missing()  # nothing claimed, no model call
+    env.run(limit_panels=1)
+    env.update(ChapterRow, env.chapter_id, ingest_started_at=datetime.now(UTC))  # re-ingested
+    with pytest.raises(UnderstandRefused, match="trial"):  # the trial predates the ingest
+        env.run(require_trial=True)
+    env.update(ChapterRow, env.chapter_id, ingest_started_at=datetime.now(UTC) - timedelta(days=1))
+    assert env.run(require_trial=True).scenes == 4  # a current trial: allowed
+    # a trial may still be requested without one (the gate is for full runs only)
+    env.update(StageRunRow, (env.chapter_id, "understand"), counts=None, finished_at=None)
+    assert env.run(limit_panels=1, require_trial=True).trial is True
+
+
+def test_flow_entry_gate_and_the_pipeline_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    confirm_trial_gate(env, trial=False)
+    with pytest.raises(UnderstandRefused, match="trial"):
+        understand_flow(env.chapter_id)  # the deployment entry (API start): gate enforced
+    assert env.provider.calls == []
+    # the pipeline's own stage passes confirm_full_understand=True by design and skips the gate
+    assert uf.understand_stage(env.chapter_id)["status"] == "done"
+    assert len(env.provider.calls) == 4
+
+
 def test_prompt_or_settings_change_invalidates_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -998,7 +1041,7 @@ def test_timed_out_run_marks_failed(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     env.provider.on_call = hang
     started = time.monotonic()
     with pytest.raises(TimeoutError):
-        understand_flow.with_options(timeout_seconds=1)(env.chapter_id)
+        understand_flow.with_options(timeout_seconds=1)(env.chapter_id, pipeline_confirmed=True)
     assert time.monotonic() - started < 8
     row = env.stage()
     assert (row.status, row.error) == ("failed", "understand timed out")
@@ -1025,7 +1068,7 @@ def test_flow_run_id_is_the_owner_token_and_job_follows_the_run(
         return original()
 
     monkeypatch.setattr(uf, "build_deps", deps_with_job)
-    understand_flow(env.chapter_id)
+    understand_flow(env.chapter_id, pipeline_confirmed=True)
     assert seen[0] is not None and seen[0] == seen[1] and seen[2] == "running"
     assert job_status(env, job_for_run[0]) == "completed"
     direct = env.stage().run_id

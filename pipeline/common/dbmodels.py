@@ -260,6 +260,22 @@ def stage_alive(row: StageRunRow, stale_before: datetime) -> bool:
     return row.status == "running" and last is not None and aware(last) >= stale_before
 
 
+def full_run_allowed(st: StageRunRow | None, ingest_started_at: datetime | None) -> bool:
+    """May a full understand run start? The one rule, shared by the API and the flow.
+
+    Needs a finished stage row no older than the chapter's last ingest start (a re-ingest replaces
+    the panels) that is either a trial (``counts.trial``) or a run the chapter budget stopped
+    (``counts.resumable``; its scenes are cached). The status is ignored: a refused later start
+    can flip it, and starting a run only touches status and error until a run claims the stage.
+    """
+    if st is None or st.finished_at is None or ingest_started_at is None:
+        return False
+    if aware(st.finished_at) < aware(ingest_started_at):
+        return False
+    counts = st.counts or {}
+    return counts.get("trial") is True or counts.get("resumable") is True
+
+
 def claim_stage(session: Session, chapter_id: str, stage: str, run_id: str, now: datetime) -> bool:
     """Take the (chapter, stage) lock for ``run_id``; True only if this run now owns it.
 
