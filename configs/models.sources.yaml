@@ -82,3 +82,26 @@ manga-ocr:
       repo: kha-white/manga-ocr-base
       revision: 82c77fb84369e0fce0d6e8f0ad96fa82646d0346
       path: model.safetensors
+
+qwen3-vl-2b-instruct:
+  repo: Qwen/Qwen3-VL-2B-Instruct
+  revision: 89644892e4d85e24eaac8bacfd4f463576704203
+  license: Apache-2.0
+  stage: understand (candidate)
+  allow: ["*.safetensors", "*.json", merges.txt, vocab.json]
+
+qwen3-5-2b:
+  repo: Qwen/Qwen3.5-2B
+  revision: 15852e8c16360a2fea060d615a32b45270f8a8fc
+  license: Apache-2.0
+  stage: understand (not selected, evidence in docs/plans/phase-1-model-audit.md)
+  status: proposed
+  allow: ["*.safetensors", "*.json", merges.txt, vocab.json, chat_template.jinja]
+
+qwen3-5-0-8b:
+  repo: Qwen/Qwen3.5-0.8B
+  revision: 2fc06364715b967f1860aea9cf38778875588b17
+  license: Apache-2.0
+  stage: understand (not selected, evidence in docs/plans/phase-1-model-audit.md)
+  status: proposed
+  allow: ["*.safetensors", "*.json", merges.txt, vocab.json, chat_template.jinja]

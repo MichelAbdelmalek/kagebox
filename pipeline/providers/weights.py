@@ -41,7 +41,7 @@ SUFFIXES: dict[str, frozenset[str]] = {
     "ctranslate2": frozenset({".bin"}),  # CTranslate2's own flat format, not torch pickle
     "paddle": frozenset({".pdmodel", ".pdiparams", ".json"}),
     "json": frozenset({".json"}),
-    "text": frozenset({".txt", ".md"}),
+    "text": frozenset({".txt", ".md", ".jinja"}),  # .jinja: chat template, data only
     "sentencepiece": frozenset({".model"}),
     "tiktoken": frozenset({".tiktoken"}),
     "yaml": frozenset({".yaml", ".yml"}),

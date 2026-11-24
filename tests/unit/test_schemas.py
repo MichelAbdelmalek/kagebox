@@ -123,6 +123,17 @@ def test_scene_rejects_unlisted_shot_hint() -> None:
         )
 
 
+def test_scene_json_figure_citing_other_panel_rejected() -> None:
+    fig = {
+        "description": {"value": "A knight", "panel_ids": ["panel_0001"]},
+        "emotion": {},
+    }
+    with pytest.raises(ValidationError, match="must cite its own panel"):
+        SceneJSON.model_validate_json(j(scene(figures=[fig])))
+    ok = {"description": {"value": "A knight", "panel_ids": ["panel_0144"]}, "emotion": {}}
+    assert len(SceneJSON.model_validate_json(j(scene(figures=[ok]))).figures) == 1
+
+
 # --- Bubble --------------------------------------------------------------------------------------
 
 

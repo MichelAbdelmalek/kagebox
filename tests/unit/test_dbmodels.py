@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from pipeline.common.database import make_engine
 from pipeline.common.dbmodels import (
+    STALE_INGEST_S,
     Base,
     BubbleRow,
     ChapterRow,
@@ -19,8 +20,14 @@ from pipeline.common.dbmodels import (
     PanelRow,
     ProjectRow,
     ReviewItemRow,
+    SceneRow,
+    StageRunRow,
     User,
     aware,
+    claim_stage,
+    full_run_allowed,
+    stage_alive,
+    stage_takeover_allowed,
 )
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import Bubble, Page, Panel
@@ -197,3 +204,158 @@ def test_chapter_ingest_started_at_nullable(tmp_path: Any) -> None:
     s.commit()
     assert aware(chapter.ingest_started_at) == NOW
     assert chapter.ingest_run_id == "f3c1e2d4-run"
+
+
+def _scene(panel_id: str, chapter_id: str, sid: str | None = None) -> SceneRow:
+    return SceneRow(
+        id=sid or "scene_" + new_id("panel"),
+        panel_id=panel_id,
+        chapter_id=chapter_id,
+        params_hash="b" * 64,
+        artifact={"k": "v"},
+    )
+
+
+def test_scene_unique_per_panel_and_cascades_with_panel_and_chapter(tmp_path: Any) -> None:
+    s = _session(tmp_path)
+    ids = _seed(s)
+    s.add(_scene(ids["panel"], ids["chap"]))
+    s.commit()
+    s.add(_scene(ids["panel"], ids["chap"]))
+    with pytest.raises(IntegrityError):
+        s.commit()
+    s.rollback()
+    s.execute(delete(PanelRow).where(PanelRow.id == ids["panel"]))
+    s.commit()
+    assert s.scalars(select(SceneRow)).all() == []
+    # chapter cascade, on a fresh database
+    (tmp_path / "b").mkdir()
+    s = _session(tmp_path / "b")
+    other = _seed(s)
+    s.add(_scene(other["panel"], other["chap"]))
+    s.commit()
+    s.execute(delete(ChapterRow).where(ChapterRow.id == other["chap"]))
+    s.commit()
+    assert s.scalars(select(SceneRow)).all() == []
+
+
+def test_claim_stage_creates_missing_row(tmp_path: Any) -> None:
+    s = _session(tmp_path)
+    ids = _seed(s)
+    assert claim_stage(s, ids["chap"], "understand", "run-a", NOW) is True
+    s.commit()
+    row = s.get(StageRunRow, (ids["chap"], "understand"))
+    assert row is not None
+    assert (row.status, row.run_id) == ("running", "run-a")
+    assert aware(row.started_at) == NOW and aware(row.heartbeat_at) == NOW  # type: ignore[arg-type]
+
+
+def test_claim_stage_refuses_live_and_takes_over_stale(tmp_path: Any) -> None:
+    s = _session(tmp_path)
+    ids = _seed(s)
+    assert claim_stage(s, ids["chap"], "understand", "run-a", NOW)
+    s.commit()
+    soon = NOW + timedelta(seconds=60)
+    assert claim_stage(s, ids["chap"], "understand", "run-b", soon) is False
+    s.commit()
+    row = s.get(StageRunRow, (ids["chap"], "understand"))
+    assert row is not None
+    s.refresh(row)
+    assert row.run_id == "run-a"
+    # another stage is independent
+    assert claim_stage(s, ids["chap"], "bible", "run-b", soon) is True
+    s.commit()
+    late = NOW + timedelta(seconds=STALE_INGEST_S + 1)
+    assert claim_stage(s, ids["chap"], "understand", "run-b", late) is True
+    s.commit()
+    s.refresh(row)
+    assert (row.run_id, row.status) == ("run-b", "running")
+    # a finished stage can be claimed again at once
+    row.status = "done"
+    s.commit()
+    assert claim_stage(s, ids["chap"], "understand", "run-c", soon) is True
+    s.commit()
+    s.refresh(row)
+    assert (row.run_id, row.status, row.finished_at, row.error) == ("run-c", "running", None, None)
+
+
+def test_stage_alive_matches_sql_rule(tmp_path: Any) -> None:
+    s = _session(tmp_path)
+    ids = _seed(s)
+    stale_before = NOW - timedelta(seconds=STALE_INGEST_S)
+    cases = [
+        ("running", NOW, None),  # fresh heartbeat
+        ("running", stale_before - timedelta(seconds=1), None),  # stale heartbeat
+        ("running", stale_before - timedelta(seconds=1), NOW),  # stale start, fresh beat
+        ("running", None, NOW),  # no beat yet, fresh start
+        ("running", None, stale_before - timedelta(seconds=1)),  # no beat, stale start
+        ("running", None, None),  # nothing at all
+        ("done", NOW, NOW),
+        ("failed", NOW, NOW),
+        ("pending", NOW, NOW),
+    ]
+    for i, (status, beat, started) in enumerate(cases):
+        s.add(
+            StageRunRow(
+                chapter_id=ids["chap"],
+                stage=f"s{i}",
+                status=status,
+                run_id="r",
+                heartbeat_at=beat,
+                started_at=started,
+            )
+        )
+    s.commit()
+    for row in s.scalars(select(StageRunRow)):
+        allowed = s.scalar(
+            select(StageRunRow.stage).where(
+                StageRunRow.stage == row.stage, stage_takeover_allowed(stale_before)
+            )
+        )
+        assert stage_alive(row, stale_before) == (allowed is None), row.stage
+
+
+def test_full_run_allowed_rule_and_null_counts(tmp_path: Any) -> None:
+    """SQL NULL, JSON null and absent counts all mean "no counts"; a trial or a budget stop that
+    finished after the chapter's last ingest start allows a full run, nothing else does."""
+    from sqlalchemy import JSON
+
+    s = _session(tmp_path)
+    ids = _seed(s)
+    row = StageRunRow(chapter_id=ids["chap"], stage="understand", status="pending")
+    s.add(row)
+    s.commit()
+    ingest = NOW - timedelta(hours=2)
+    done = NOW - timedelta(hours=1)
+    assert full_run_allowed(None, ingest) is False
+    assert full_run_allowed(row, ingest) is False  # no finished_at
+    row.finished_at = done
+    for counts in (None, JSON.NULL, {}):  # SQL NULL, JSON null, empty
+        row.counts = counts
+        s.commit()
+        s.refresh(row)
+        assert row.counts in (None, {}) and full_run_allowed(row, ingest) is False
+    for counts in ({"trial": True}, {"resumable": True}):
+        row.counts = counts
+        assert full_run_allowed(row, ingest) is True
+        assert full_run_allowed(row, NOW) is False  # re-ingested after it finished
+        assert full_run_allowed(row, None) is False
+    for counts in ({"trial": False}, {"resumable": False}, {"trial": 1}):
+        row.counts = counts
+        assert full_run_allowed(row, ingest) is False
+
+
+def test_job_stage_defaults_to_ingest(tmp_path: Any) -> None:
+    s = _session(tmp_path)
+    ids = _seed(s)
+    job = s.scalars(select(JobRow)).one()
+    assert job.stage == "ingest"
+    s.execute(
+        text(
+            "INSERT INTO jobs (id, chapter_id, status, created_at, updated_at) "
+            "VALUES ('j2', :c, 'submitted', :t, :t)"
+        ),
+        {"c": ids["chap"], "t": NOW},
+    )
+    s.commit()
+    assert s.get(JobRow, "j2").stage == "ingest"  # type: ignore[union-attr]

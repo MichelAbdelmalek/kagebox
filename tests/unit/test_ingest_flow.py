@@ -38,6 +38,8 @@ from pipeline.common.dbmodels import (
     ProjectRow,
     ReviewItemRow,
     RightsRow,
+    SceneRow,
+    StageRunRow,
     User,
 )
 from pipeline.common.ids import new_id
@@ -48,6 +50,7 @@ from pipeline.common.uploads import UploadRejected
 from pipeline.ingest.bubbles import Region
 from pipeline.ingest.panels import slice_strip
 from pipeline.ingest.process import params_hash
+from tests.unit.lock_order import both_locked, record_row_locks, violations
 
 EVIDENCE = "evidence/sha256/" + "a" * 64 + ".pdf"
 W, H = 600, 800
@@ -1091,3 +1094,118 @@ def test_rights_revoked_mid_run_stores_nothing(
     row = chapter(env, cid)
     assert row.status == "failed" and row.error is not None and "rejected" in row.error
     assert count(env, PageRow, cid) == 0
+
+
+def _add_understand_state(env: Env, cid: str) -> str:
+    """A scene, understand review items, an ingest review item and stage rows for a chapter."""
+    with Session(env.engine) as s, s.begin():
+        panel = s.scalars(select(PanelRow).where(PanelRow.chapter_id == cid)).first()
+        assert panel is not None
+        s.add(
+            SceneRow(
+                id=new_id("scene"),
+                panel_id=panel.id,
+                chapter_id=cid,
+                params_hash="a" * 64,
+                artifact={},
+            )
+        )
+        project = s.get(ChapterRow, cid)
+        assert project is not None
+        for kind in ("scene_failed", "scene_text_claim", "ocr_low_confidence"):
+            s.add(
+                ReviewItemRow(
+                    id=new_id("rev"),
+                    project_id=project.project_id,
+                    chapter_id=cid,
+                    artifact_id=panel.id,
+                    kind=kind,
+                    reason="r",
+                    status="open",
+                )
+            )
+        for stage in ("understand", "bible"):
+            s.add(StageRunRow(chapter_id=cid, stage=stage, status="done"))
+        return panel.id
+
+
+def test_reingest_clears_understand_review_items_and_stage_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    ingest_flow(cid)
+    _add_understand_state(env, cid)
+    ingest_flow(cid)  # the panels are replaced: everything built on them goes
+    assert count(env, SceneRow, cid) == 0
+    assert count(env, StageRunRow, cid) == 0
+    found = kinds(env, cid)
+    assert "scene_failed" not in found and "scene_text_claim" not in found
+    assert "ocr_low_confidence" not in found  # ingest's own items are replaced as before
+
+
+def test_ingest_start_locks_the_chapter_row_before_the_stage_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png(), page_png()]))
+    with Session(env.engine) as s, s.begin():
+        s.add(StageRunRow(chapter_id=cid, stage="understand", status="done"))
+    events = record_row_locks(monkeypatch)
+    ingest_flow(cid)  # _start (chapter, then the understand stage row), then _commit
+    assert both_locked(events) >= 1
+    assert violations(events) == []
+
+
+def test_ingest_refused_while_understand_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    ingest_flow(cid)
+    now = datetime.now(UTC)
+    with Session(env.engine) as s, s.begin():
+        s.add(
+            StageRunRow(
+                chapter_id=cid,
+                stage="understand",
+                status="running",
+                run_id="run-u",
+                started_at=now,
+                heartbeat_at=now,
+            )
+        )
+    panels_before = count(env, PanelRow, cid)
+    with pytest.raises(ingest_mod.IngestAlreadyRunning, match="understand is running"):
+        ingest_flow(cid)
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("ready", None)  # untouched
+    assert count(env, PanelRow, cid) == panels_before
+    with Session(env.engine) as s, s.begin():  # a dead understand run does not block
+        stage = s.get(StageRunRow, (cid, "understand"))
+        assert stage is not None
+        stage.heartbeat_at = now - timedelta(seconds=STALE_INGEST_S + 60)
+    ingest_flow(cid)
+    assert chapter(env, cid).status == "ready"
+
+
+def test_unstarted_ingest_looks_only_at_ingest_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+    cid = add_chapter(env, make_cbz([page_png()]), page_end=1)
+    add_job(env, cid, "run-i")
+    with Session(env.engine) as s, s.begin():  # a newer job of another stage
+        s.add(
+            JobRow(
+                id=new_id("job"),
+                chapter_id=cid,
+                flow_run_id="run-u",
+                status="submitted",
+                stage="understand",
+            )
+        )
+    run = SimpleNamespace(id="run-i", parameters={"chapter_id": cid})
+    ingest_mod.on_crashed(ingest_flow, run, None)  # type: ignore[arg-type]
+    row = chapter(env, cid)
+    assert (row.status, row.error) == ("failed", "ingest could not start")

@@ -9,7 +9,7 @@ import os
 import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,7 @@ from PIL import Image
 from sqlalchemy import select
 
 from kagebox_api.db import (
+    AuditEvent,
     BubbleRow,
     ChapterRow,
     JobRow,
@@ -32,7 +33,9 @@ from kagebox_api.db import (
 )
 from kagebox_api.deps import CSRF_COOKIE
 from kagebox_api.main import create_app
+from kagebox_api.prefect_client import UNDERSTAND_DEPLOYMENT, start_deployment
 from kagebox_api.security import hash_password
+from pipeline.common.dbmodels import STALE_INGEST_S, SceneRow, StageRunRow
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import Bubble, Page, Panel
 from pipeline.common.settings import Settings
@@ -202,6 +205,8 @@ def test_every_new_route_requires_auth(env: Env) -> None:
         ("POST", f"/api/chapters/{cid}/upload"),
         ("POST", f"/api/chapters/{cid}/import"),
         ("GET", f"/api/chapters/{cid}/pages"),
+        ("POST", f"/api/chapters/{cid}/understand"),
+        ("GET", f"/api/chapters/{cid}/stages"),
         ("GET", "/api/pages/page_x/panels"),
         ("GET", f"/api/projects/{pid}/review-items"),
         ("GET", "/api/jobs/job_x"),
@@ -903,7 +908,8 @@ def test_job_status_readable_by_project_members_only(env: Env) -> None:
     out = env.c.get(f"/api/jobs/{job_id}")
     assert out.status_code == 200, out.text
     body = out.json()
-    assert set(body) == {"id", "chapter_id", "status", "created_at", "updated_at"}
+    assert set(body) == {"id", "chapter_id", "status", "stage", "created_at", "updated_at"}
+    assert body["stage"] == "ingest"
     assert (body["id"], body["chapter_id"], body["status"]) == (job_id, cid, "submitted")
     login(env.c, "vi")  # viewer of the project
     assert env.c.get(f"/api/jobs/{job_id}").json()["status"] == "submitted"
@@ -1012,3 +1018,380 @@ def test_pages_keyset_pagination(env: Env) -> None:
     for bad in ("%%%", _cursor(["1", "page_x"]), _cursor([True, "page_x"]), _cursor([1, 2])):
         r = env.c.get(f"/api/chapters/{cid}/pages", params={"cursor": bad})
         assert r.status_code == 422, bad
+
+
+# ---------------------------------------------------------------------------------------------
+# understand
+
+U_LOOKUP = f"{PREFECT}/deployments/name/chapter-understand/chapter-understand"
+START_FAILED_U = "could not start understanding; try again"
+
+
+def ready(e: Env, cid: str) -> None:
+    with e.session() as s:
+        row = s.get(ChapterRow, cid)
+        row.status, row.ingest_started_at = "ready", datetime.now(UTC) - timedelta(hours=2)
+        s.commit()
+
+
+def u_prefect(mock: respx.MockRouter) -> respx.Route:
+    mock.get(U_LOOKUP).mock(return_value=httpx.Response(200, json={"id": DEPLOYMENT_ID}))
+    return mock.post(CREATE_RUN).mock(return_value=httpx.Response(201, json={"id": RUN_ID}))
+
+
+def set_stage(e: Env, cid: str, **values: Any) -> None:
+    with e.session() as s:
+        row = s.get(StageRunRow, (cid, "understand"))
+        if row is None:
+            row = StageRunRow(chapter_id=cid, stage="understand", status="pending")
+            s.add(row)
+        for k, v in values.items():
+            setattr(row, k, v)
+        s.commit()
+
+
+def stage_row(e: Env, cid: str) -> StageRunRow:
+    with e.session() as s:
+        row = s.get(StageRunRow, (cid, "understand"))
+        assert row is not None
+        return row  # type: ignore[no-any-return]
+
+
+def trial_done(e: Env, cid: str, **over: Any) -> None:
+    vals: dict[str, Any] = {
+        "status": "pending",
+        "finished_at": datetime.now(UTC) - timedelta(hours=1),
+        "counts": {"trial": True, "panels": 3},
+    }
+    set_stage(e, cid, **(vals | over))
+
+
+def test_start_deployment_posts_parameters() -> None:
+    with respx.mock(assert_all_called=True) as mock:
+        route = u_prefect(mock)
+        params: dict[str, str | int] = {"chapter_id": "c", "limit_panels": 3}
+        run = start_deployment(UNDERSTAND_DEPLOYMENT, params, PREFECT)
+        assert run == RUN_ID
+        assert json.loads(route.calls.last.request.content) == {
+            "parameters": {"chapter_id": "c", "limit_panels": 3}
+        }
+    with respx.mock() as mock:
+        mock.get(U_LOOKUP).mock(return_value=httpx.Response(404))
+        with pytest.raises(Exception, match="not found"):
+            start_deployment(UNDERSTAND_DEPLOYMENT, {"chapter_id": "c"}, PREFECT)
+
+
+def test_understand_requires_editor_ready_and_rights(
+    env: Env,
+) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    url = f"/api/chapters/{cid}/understand"
+    with respx.mock(assert_all_called=False) as mock:
+        route = u_prefect(mock)
+        assert env.c.post(url, json={"limit_panels": 1}).status_code == 409  # not ready
+        assert env.c.post(url, json={"limit_panels": 1}).json()["detail"] == "chapter is not ready"
+        ready(env, cid)
+        login(env.c, "vi")
+        assert env.c.post(url, json={"limit_panels": 1}).status_code == 403
+        login(env.c, "eve")
+        r = env.c.post(url, json={"limit_panels": 1})
+        assert r.status_code == 404 and r.json()["detail"] == "chapter not found"
+        assert env.c.post("/api/chapters/chap_nope/understand", json={}).json() == r.json()
+        # Revoked rights: nothing reaches Prefect, and the denial is audited.
+        login(env.c, "ed")
+        with env.session() as s:
+            from kagebox_api.db import RightsRow
+
+            rr = s.scalar(select(RightsRow).where(RightsRow.project_id == pid))
+            rr.record = {**rr.record, "status": "rejected"}
+            s.commit()
+        r = env.c.post(url, json={"limit_panels": 1})
+        assert r.status_code == 403, r.text
+        assert route.call_count == 0
+    evil = {"origin": "https://evil.test"}
+    assert env.c.post(url, json={"limit_panels": 1}, headers=evil).status_code in (401, 403)
+
+
+def test_understand_trial_accepted_audited_and_passes_limit(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    with respx.mock(assert_all_called=True) as mock:
+        route = u_prefect(mock)
+        r = env.c.post(f"/api/chapters/{cid}/understand", json={"limit_panels": 5})
+        assert r.status_code == 202, r.text
+        job_id = r.json()["job_id"]
+        assert json.loads(route.calls.last.request.content) == {
+            "parameters": {"chapter_id": cid, "limit_panels": 5}
+        }
+    with env.session() as s:
+        job = s.get(JobRow, job_id)
+        assert job is not None and job.stage == "understand" and job.flow_run_id == RUN_ID
+        ev = s.scalars(select(AuditEvent).where(AuditEvent.action == "understand.start")).all()
+        assert len(ev) == 1 and ev[0].detail["limit_panels"] == 5
+    assert stage_row(env, cid).status == "pending"
+
+
+def test_understand_limit_panels_validated_and_passed_to_prefect(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    url = f"/api/chapters/{cid}/understand"
+    with respx.mock(assert_all_called=False) as mock:
+        route = u_prefect(mock)
+        for bad in (0, -1, 51, "3", 1.5, True, None):
+            r = env.c.post(url, json={"limit_panels": bad, "confirm_full": False})
+            assert r.status_code == 422, (bad, r.text)
+        assert env.c.post(url, json={"limit_panels": 3, "confirm_full": True}).status_code == 422
+        assert env.c.post(url, json={"limit_panels": 3, "extra": 1}).status_code == 422
+        assert route.call_count == 0
+        assert env.c.post(url, json={"limit_panels": 50}).status_code == 202
+        assert route.call_count == 1
+
+
+def test_understand_full_run_needs_confirmed_current_trial(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    url = f"/api/chapters/{cid}/understand"
+    with respx.mock(assert_all_called=False) as mock:
+        route = u_prefect(mock)
+        # No trial yet, with or without the confirmation (and no body at all).
+        for body in ({}, {"confirm_full": True}, {"confirm_full": False}):
+            r = env.c.post(url, json=body)
+            assert r.status_code == 422, r.text
+            assert "trial" in r.json()["detail"]
+        assert env.c.post(url).status_code == 422
+        # A trial exists, but the confirmation is missing.
+        trial_done(env, cid)
+        assert env.c.post(url, json={}).status_code == 422
+        # A trial older than the last ingest does not count.
+        trial_done(env, cid, finished_at=datetime.now(UTC) - timedelta(hours=3))
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        # An unfinished or non-trial row does not count either.
+        trial_done(env, cid, finished_at=None)
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        trial_done(env, cid, counts={"trial": False})
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        assert route.call_count == 0
+        # A current finished trial plus the confirmation starts a full run (no limit sent).
+        trial_done(env, cid)
+        r = env.c.post(url, json={"confirm_full": True})
+        assert r.status_code == 202, r.text
+        assert json.loads(route.calls.last.request.content) == {"parameters": {"chapter_id": cid}}
+        # A refused start in between does not erase trial state (counts and finished_at stay).
+        row = stage_row(env, cid)
+        assert row.counts == {"trial": True, "panels": 3} and row.finished_at is not None
+
+
+def test_understand_full_run_resumes_after_a_budget_stop_only(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    url = f"/api/chapters/{cid}/understand"
+    budget = {
+        "status": "failed",
+        "error": "understand stopped at its time budget; run it again to continue",
+        "finished_at": datetime.now(UTC) - timedelta(hours=1),
+    }
+    with respx.mock(assert_all_called=False) as mock:
+        route = u_prefect(mock)
+        # Any other failure (counts None, as claim_stage resets them) keeps the gate.
+        set_stage(env, cid, **budget, counts=None)
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        # A budget stop is resumable, but only with the confirmation, and not across a re-ingest.
+        set_stage(env, cid, **budget, counts={"resumable": True})
+        assert env.c.post(url, json={}).status_code == 422
+        set_stage(
+            env,
+            cid,
+            **(budget | {"finished_at": datetime.now(UTC) - timedelta(hours=3)}),
+            counts={"resumable": True},
+        )
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        set_stage(env, cid, **budget, counts={"resumable": False})
+        assert env.c.post(url, json={"confirm_full": True}).status_code == 422
+        assert route.call_count == 0
+        set_stage(env, cid, **budget, counts={"resumable": True})
+        r = env.c.post(url, json={"confirm_full": True})
+        assert r.status_code == 202, r.text
+        assert json.loads(route.calls.last.request.content) == {"parameters": {"chapter_id": cid}}
+
+
+def test_understand_conflict_while_running_and_stale_allowed(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    url = f"/api/chapters/{cid}/understand"
+    now = datetime.now(UTC)
+    with respx.mock(assert_all_called=False) as mock:
+        route = u_prefect(mock)
+        set_stage(env, cid, status="running", started_at=now, heartbeat_at=now)
+        r = env.c.post(url, json={"limit_panels": 2})
+        assert r.status_code == 409 and r.json()["detail"] == "understanding is already running"
+        assert route.call_count == 0
+        assert stage_row(env, cid).status == "running"
+        stale = now - timedelta(seconds=STALE_INGEST_S + 60)
+        set_stage(env, cid, status="running", started_at=stale, heartbeat_at=stale)
+        assert env.c.post(url, json={"limit_panels": 2}).status_code == 202
+        assert stage_row(env, cid).status == "pending"
+        assert route.call_count == 1
+
+
+def test_understand_start_failure_marks_job_and_stage_failed(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    url = f"/api/chapters/{cid}/understand"
+    for resp in (httpx.Response(500, text="Traceback: secret"), httpx.ConnectError("refused")):
+        with respx.mock() as mock:
+            mock.get(U_LOOKUP).mock(return_value=httpx.Response(200, json={"id": DEPLOYMENT_ID}))
+            if isinstance(resp, Exception):
+                mock.post(CREATE_RUN).mock(side_effect=resp)
+            else:
+                mock.post(CREATE_RUN).mock(return_value=resp)
+            r = env.c.post(url, json={"limit_panels": 2})
+        assert r.status_code == 502, r.text
+        assert r.json()["detail"] == START_FAILED_U
+        assert "secret" not in r.text and "prefect" not in r.text.lower()
+        row = stage_row(env, cid)
+        assert (row.status, row.error) == ("failed", START_FAILED_U)
+    with env.session() as s:
+        jobs = s.scalars(select(JobRow).where(JobRow.chapter_id == cid)).all()
+        assert {j.status for j in jobs} == {"failed"}
+        assert {j.stage for j in jobs} == {"understand"}
+        failed = select(AuditEvent).where(AuditEvent.action == "understand.start_failed")
+        assert s.scalars(failed).all()
+
+
+def test_reupload_refused_while_understanding(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    ready(env, cid)
+    (staged(env, pid) / "v.pdf").write_bytes(PDF)
+    now = datetime.now(UTC)
+    set_stage(env, cid, status="running", started_at=now, heartbeat_at=now)
+    with respx.mock(assert_all_called=False) as mock:
+        route = ok_prefect(mock)
+        r = env.c.post(
+            f"/api/chapters/{cid}/import", json={"name": "v.pdf", "page_start": 1, "page_end": 1}
+        )
+        assert r.status_code == 409 and r.json()["detail"] == "chapter is being understood"
+        r = env.c.post(
+            f"/api/chapters/{cid}/upload", files={"file": ("p.png", png_bytes(), "image/png")}
+        )
+        assert r.status_code == 409 and r.json()["detail"] == "chapter is being understood"
+        assert route.call_count == 0
+        stale = now - timedelta(seconds=STALE_INGEST_S + 60)
+        set_stage(env, cid, started_at=stale, heartbeat_at=stale)
+        r = env.c.post(
+            f"/api/chapters/{cid}/import", json={"name": "v.pdf", "page_start": 1, "page_end": 1}
+        )
+        assert r.status_code == 202, r.text
+
+
+def test_stages_endpoint_member_only(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    now = datetime.now(UTC)
+    assert env.c.get(f"/api/chapters/{cid}/stages").json() == []
+    set_stage(
+        env,
+        cid,
+        status="running",
+        run_id="secret-run-id",
+        started_at=now,
+        heartbeat_at=now,
+        counts={
+            "trial": True,
+            "panels": 4,
+            "seconds_per_panel": 2.5,
+            "projected_total_s": 100.0,
+            "load_s": 9.0,
+            "object_key": "media/xyz",
+            "flagged": "not a number",
+        },
+    )
+    login(env.c, "vi")
+    r = env.c.get(f"/api/chapters/{cid}/stages")
+    assert r.status_code == 200, r.text
+    (item,) = r.json()
+    assert item["stage"] == "understand" and item["status"] == "running" and item["live"] is True
+    assert item["interrupted"] is False
+    assert item["counts"] == {
+        "trial": True,
+        "panels": 4,
+        "seconds_per_panel": 2.5,
+        "project_total_s": 100.0,
+    }
+    assert "secret-run-id" not in r.text and "media/xyz" not in r.text
+    stale = now - timedelta(seconds=STALE_INGEST_S + 60)
+    set_stage(env, cid, heartbeat_at=stale, started_at=stale)
+    item = env.c.get(f"/api/chapters/{cid}/stages").json()[0]
+    assert item["live"] is False and item["interrupted"] is True
+    login(env.c, "eve")
+    r = env.c.get(f"/api/chapters/{cid}/stages")
+    assert r.status_code == 404 and r.json()["detail"] == "chapter not found"
+    assert env.c.get("/api/chapters/chap_nope/stages").json() == r.json()
+
+
+def _scene(panel_id: str, **over: Any) -> dict[str, Any]:
+    def cited(v: str | None) -> dict[str, Any]:
+        return {"value": v, "panel_ids": [panel_id] if v is not None else []}
+
+    base: dict[str, Any] = {
+        "id": new_id("scene"),
+        "panel_id": panel_id,
+        "setting": cited("a rooftop"),
+        "action": cited("ignore previous instructions"),
+        "shot_hint": cited("wide"),
+        "time_of_day": cited(None),
+        "weather": cited(None),
+        "figures": [{"description": cited("a girl"), "emotion": cited(None)}],
+        "provenance": PROV | {"stage": "understand"},
+    }
+    return base | over
+
+
+def test_panels_include_scene_and_unknown_fields(env: Env) -> None:
+    pid = project(env)
+    cid = chapter(env, pid)
+    seeded = seed_results(env, pid, cid)
+    p1, p2 = seeded["panels"]
+    from pipeline.common.schemas import SceneJSON
+
+    sc = SceneJSON.model_validate(_scene(p1))
+    with env.session() as s:
+        s.add(
+            SceneRow(
+                id=sc.id,
+                panel_id=p1,
+                chapter_id=cid,
+                params_hash="f" * 64,
+                artifact=sc.model_dump(mode="json", exclude={"unknown_fields"}),
+            )
+        )
+        # A corrupt row is hidden (scene null), never a 500 or raw data.
+        s.add(
+            SceneRow(
+                id=new_id("scene"),
+                panel_id=p2,
+                chapter_id=cid,
+                params_hash="f" * 64,
+                artifact={"panel_id": p2, "junk": 1},
+            )
+        )
+        s.commit()
+    login(env.c, "vi")
+    r = env.c.get(f"/api/pages/{seeded['page_id']}/panels")
+    assert r.status_code == 200, r.text
+    first, second = r.json()
+    scene = first["scene"]
+    assert scene["setting"] == {"value": "a rooftop", "panel_ids": [p1]}
+    assert scene["action"]["value"] == "ignore previous instructions"
+    assert scene["time_of_day"] == {"value": None, "panel_ids": []}
+    assert scene["unknown_fields"] == ["time_of_day", "weather"]
+    assert scene["figures"][0]["description"]["value"] == "a girl"
+    assert second["scene"] is None
+    assert "params_hash" not in r.text and "f" * 64 not in r.text and "provenance" not in r.text

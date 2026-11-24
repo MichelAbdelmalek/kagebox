@@ -8,7 +8,13 @@ import pytest
 from prefect import flow
 from prefect.testing.utilities import prefect_test_harness
 
-from orchestration.flows import STAGES, chapter_pipeline, check_rights, run_chapter
+from orchestration.flows import (
+    CLOUD_STAGES,
+    STAGES,
+    chapter_pipeline,
+    check_rights,
+    run_chapter,
+)
 from pipeline.common.schemas import RightsDenied, RightsRecord
 
 REF = "evidence/sha256/" + "a" * 64 + ".pdf"
@@ -31,8 +37,8 @@ def rec(**over: Any) -> RightsRecord:
 
 
 @flow
-def harness_flow(load: Any, profile: str = "cloud") -> list[dict[str, str]]:
-    return run_chapter(load, "proj_1", "chap_1", profile)  # type: ignore[arg-type]
+def harness_flow(load: Any, profile: str = "cloud", runners: Any = None) -> list[dict[str, str]]:
+    return run_chapter(load, "proj_1", "chap_1", profile, runners=runners)  # type: ignore[arg-type]
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -52,11 +58,56 @@ def test_pipeline_refuses_without_approved_rights() -> None:
 
 def test_cloud_stages_need_cloud_permission() -> None:
     with pytest.raises(RightsDenied, match="hosted provider"):
-        check_rights(lambda _: rec(), "proj_1", "understand", "cloud")
-    assert check_rights(lambda _: rec(), "proj_1", "understand", "gpu")
-    assert check_rights(
-        lambda _: rec(allows_cloud_processing=True), "proj_1", "understand", "cloud"
-    )
+        check_rights(lambda _: rec(), "proj_1", "director", "cloud")
+    assert check_rights(lambda _: rec(), "proj_1", "director", "gpu")
+    assert check_rights(lambda _: rec(allows_cloud_processing=True), "proj_1", "director", "cloud")
+
+
+def test_understand_stage_needs_render_rights_only() -> None:
+    """Understand runs a local model in every profile: the cloud-processing gate is not its."""
+    assert "understand" not in CLOUD_STAGES
+    no_cloud = rec(allows_cloud_processing=False)
+    assert check_rights(lambda _: no_cloud, "proj_1", "understand", "cloud")
+    with pytest.raises(RightsDenied):  # but the render right is still required
+        check_rights(
+            lambda _: rec(status="pending", approved_by=None, approved_at=None),
+            "proj_1",
+            "understand",
+            "cloud",
+        )
+    ran: list[str] = []
+
+    def runner(chapter_id: str) -> dict[str, str]:
+        ran.append(chapter_id)
+        return {"stage": "understand", "chapter_id": chapter_id, "status": "done"}
+
+    with pytest.raises(RightsDenied, match="hosted provider"):  # director, a later stage
+        harness_flow(lambda _: no_cloud, "cloud", {"understand": runner})
+    assert ran == ["chap_1"]  # the stage itself ran
+
+
+def test_chapter_pipeline_wires_the_understand_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    import orchestration.flows as flows_mod
+    import orchestration.understand_flow as understand_mod
+    import pipeline.common.database as database_mod
+    import pipeline.common.settings as settings_mod
+
+    seen: dict[str, Any] = {}
+
+    def fake_run_chapter(
+        load: Any, project_id: str, chapter_id: str, profile: str, runners: Any
+    ) -> list[dict[str, str]]:
+        seen["runners"] = runners
+        return []
+
+    monkeypatch.setattr(flows_mod, "run_chapter", fake_run_chapter)
+    monkeypatch.setattr(database_mod, "make_engine", lambda s: object())
+    monkeypatch.setattr(settings_mod, "get_settings", lambda: object())
+    monkeypatch.setattr(flows_mod, "db_rights_loader", lambda e: lambda p: None)
+    chapter_pipeline("proj_1", "chap_1")  # unconfirmed: never a silent 12-hour run
+    assert seen["runners"]["understand"]("chap_1")["status"] == flows_mod.UNDERSTAND_SKIPPED
+    chapter_pipeline("proj_1", "chap_1", confirm_full_understand=True)
+    assert seen["runners"]["understand"] is understand_mod.understand_stage
 
 
 def test_pipeline_runs_all_stages_when_allowed() -> None:
@@ -72,3 +123,37 @@ def test_deployment_parameters_validate() -> None:
         chapter_pipeline.validate_parameters(
             {"project_id": "proj_1", "chapter_id": "c", "profile": "nope"}
         )
+
+
+def test_pipeline_does_not_run_a_full_understand_unconfirmed() -> None:
+    from orchestration.flows import STAGES as ALL
+    from orchestration.flows import UNDERSTAND_SKIPPED, understand_runner
+
+    calls: list[str] = []
+
+    def full(chapter_id: str) -> dict[str, str]:
+        calls.append(chapter_id)
+        return {"stage": "understand", "chapter_id": chapter_id, "status": "done"}
+
+    assert "understand" in ALL
+    skipped = understand_runner(full, confirm_full=False)("chap_1")
+    assert skipped == {"stage": "understand", "chapter_id": "chap_1", "status": UNDERSTAND_SKIPPED}
+    assert UNDERSTAND_SKIPPED == "skipped: trial and confirmation required"
+    assert calls == []
+    assert understand_runner(full, confirm_full=True)("chap_1")["status"] == "done"
+    assert calls == ["chap_1"]
+    # inside a flow run, so the stage tasks log to a flow run (no "without a flow run id" warnings)
+    out = harness_flow(
+        lambda _: rec(),
+        "gpu",
+        runners={"understand": understand_runner(full, confirm_full=False)},
+    )
+    assert [r["status"] for r in out if r["stage"] == "understand"] == [UNDERSTAND_SKIPPED]
+    assert calls == ["chap_1"]
+
+
+def test_chapter_pipeline_declares_confirm_full_understand_default_false() -> None:
+    import inspect
+
+    p = inspect.signature(chapter_pipeline.fn).parameters["confirm_full_understand"]
+    assert p.default is False

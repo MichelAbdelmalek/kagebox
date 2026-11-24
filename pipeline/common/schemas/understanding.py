@@ -16,6 +16,13 @@ ShotHint = Literal[
 _CITED_FIELDS = ("setting", "action", "shot_hint", "time_of_day", "weather")
 
 
+class Figure(Strict):
+    """One figure seen in a panel. Identity (which character) is milestone 1.3's job."""
+
+    description: Cited[ShortText]
+    emotion: Cited[ShortText]
+
+
 class SceneJSON(Artifact):
     """What a VLM read from one panel. Every known field must cite this panel."""
 
@@ -27,12 +34,16 @@ class SceneJSON(Artifact):
     weather: Cited[ShortText]
     characters_present: list[Cited[CharacterId]] = Field(default_factory=list, max_length=32)
     emotion_by_character: dict[CharacterId, Cited[ShortText]] = Field(default_factory=dict)
+    figures: list[Figure] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="after")
     def _cites_own_panel(self) -> SceneJSON:
         cited: list[tuple[str, Any]] = [(n, getattr(self, n)) for n in _CITED_FIELDS]
         cited += [(f"characters_present[{i}]", c) for i, c in enumerate(self.characters_present)]
         cited += [(f"emotion[{k}]", v) for k, v in self.emotion_by_character.items()]
+        for i, f in enumerate(self.figures):
+            cited += [(f"figures[{i}].description", f.description)]
+            cited += [(f"figures[{i}].emotion", f.emotion)]
         for name, c in cited:
             if c.known and self.panel_id not in c.panel_ids:
                 raise ValueError(f"{name} must cite its own panel {self.panel_id}")

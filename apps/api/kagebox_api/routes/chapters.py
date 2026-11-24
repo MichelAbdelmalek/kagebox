@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy import CursorResult, and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.datastructures import UploadFile
 from starlette.types import Message
@@ -43,9 +44,23 @@ from kagebox_api.db import (
     utcnow,
 )
 from kagebox_api.deps import DB, AppState, CurrentUser, require_project_role, state
-from kagebox_api.prefect_client import PrefectError, start_ingest
+from kagebox_api.prefect_client import (
+    UNDERSTAND_DEPLOYMENT,
+    PrefectError,
+    start_deployment,
+    start_ingest,
+)
 from kagebox_api.security import sign_media
-from pipeline.common.dbmodels import ingest_alive, ingest_stale_before, ingest_takeover_allowed
+from pipeline.common.dbmodels import (
+    SceneRow,
+    StageRunRow,
+    full_run_allowed,
+    ingest_alive,
+    ingest_stale_before,
+    ingest_takeover_allowed,
+    stage_alive,
+    stage_takeover_allowed,
+)
 from pipeline.common.ids import new_id
 from pipeline.common.schemas import (
     BBox,
@@ -54,6 +69,7 @@ from pipeline.common.schemas import (
     Panel,
     RightsDenied,
     RightsRecord,
+    SceneJSON,
     require_render_allowed,
 )
 from pipeline.common.uploads import ARCHIVE_MIMES, DOC_MIMES, Sniffed, UploadRejected, sniff
@@ -71,6 +87,25 @@ CHUNK = 1024 * 1024
 FORM_SLACK = 64 * 1024  # multipart boundaries, part headers and the two small range fields
 MANHWA_PDF = "manhwa sources must be images or CBZ"  # same message as the ingest flow
 START_FAILED = "could not start ingest; try again"
+UNDERSTAND_START_FAILED = "could not start understanding; try again"
+NOT_READY = "chapter is not ready"
+UNDERSTAND_RUNNING = "understanding is already running"
+BEING_UNDERSTOOD = "chapter is being understood"
+TRIAL_REQUIRED = "run a trial first and confirm the full run"
+MAX_TRIAL_PANELS = 50  # same bound as orchestration.understand_flow (the API must not import it)
+UNDERSTAND = "understand"
+# The only stage counts a client may see (numbers and booleans, never keys or diagnostics).
+# The trial's projected total is published as ``project_total_s``.
+SAFE_COUNTS = {
+    "trial": "trial",
+    "panels": "panels",
+    "scenes": "scenes",
+    "cached": "cached",
+    "failed": "failed",
+    "flagged": "flagged",
+    "seconds_per_panel": "seconds_per_panel",
+    "projected_total_s": "project_total_s",
+}
 INTERRUPTED = "ingest was interrupted"  # same message as the ingest flow
 MAX_CONCURRENT_UPLOADS = 2
 UPLOADS_BUSY = "too many uploads in progress, try again"
@@ -158,6 +193,53 @@ class BubbleOut(BaseModel):
     needs_review: bool
 
 
+class CitedOut(BaseModel):
+    value: str | None  # untrusted model output: data only (length-bounded by the schema)
+    panel_ids: list[str]
+
+
+class FigureOut(BaseModel):
+    description: CitedOut
+    emotion: CitedOut
+
+
+class SceneOut(BaseModel):
+    setting: CitedOut
+    action: CitedOut
+    shot_hint: CitedOut
+    time_of_day: CitedOut
+    weather: CitedOut
+    figures: list[FigureOut]
+    unknown_fields: list[str]
+
+
+class UnderstandIn(BaseModel):
+    """``limit_panels`` makes a trial. Without it this is a full run, which needs
+    ``confirm_full`` and a finished, current trial."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    limit_panels: int | None = Field(default=None, ge=1, le=MAX_TRIAL_PANELS)
+    confirm_full: bool = False
+
+    @model_validator(mode="after")
+    def _one_mode(self) -> UnderstandIn:
+        if self.limit_panels is not None and self.confirm_full:
+            raise ValueError("a trial cannot confirm a full run")
+        return self
+
+
+class StageOut(BaseModel):
+    stage: str
+    status: str
+    started_at: datetime | None
+    heartbeat_at: datetime | None
+    finished_at: datetime | None
+    error: str | None
+    counts: dict[str, bool | int | float]
+    live: bool
+    interrupted: bool  # 'running' with no recent sign of life
+
+
 class PanelOut(BaseModel):
     id: str
     reading_order: int
@@ -165,6 +247,7 @@ class PanelOut(BaseModel):
     polygon: list[tuple[int, int]] | None
     crop_url: str
     bubbles: list[BubbleOut]
+    scene: SceneOut | None = None
 
 
 class ReviewItemOut(BaseModel):
@@ -233,6 +316,12 @@ def _busy(row: ChapterRow) -> bool:
     return ingest_alive(row, ingest_stale_before())
 
 
+def _understanding(db: Session, chapter_id: str) -> bool:
+    """The understand stage is held by a live run (stale heartbeats do not count)."""
+    st = db.get(StageRunRow, (chapter_id, UNDERSTAND))
+    return st is not None and stage_alive(st, ingest_stale_before())
+
+
 def _prepare(db: Session, user: User, chapter_id: str) -> ChapterRow:
     """Checks shared by upload and import, before any bytes are read.
 
@@ -244,6 +333,8 @@ def _prepare(db: Session, user: User, chapter_id: str) -> ChapterRow:
     _require_rights(db, user, row.project_id)
     if _busy(row):
         raise HTTPException(status.HTTP_409_CONFLICT, "chapter is being ingested")
+    if _understanding(db, row.id):
+        raise HTTPException(status.HTTP_409_CONFLICT, BEING_UNDERSTOOD)
     db.commit()  # read-only so far; commit (not rollback, which expires) frees the connection
     return row
 
@@ -265,6 +356,9 @@ def _set_source_and_start(
     rng: PageRange,
 ) -> JobAccepted:
     """Record the verified source, then ask Prefect for a run. Refused while ingesting."""
+    if _understanding(db, row.id):  # re-checked: a run may have started while the body streamed
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, BEING_UNDERSTOOD)
     result = cast(
         CursorResult[Any],
         db.execute(
@@ -623,6 +717,135 @@ def import_source(
 
 
 # ---------------------------------------------------------------------------------------------
+# understand
+
+
+def _full_run_allowed(db: Session, row: ChapterRow) -> bool:
+    """A finished trial, or a run the budget stopped, newer than the chapter's last ingest start
+    (the rule lives in ``full_run_allowed``, shared with the flow's own re-check)."""
+    return full_run_allowed(db.get(StageRunRow, (row.id, UNDERSTAND)), row.ingest_started_at)
+
+
+def _claim_pending(db: Session, chapter_id: str) -> bool:
+    """Conditional upsert of the stage row to 'pending'; False while a live run holds it."""
+    key = (StageRunRow.chapter_id == chapter_id, StageRunRow.stage == UNDERSTAND)
+    if db.scalar(select(StageRunRow.stage).where(*key)) is None:
+        try:
+            with db.begin_nested():
+                db.add(StageRunRow(chapter_id=chapter_id, stage=UNDERSTAND, status="pending"))
+        except IntegrityError:
+            pass  # a concurrent start inserted it; the guarded UPDATE decides
+    result = cast(
+        CursorResult[Any],
+        db.execute(
+            update(StageRunRow)
+            .where(*key, stage_takeover_allowed(ingest_stale_before()))
+            .values(status="pending", error=None)  # counts and finished_at keep the trial
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    return result.rowcount == 1
+
+
+@router.post(
+    "/chapters/{chapter_id}/understand",
+    response_model=JobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def start_understand(
+    chapter_id: str,
+    request: Request,
+    user: CurrentUser,
+    db: DB,
+    body: UnderstandIn | None = None,
+) -> JobAccepted:
+    """Start understanding: a trial (``limit_panels``) or, once a trial is done, a full run."""
+    st = state(request)
+    body = body or UnderstandIn()
+    row = _chapter_for(db, user, chapter_id, "editor")
+    if row.status != "ready":
+        raise HTTPException(status.HTTP_409_CONFLICT, NOT_READY)
+    _require_rights(db, user, row.project_id)  # local processing: render right, no cloud gate
+    if body.limit_panels is None and not (body.confirm_full and _full_run_allowed(db, row)):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, TRIAL_REQUIRED)
+    if not _claim_pending(db, row.id):
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, UNDERSTAND_RUNNING)
+    audit(db, user.id, "understand.start", row.id, limit_panels=body.limit_panels)
+    db.commit()
+
+    params: dict[str, str | int] = {"chapter_id": row.id}
+    if body.limit_panels is not None:
+        params["limit_panels"] = body.limit_panels
+    job_id = new_id("job")
+    try:
+        run_id = start_deployment(UNDERSTAND_DEPLOYMENT, params, st.settings.prefect_api_url)
+    except PrefectError:
+        db.add(
+            JobRow(
+                id=job_id, chapter_id=row.id, flow_run_id=None, status="failed", stage=UNDERSTAND
+            )
+        )
+        # Never leave 'pending' as if a run were queued (a run that already claimed it is kept).
+        db.execute(
+            update(StageRunRow)
+            .where(
+                StageRunRow.chapter_id == row.id,
+                StageRunRow.stage == UNDERSTAND,
+                StageRunRow.status == "pending",
+            )
+            .values(status="failed", error=UNDERSTAND_START_FAILED)
+            .execution_options(synchronize_session=False)
+        )
+        audit(db, user.id, "understand.start_failed", row.id, job_id=job_id)
+        db.commit()
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, UNDERSTAND_START_FAILED) from None
+    db.add(
+        JobRow(
+            id=job_id, chapter_id=row.id, flow_run_id=run_id, status="submitted", stage=UNDERSTAND
+        )
+    )
+    audit(db, user.id, "understand.started", row.id, job_id=job_id)
+    db.commit()
+    return JobAccepted(job_id=job_id)
+
+
+def _safe_counts(raw: dict[str, Any] | None) -> dict[str, bool | int | float]:
+    out: dict[str, bool | int | float] = {}
+    for key, public in SAFE_COUNTS.items():
+        v = (raw or {}).get(key)
+        if isinstance(v, bool | int | float):
+            out[public] = v
+    return out
+
+
+@router.get("/chapters/{chapter_id}/stages", response_model=list[StageOut])
+def list_stages(chapter_id: str, user: CurrentUser, db: DB) -> list[StageOut]:
+    """Per-stage run state of a chapter (viewers). Counts are a fixed, numeric subset."""
+    row = _chapter_for(db, user, chapter_id, "viewer")
+    out: list[StageOut] = []
+    stale_before = ingest_stale_before()
+    for st in db.scalars(
+        select(StageRunRow).where(StageRunRow.chapter_id == row.id).order_by(StageRunRow.stage)
+    ):
+        live = stage_alive(st, stale_before)
+        out.append(
+            StageOut(
+                stage=st.stage,
+                status=st.status,
+                started_at=st.started_at,
+                heartbeat_at=st.heartbeat_at,
+                finished_at=st.finished_at,
+                error=None if st.error is None else st.error[:300],
+                counts=_safe_counts(st.counts),
+                live=live,
+                interrupted=st.status == "running" and not live,
+            )
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
 # results
 
 
@@ -702,6 +925,38 @@ def list_pages(
     return PagesOut(items=out, next=nxt)
 
 
+def _cited(c: Any) -> CitedOut:
+    return CitedOut(value=None if c.value is None else str(c.value), panel_ids=list(c.panel_ids))
+
+
+def _scenes(db: Session, panel_ids: list[str]) -> dict[str, SceneOut]:
+    """Validated scenes by panel id. A row that no longer validates is hidden, not leaked."""
+    out: dict[str, SceneOut] = {}
+    if not panel_ids:
+        return out
+    for srow in db.scalars(select(SceneRow).where(SceneRow.panel_id.in_(panel_ids))):
+        try:
+            sc: SceneJSON = _load(SceneJSON, srow.artifact)
+        except ValidationError:
+            log.warning("a stored scene failed validation and is not shown")
+            continue
+        if sc.panel_id != srow.panel_id:
+            continue
+        out[srow.panel_id] = SceneOut(
+            setting=_cited(sc.setting),
+            action=_cited(sc.action),
+            shot_hint=_cited(sc.shot_hint),
+            time_of_day=_cited(sc.time_of_day),
+            weather=_cited(sc.weather),
+            figures=[
+                FigureOut(description=_cited(f.description), emotion=_cited(f.emotion))
+                for f in sc.figures
+            ],
+            unknown_fields=sc.unknown_fields,
+        )
+    return out
+
+
 @router.get("/pages/{page_id}/panels", response_model=list[PanelOut])
 def list_panels(page_id: str, request: Request, user: CurrentUser, db: DB) -> list[PanelOut]:
     """Panels in reading order, each with its bubbles in reading order."""
@@ -741,6 +996,7 @@ def list_panels(page_id: str, request: Request, user: CurrentUser, db: DB) -> li
                     needs_review=brow.needs_review,
                 )
             )
+    scenes = _scenes(db, [p.id for p in panel_rows])
     out: list[PanelOut] = []
     for row in panel_rows:
         panel: Panel = _load(Panel, row.artifact)
@@ -752,6 +1008,7 @@ def list_panels(page_id: str, request: Request, user: CurrentUser, db: DB) -> li
                 polygon=panel.polygon,
                 crop_url=_media_url(st, user.id, panel.crop_ref),
                 bubbles=by_panel[row.id],
+                scene=scenes.get(row.id),
             )
         )
     return out

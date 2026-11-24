@@ -109,6 +109,27 @@ def manga_ocr(name: str) -> str:
     return f"decoded {tok.decode(ids[0], skip_special_tokens=True)!r}"
 
 
+def vlm(name: str) -> str:
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    proc = load(AutoProcessor, name, weights=False)
+    # bfloat16: fp32 2B weights (8.6 GB) do not fit the models-check memory limit
+    model = load(AutoModelForImageTextToText, name, dtype=torch.bfloat16)
+    image = Image.new("RGB", (64, 64), (128, 128, 128))
+    messages = [
+        {
+            "role": "user",
+            "content": [{"type": "image"}, {"type": "text", "text": "Describe this image."}],
+        }
+    ]
+    # the kwarg the understand provider passes too (local_vlm.py); the pinned Instruct template
+    # does not reference it (checked 2026-11-24), so it is accepted and ignored, never an error
+    prompt = proc.apply_chat_template(messages, add_generation_prompt=True, enable_thinking=False)
+    inputs = proc(text=[prompt], images=[image], return_tensors="pt")
+    ids = model.generate(**inputs, max_new_tokens=5, do_sample=False)
+    return f"generated {tuple(ids.shape)}"
+
+
 CHECKS: dict[str, Callable[[str], str]] = {
     "siglip-so400m": siglip,
     "sam2-1-hiera-small": sam2,
@@ -119,6 +140,7 @@ CHECKS: dict[str, Callable[[str], str]] = {
     "pp-ocrv5-rec-ko": generic,
     "whisper-large-v3-turbo": whisper,
     "manga-ocr": manga_ocr,
+    "qwen3-vl-2b-instruct": vlm,
 }
 
 

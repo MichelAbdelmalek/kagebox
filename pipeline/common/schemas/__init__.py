@@ -20,7 +20,7 @@ from pipeline.common.schemas.rights import (
     require_render_allowed,
 )
 from pipeline.common.schemas.source import BBox, Bubble, Chapter, Page, Panel, Project
-from pipeline.common.schemas.understanding import CharacterRef, ReferenceCrop, SceneJSON
+from pipeline.common.schemas.understanding import CharacterRef, Figure, ReferenceCrop, SceneJSON
 
 __all__ = [
     "Artifact",
@@ -31,6 +31,7 @@ __all__ = [
     "CharacterRef",
     "Check",
     "Cited",
+    "Figure",
     "ModelRef",
     "Page",
     "Panel",

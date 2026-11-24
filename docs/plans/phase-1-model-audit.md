@@ -21,7 +21,7 @@ Date: 2026-11-19. Method: one research agent per candidate, two independent skep
 | Watermark | facebook/audioseal @ `3c19eba5` | Use, after conversion | MIT (weights included). All weights are `.pth` pickles, and the library loads them with `weights_only=False` → convert and bypass its loader. |
 | Speech check | openai/whisper-large-v3-turbo safetensors via transformers | Use | MIT. No format exception. Slower on CPU than faster-whisper, whose CTranslate2 `model.bin` is not a pickle but would need an exception. |
 | Score draft | ACE-Step 1.5 | Deferred to the gpu profile | MIT, but its loader hard-codes `trust_remote_code` and ships a small pickle. Per D2 the cloud profile skips the score, so this audit happens when a GPU host exists. |
-| Scene understanding | Together: Qwen/Qwen3.5-9B (Apache-2.0) vs nvidia/NVIDIA-Nemotron-3.5-Super-VL (OpenMDW-1.1) | Bake-off in 1.2 | Both serve JSON-schema output. Qwen is cheaper per output token and plainly licensed. OpenMDW's licence ends if you sue over patents *or copyright*. |
+| Scene understanding | Local, `worker-cpu`: Qwen3-VL-2B-Instruct, Qwen3.5-2B, Qwen3.5-0.8B (all Apache-2.0); the earlier Together candidates (Qwen3.5-9B, Nemotron-3.5-Super-VL) are dropped | Bake-off in 1.2, then pin | Decision (2026-11-21): local VLM. Pages never leave the machine, so rights records need no cloud consent for this stage. Weights must be safetensors, pinned by revision and sha256 like every other model. |
 | Director | Together: openai/gpt-oss-120b (Apache-2.0) | Use | Structured outputs supported. Fallback: deepseek-ai/DeepSeek-V4.1-Flash (MIT). |
 | Sample chapter | Planet Comics #41, "The Lost World" (Fiction House, on sale 1945-12-28); Comic Book Plus dlid 69256 | Use, pending a manual check | US public domain by non-renewal. Before use: check the 1972–73 Catalog of Copyright Entries renewal volumes directly, then download (24 MB zip) and pin its sha256. Public domain in the US only. |
 
@@ -51,3 +51,33 @@ The owner delegated these to engineering and noted the project is **not commerci
 ## Not yet measured
 
 CPU time and memory per model on arm64, and the combined RAM of all models against Docker Desktop's VM limit. Whether CosyVoice2 works on torch ≥ 2.6. Watermark survival after mixing with the score and AAC encoding. These are covered by the 1.1–1.7 milestone tests.
+
+## Decision (2026-11-21): local VLM
+
+Scene understanding runs a small open-weight vision model locally on `worker-cpu` instead of Together. Reasons: no page image leaves the machine (no cloud-processing consent needed for this stage), no per-token cost, and the loader already enforces safetensors, pinned revisions and checksums. Candidates are Qwen3-VL-2B-Instruct, Qwen3.5-2B and Qwen3.5-0.8B (all Apache-2.0), run in bf16 on CPU (no fp32 for the 2B models). `stages.understand` stays `proposed` with `model: null` until the bake-off pins one. Output is validated against the strict reading schema with retries; output that still fails becomes a ReviewItem. Together remains the provider for the director stage only.
+
+## Decision (2026-11-22): owner approved qwen3-vl-2b-instruct
+
+`stages.understand` is now `provider: local`, `model: qwen3-vl-2b-instruct` (Qwen/Qwen3-VL-2B-Instruct, revision `89644892e4d85e24eaac8bacfd4f463576704203`, Apache-2.0), `status: approved`, with no fallback for now. `qwen3-5-2b` and `qwen3-5-0-8b` stay pinned in `models:` and on disk.
+
+Evidence: the real bake-off (15 panels per run: 10 from one chapter plus 5 synthetic; report `data/reports/understand-bakeoff/20261121T200218Z/`, gitignored; prompt v1). Rates come from a small sample and are indicative only.
+
+| run | schema-valid | null rate (setting / action / time / weather / shot_hint) | text-evidence claims, unsupported quotes | s/panel p50 / p95 | peak RSS |
+|---|---|---|---|---|---|
+| qwen3-vl-2b-instruct bf16 | 15/15 (1.00) | 0 / 0 / 0.87 / 0.87 / 0 | 3, 1 (33%) | 153 / 322 | 5.8 GB |
+| qwen3-5-2b bf16 | 12/15 (0.80) | 0 / 0 / 0.83 / 0.92 / 0 | 1, 0 | 152 / 546 | 6.1 GB |
+| qwen3-5-0-8b bf16 | 15/15 (1.00) | 0 / 0 / 0.13 / 0.87 / 0 | 4, 3 (75%) | 59 / 110 | 3.2 GB |
+| qwen3-5-0-8b fp32 | 15/15 (1.00) | 0 / 0 / 0.13 / 0.87 / 0 | 3, 2 (67%) | 75 / 120 | 6.4 GB |
+
+Why this model: 100% schema-valid, descriptions stay on what is drawn, it nulls time of day and weather when unsure, and it did not copy the prompt example (the other two did). The 0.8B is 2.6x faster but invents content and cites text it does not have.
+
+Consequences of the bake-off, decided with this approval:
+- Every model set `weather` to "storm" from an instruction inside a speech bubble, with a quote that really was in the OCR text. Ruling R3: scene fields describe what is drawn, so a claim with `text` evidence is nulled and raised as `scene_text_claim`; the quote check is removed. Dialogue stays stored as OCR bubbles.
+- Ruling R5: prompt v2 (`configs/prompts/understand.v2.md`) replaces the concrete example with placeholders; v1 stays on disk as the prompt of the recorded run.
+- Still open: throughput. At p50 of 153 s a 238-panel chapter projects to about 10 h against the 7 h cap (`max_minutes_per_chapter: 420`); thread count, `max_pixels` and the cap need a measurement in the next stage.
+
+## Decision (2026-11-23): the two other candidates are de-approved (ruling R7)
+
+`qwen3-5-2b` and `qwen3-5-0-8b` are `status: proposed` in `configs/models.sources.yaml` and `configs/models.yaml`. Their files stay on the volume, but `models-fetch` skips them and `model_dir` refuses them (`ModelNotApproved`); `check_models` no longer loads them. Both are **not selected: evidence**:
+- qwen3-5-0-8b: nearly empty answers under prompt v3 (action and shot_hint null on every panel, one-word settings), still follows an injected weather instruction, so it cannot feed the director.
+- qwen3-5-2b: 12/15 schema-valid (0.80), parrots prompt examples, p95 546 s because of retries.

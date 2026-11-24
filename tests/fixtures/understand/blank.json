@@ -1,0 +1,15 @@
+{
+  "case": "blank",
+  "prompt_sha256": "1d546e0ee92f15ddadd5e06ed95536027bea3717127fa60c361eafd8902064b6",
+  "image_sha256": "6c04fff04b3c72be7df55bad041c9173f29c056532af3075734d3a9bb2052cee",
+  "content_sha256": "03e67902c4e0150947e13f96fab89ea4f8c7b18bbb4a9c180d6966dd9768dee5",
+  "fixture_key": "3c34354bcd07a4dc4ba4b011562ac69e2a7befdb415a88f6bae6ff83be145002",
+  "outputs": [
+    "{\"setting\": {\"value\": \"a white background with no visible objects or figures\", \"evidence\": \"visual\"}, \"action\": {\"value\": null, \"evidence\": null}, \"time_of_day\": {\"value\": null, \"evidence\": null}, \"weather\": {\"value\": null, \"evidence\": null}, \"shot_hint\": null, \"figures\": []}"
+  ],
+  "recorded_with": {
+    "margin_px": 4,
+    "mask_detect_threshold": 0.35,
+    "prompt_version": "v4"
+  }
+}

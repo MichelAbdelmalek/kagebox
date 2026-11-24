@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 from pathlib import Path
 from typing import Any
+
+import pytest
+
+from pipeline.providers.weights import FileSpec, UnsafeWeights, verify_file
 
 _spec = importlib.util.spec_from_file_location(
     "pin_models", Path(__file__).parents[2] / "deploy/scripts/pin_models.py"
@@ -48,3 +53,28 @@ def test_outputs_cover_every_step_even_if_sources_yaml_lists_some() -> None:
     }
     out = pin_models.carry_outputs(new, None)
     assert out == {"a.safetensors": B, "b.safetensors": None}
+
+
+def test_jinja_chat_template_is_text_format(tmp_path: Path) -> None:
+    assert pin_models.FORMATS[".jinja"] == "text"
+    body = b"{% for m in messages %}{{ m.content }}{% endfor %}"
+    f = tmp_path / "chat_template.jinja"
+    f.write_bytes(body)
+    spec = FileSpec(
+        path="chat_template.jinja",
+        sha256=hashlib.sha256(body).hexdigest(),
+        size_bytes=len(body),
+        format="text",
+    )
+    assert verify_file(f, spec) == f
+    # non-UTF-8 content is refused even with a matching hash
+    bad = tmp_path / "bad.jinja"
+    bad.write_bytes(b"\xff\xfe\x00")
+    bad_spec = FileSpec(
+        path="bad.jinja",
+        sha256=hashlib.sha256(b"\xff\xfe\x00").hexdigest(),
+        size_bytes=3,
+        format="text",
+    )
+    with pytest.raises(UnsafeWeights):
+        verify_file(bad, bad_spec)

@@ -11,7 +11,7 @@ GITLEAKS_IMAGE := zricethezav/gitleaks:v8.28.0@sha256:cdbb7c955abce02001a9f6c9f6
 UV := docker run --rm -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox-uvcache:/root/.cache/uv -w /app -e UV_LINK_MODE=copy $(UV_IMAGE) uv
 PNPM := docker run --rm -v "$(CURDIR)/apps/web":/app -v "$(CURDIR)/docs":/docs:ro -v kagebox-web-nm:/app/node_modules -v kagebox-pnpm:/root/.local/share/pnpm -w /app -e COREPACK_ENABLE_DOWNLOAD_PROMPT=0 -e npm_config_store_dir=/root/.local/share/pnpm/store -e CI=true $(NODE_IMAGE) sh -c
 
-.PHONY: help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models test-models worker-image ingest-sample
+.PHONY: bakeoff-understand help secrets env up-cloud up-gpu down logs ps admin user test test-py test-web lint scan scan-images pin-models fetch-models convert-models check-models test-models worker-image ingest-sample understand-sample
 
 help:
 	@grep -E '^[a-z-]+:.*##' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-14s %s\n", $$1, $$2}'
@@ -56,7 +56,8 @@ test-models: ## offline: tests that load the real pinned weights (models volume 
 	$(UV) sync -q --locked --all-extras --group dev
 	docker run --rm --network none -v "$(CURDIR)":/app -v kagebox-venv:/app/.venv -v kagebox_models:/models:ro -w /app -e UV_OFFLINE=1 -e HF_HUB_OFFLINE=1 -e KAGEBOX_MODELS_DIR=/models $(UV_IMAGE) sh -c 'uv run --offline pytest -m models -q -o addopts="-ra --strict-markers"; rc=$$?; [ $$rc -eq 5 ] && rc=0; exit $$rc'
 
-lint: ## ruff, mypy, bandit
+lint: ## ruff, mypy, bandit (installs the locked dependencies first: mypy needs them, and `make scan` runs lint on a fresh checkout)
+	$(UV) sync -q --locked --all-extras --group dev
 	$(UV) run ruff check .
 	$(UV) run ruff format --check .
 	$(UV) run mypy
@@ -84,6 +85,10 @@ ingest-sample: ## real-data ingest of the sample chapter via the API (stack runn
 	test -f data/fixtures/blackjack-v1/work/001bj.pdf
 	sh tests/e2e/ingest_sample.sh
 
+understand-sample: ## trial of the understand stage on the sample chapter via the API (TRIAL_PANELS=10); CONFIRM=yes runs the full chapter
+	mkdir -p data/reports
+	TRIAL_PANELS=$(or $(TRIAL_PANELS),10) CONFIRM=$(or $(CONFIRM),no) sh tests/e2e/understand_sample.sh
+
 pin-models: ## regenerate pinned files/hashes in configs/models.yaml from models.sources.yaml
 	$(UV) run python deploy/scripts/pin_models.py configs
 
@@ -99,3 +104,6 @@ check-models: worker-image ## offline: verify hashes, load every approved model,
 convert-models: worker-image ## offline: pickle -> safetensors in a sandbox, then promote pinned outputs
 	$(COMPOSE) --profile fetch run --rm models-convert
 	$(COMPOSE) --profile fetch run --rm models-promote
+
+bakeoff-understand: ## local vision bake-off, no image rebuild (needs Docker memory >= 11 GB; ARGS="--chapter <id> ...")
+	sh deploy/scripts/bakeoff.sh $(ARGS)

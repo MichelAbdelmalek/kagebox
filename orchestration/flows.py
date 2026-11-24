@@ -1,8 +1,9 @@
 """Prefect flows: the chapter pipeline with the rights gate in front of every stage.
 
 Every stage re-checks rights itself, so a record revoked mid-run stops the next stage.
-Stages with a runner (ingest: ``orchestration.ingest_flow``) do real work; the others report
-``not_implemented`` until their Phase 1 milestone lands.
+Stages with a runner (ingest: ``orchestration.ingest_flow``, understand:
+``orchestration.understand_flow``) do real work; the others report ``not_implemented`` until their
+Phase 1 milestone lands.
 """
 
 # No `from __future__ import annotations`: Prefect builds a Pydantic model from the flow
@@ -29,8 +30,9 @@ STAGES: tuple[Stage, ...] = (
     "validate",
     "assemble",
 )
-# Stages that send page content to a hosted provider in the cloud profile.
-CLOUD_STAGES: frozenset[Stage] = frozenset({"understand", "director"})
+# Stages that send page content to a hosted provider in the cloud profile. Understand runs on a
+# local model in every profile, so it needs the render right only.
+CLOUD_STAGES: frozenset[Stage] = frozenset({"director"})
 
 RightsLoader = Callable[[str], RightsRecord | None]
 
@@ -70,6 +72,20 @@ def run_stage(
 
 Profile = Literal["cloud", "gpu"]
 
+UNDERSTAND_SKIPPED = "skipped: trial and confirmation required"
+
+
+def understand_runner(full: StageRunner, confirm_full: bool) -> StageRunner:
+    """A full understand run takes hours: the pipeline starts one only when it was confirmed
+    (after a trial); otherwise the stage is skipped without running a model."""
+    if confirm_full:
+        return full
+
+    def skipped(chapter_id: str) -> StageResult:
+        return {"stage": "understand", "chapter_id": chapter_id, "status": UNDERSTAND_SKIPPED}
+
+    return skipped
+
 
 def run_chapter(
     load: RightsLoader,
@@ -93,10 +109,14 @@ def run_chapter(
 
 @flow(name="chapter-pipeline", log_prints=False, validate_parameters=True)
 def chapter_pipeline(
-    project_id: str, chapter_id: str, profile: Profile = "cloud"
+    project_id: str,
+    chapter_id: str,
+    profile: Profile = "cloud",
+    confirm_full_understand: bool = False,
 ) -> list[StageResult]:
     """Deployment entry point. Parameters must stay JSON-serializable."""
-    from orchestration.ingest_flow import ingest_stage  # deferred: it imports this module
+    from orchestration.ingest_flow import ingest_stage  # deferred: they import this module
+    from orchestration.understand_flow import understand_stage
     from pipeline.common.database import make_engine  # deferred: needs settings at run time
     from pipeline.common.settings import get_settings
 
@@ -105,5 +125,8 @@ def chapter_pipeline(
         project_id,
         chapter_id,
         profile,
-        runners={"ingest": ingest_stage},
+        runners={
+            "ingest": ingest_stage,
+            "understand": understand_runner(understand_stage, confirm_full_understand),
+        },
     )

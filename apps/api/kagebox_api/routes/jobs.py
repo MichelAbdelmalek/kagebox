@@ -24,6 +24,7 @@ class JobOut(BaseModel):
     id: str
     chapter_id: str
     status: str
+    stage: str
     created_at: datetime
     updated_at: datetime
 
@@ -42,6 +43,7 @@ def get_job(job_id: str, user: CurrentUser, db: DB) -> JobOut:
         id=job.id,
         chapter_id=job.chapter_id,
         status=job.status,
+        stage=job.stage,
         created_at=job.created_at,
         updated_at=job.updated_at,
     )

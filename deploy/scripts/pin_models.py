@@ -23,6 +23,7 @@ FORMATS = {
     ".safetensors": "safetensors",
     ".json": "json",
     ".txt": "text",
+    ".jinja": "text",
     ".model": "sentencepiece",
     ".yaml": "yaml",
     ".yml": "yaml",
@@ -34,6 +35,14 @@ def tree(client: httpx.Client, repo: str, rev: str) -> list[dict[str, Any]]:
     r.raise_for_status()
     items: list[dict[str, Any]] = r.json()
     return [i for i in items if i.get("type") == "file"]
+
+
+def status_of(src: dict[str, Any]) -> str:
+    """``approved`` unless models.sources.yaml says ``proposed`` (kept on disk, never loaded)."""
+    status = src.get("status", "approved")
+    if status not in ("approved", "proposed"):
+        raise SystemExit(f"status must be approved or proposed, got {status!r}")
+    return str(status)
 
 
 def pin(client: httpx.Client, name: str, src: dict[str, Any]) -> dict[str, Any]:
@@ -58,7 +67,7 @@ def pin(client: httpx.Client, name: str, src: dict[str, Any]) -> dict[str, Any]:
     if missing:
         raise SystemExit(f"{name}: nothing in {repo}@{rev} matched {missing}")
     return {
-        "status": "approved",
+        "status": status_of(src),
         "repo": repo,
         "revision": rev,
         "license": src["license"],
@@ -98,7 +107,7 @@ def pin_conversion(client: httpx.Client, name: str, src: dict[str, Any]) -> dict
     repo, rev, conv = src["repo"], src["revision"], src["convert"]
     data = pin(client, name, src)["files"] if src.get("allow") else []
     out: dict[str, Any] = {
-        "status": "approved",
+        "status": status_of(src),
         "repo": repo,
         "revision": rev,
         "license": src["license"],
