@@ -1,0 +1,11 @@
+# Gitleaks config: the default rules plus one narrow allowlist.
+[extend]
+useDefault = true
+
+[allowlist]
+# tests/fixtures/understand/*.json are recorded model answers for the replay provider (synthetic
+# panels only). Each has a "fixture_key": a sha256 content hash of the request, not a credential,
+# which trips generic-api-key. A rule-scoped allowlist was tried and not applied by gitleaks 8.28,
+# so these files are skipped; every other path is still scanned by every rule.
+description = "recorded replay fixtures"
+paths = ['''tests/fixtures/understand/[a-z_]+\.json''']
