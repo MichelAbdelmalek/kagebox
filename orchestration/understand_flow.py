@@ -562,7 +562,11 @@ def _understand(
                 reading = provider.vlm_structured(
                     spec, instructions, "", [prepared.png], PanelReading
                 )
-        except StructuredOutputFailed as exc:
+        except (UnderstandAlreadyRunning, UnderstandRefused, ModelLoadFailed):
+            raise  # run-level conditions (all RuntimeErrors): they stop the run, not this panel
+        except (StructuredOutputFailed, ValueError, RuntimeError) as exc:
+            # No valid answer, an image the model refused (ValueError) or an out-of-memory error
+            # (RuntimeError): this panel only; the review item carries the class name, not the text.
             _record_failed(deps, run, tally, work.id, exc)
             continue
         _record_scene(deps, run, tally, work, reading, spec, ph, prepared)

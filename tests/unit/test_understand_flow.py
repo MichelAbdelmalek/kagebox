@@ -493,6 +493,27 @@ def test_one_panel_failure_is_review_item_others_continue(
     assert env.stage().status == "done"
 
 
+@pytest.mark.parametrize("exc_type", [ValueError, RuntimeError])
+def test_provider_value_or_runtime_error_fails_only_that_panel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc_type: type[Exception]
+) -> None:
+    env = make_env(tmp_path, monkeypatch)
+
+    def refuse_second(n: int) -> PanelReading | None:
+        if n == 2:
+            raise exc_type(f"image refused {SENTINEL}")  # image refused / out of memory
+        return None
+
+    env.provider.on_call = refuse_second
+    summary = env.run()
+    assert (summary.panels, summary.scenes, summary.failed, summary.flagged) == (4, 3, 1, 1)
+    assert len(env.provider.calls) == 4  # the run went on after the failure
+    (item,) = env.reviews("scene_failed")
+    assert item.artifact_id == env.panel_ids[1]
+    assert exc_type.__name__ in item.reason and SENTINEL not in item.reason  # class name only
+    assert env.stage().status == "done"
+
+
 def test_text_claim_stores_scene_and_review_item(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1015,13 +1036,13 @@ def test_failing_fail_does_not_mask_the_original_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = make_env(tmp_path, monkeypatch)
-    env.provider.on_call = lambda n: (_ for _ in ()).throw(RuntimeError("model exploded"))
+    env.provider.on_call = lambda n: (_ for _ in ()).throw(OSError("model exploded"))
 
     def broken(*a: Any, **k: Any) -> None:
         raise OSError("database went away")
 
     monkeypatch.setattr(uf, "_fail", broken)
-    with pytest.raises(RuntimeError, match="model exploded"):
+    with pytest.raises(OSError, match="model exploded"):
         env.run()
 
 
@@ -1037,10 +1058,10 @@ def test_errors_and_logs_carry_no_ocr_text(
             raise StructuredOutputFailed(spec, 2, "ValidationError")
         if n == 2:
             return reading(setting=Claim(value=OUT_SENTINEL, evidence="text"))
-        raise RuntimeError(f"boom {SENTINEL} {OUT_SENTINEL}")
+        raise OSError(f"boom {SENTINEL} {OUT_SENTINEL}")
 
     env.provider.on_call = fail
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OSError):
         env.run()
     assert (
         SENTINEL not in caplog.text and OUT_SENTINEL not in caplog.text
