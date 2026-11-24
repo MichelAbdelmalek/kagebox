@@ -653,7 +653,7 @@ def main(argv: list[str] | None = None) -> int:
         args.record.mkdir(parents=True, exist_ok=True)
         dtype = dtypes[0]
         call, sent = _make_call(models[0], dtype, settings, instructions)
-        meta = {
+        meta: dict[str, str | int | float] = {
             "margin_px": settings.margin_px,
             "mask_detect_threshold": settings.mask_detect_threshold,
             "prompt_version": settings.prompt_version,
